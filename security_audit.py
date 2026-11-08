@@ -48,6 +48,7 @@ SNAP_DIR = os.path.join(CONFIG_DIR, "snapshots")
 IDENTITY_FILE = os.path.join(CONFIG_DIR, "apk_identity.json")
 REPUTATION_FILE = os.path.join(CONFIG_DIR, "reputation.json")
 TRACKERS_FILE = os.path.join(CONFIG_DIR, "trackers.json")
+ROOTING_DB_FILE = os.path.join(CONFIG_DIR, "rooting_db.json")
 KEEP_SNAPSHOTS = 30
 
 DEFAULT_SEC_CONFIG = {"virustotal_key": "", "malwarebazaar_key": "", "exodus_token": "",
@@ -313,7 +314,13 @@ def collect(shell, apps, sockets=None):
 
 
 def launcher_packages(shell, pkgs):
-    """Which of `pkgs` have an icon in the app drawer. Returns (set, method)."""
+    """Which of `pkgs` have an icon in the app drawer.
+
+    Returns (set, method). method is the discovery technique that worked
+    ("query-activities" or "per-package"), or None if discovery FAILED entirely
+    (every command errored). Callers must treat method is None as "unknown" and
+    NOT as "every app is hidden" - an empty set with a non-None method does mean
+    "none of these have a launcher icon"."""
     try:
         out = shell("cmd package query-activities --brief -a android.intent.action.MAIN "
                     "-c android.intent.category.LAUNCHER", 60) or ""
@@ -322,15 +329,22 @@ def launcher_packages(shell, pkgs):
     found = set(m.group(1) for m in re.finditer(r"(?m)^\s*([A-Za-z][\w.]*)/[\w.$]+\s*$", out))
     if found:
         return found & set(pkgs), "query-activities"
-    have = set()
+    # query-activities produced nothing: fall back to per-package dumps. Track
+    # whether ANY dump actually succeeded, so total failure is reported as None.
+    have, any_ok = set(), False
     for p in pkgs:
         try:
             dump = shell("dumpsys package " + p, 30) or ""
+            any_ok = True
         except Exception:
             continue
         if "android.intent.category.LAUNCHER" in dump:
             have.add(p)
-    return have, "per-package"
+    if have:
+        return have, "per-package"
+    if any_ok:
+        return set(), "per-package"       # genuinely none have a launcher icon
+    return set(), None                     # discovery failed - caller: treat as unknown
 
 
 # --------------------------------------------------------------------------
@@ -484,7 +498,7 @@ def device_info(shell):
                  "ro.product.board", "ro.board.platform", "ro.product.cpu.abi",
                  "ro.build.version.release", "ro.build.version.sdk", "ro.build.version.incremental",
                  "ro.build.id", "ro.build.display.id", "ro.build.version.security_patch",
-                 "ro.build.date", "ro.build.type", "ro.build.tags",
+                 "ro.build.date", "ro.build.type", "ro.build.tags", "ro.build.fingerprint",
                  "ro.miui.ui.version.name", "ro.mi.os.version.name", "ro.mi.os.version.incremental",
                  "ro.build.version.opporom", "ro.vivo.os.version", "ro.build.version.emui",
                  "ro.boot.flash.locked", "ro.boot.verifiedbootstate", "ro.boot.vbmeta.device_state",
@@ -1202,3 +1216,298 @@ def tracker_findings(apps, labeler, reports):
                                % (r.get("version") or "?"), r.get("link", ""), pkg=p, key="trackers:%s" % p))
     out.sort(key=lambda f: (LEVEL_RANK[f["level"]], f["title"].lower()))
     return out
+
+
+# --------------------------------------------------------------------------
+# rooting database: one AI rooting answer per codename, shared across devices
+# --------------------------------------------------------------------------
+
+ROOTING_DB_SCHEMA = 2   # 1 = legacy codename-keyed flat dict; 2 = {schema, entries{}}
+
+
+def _write_rooting_db(entries):
+    """Persist the entries map privately (0600 file, 0700 dir), with schema version."""
+    try:
+        os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+        os.chmod(CONFIG_DIR, 0o700)
+    except OSError:
+        pass
+    return save_json(ROOTING_DB_FILE, {"schema": ROOTING_DB_SCHEMA, "entries": entries}, private=True)
+
+
+def load_rooting_db():
+    """Return the entries map {key: entry}, migrating legacy formats once.
+
+    Migration is collision-safe: if two legacy codename-only records would map to
+    the same composite key, the colliding one is kept under a disambiguated key so
+    nothing silently disappears. A one-time .bak of the pre-migration file is left
+    beside it."""
+    raw = load_json(ROOTING_DB_FILE, {})
+    if not isinstance(raw, dict) or not raw:
+        return {}
+    if raw.get("schema") == ROOTING_DB_SCHEMA and isinstance(raw.get("entries"), dict):
+        return raw["entries"]
+
+    # legacy: either a bare {codename: entry} map (schema 1) or a schema-1.x variant
+    legacy = raw.get("entries", raw) if isinstance(raw.get("entries"), dict) else raw
+    entries, changed = {}, False
+    for key, entry in legacy.items():
+        if key in ("schema", "entries") or not isinstance(entry, dict):
+            continue
+        if "identity" not in entry:
+            entry["identity"] = {"maker": entry.get("maker", ""),
+                                 "codename": entry.get("codename", key),
+                                 "model": entry.get("model_number", ""),
+                                 "platform": entry.get("chip", "")}
+            changed = True
+        new_key = identity_key_str(entry["identity"])
+        if new_key in entries:        # collision: keep both, don't overwrite
+            changed = True
+            n = 2
+            while "%s#%d" % (new_key, n) in entries:
+                n += 1
+            new_key = "%s#%d" % (new_key, n)
+        entries[new_key] = entry
+    if changed:
+        try:
+            if os.path.exists(ROOTING_DB_FILE) and not os.path.exists(ROOTING_DB_FILE + ".bak"):
+                import shutil as _sh
+                _sh.copy2(ROOTING_DB_FILE, ROOTING_DB_FILE + ".bak")
+        except OSError:
+            pass
+        _write_rooting_db(entries)
+    return entries
+
+
+def device_identity(info):
+    """The preferred composite identity for a device: maker + codename + model + platform.
+    Any part may be '' if the device didn't report it."""
+    props = (info or {}).get("props", {})
+    return {
+        "maker": (props.get("ro.product.manufacturer") or props.get("ro.product.brand") or "").strip(),
+        "codename": (info or {}).get("codename", "").strip(),
+        "model": props.get("ro.product.model", "").strip(),
+        "platform": (props.get("ro.board.platform") or props.get("ro.product.board") or "").strip(),
+    }
+
+
+def identity_key_str(identity):
+    """The DB key for an identity. All four parts, lowercased, '|'-joined."""
+    return "|".join((identity.get("maker", ""), identity.get("codename", ""),
+                     identity.get("model", ""), identity.get("platform", ""))).lower()
+
+
+def _entry_identity(e):
+    i = e.get("identity", {})
+    return {"maker": i.get("maker", "") or e.get("maker", ""),
+            "codename": i.get("codename", "") or e.get("codename", ""),
+            "model": i.get("model", "") or e.get("model_number", ""),
+            "platform": i.get("platform", "") or e.get("chip", "")}
+
+
+def identity_conflict(a, b):
+    """True if two identities POSITIVELY disagree on any field both actually have.
+    Missing fields don't conflict - only values present on both sides and differing."""
+    for k in ("maker", "codename", "model", "platform"):
+        va, vb = (a.get(k) or "").strip().lower(), (b.get(k) or "").strip().lower()
+        if va and vb and va != vb:
+            return True
+    return False
+
+
+def identity_match_quality(want, have):
+    """How well two identities match, from the fields actually present on BOTH.
+    Returns 'exact' only when every field present on both sides agrees AND at least
+    codename plus one more identifying field (maker/model/platform) are present on
+    both. 'codename' when only the codename is shared evidence. 'conflict' when any
+    shared field disagrees. 'none' when there's no shared identifying evidence."""
+    if identity_conflict(want, have):
+        return "conflict"
+    shared = [k for k in ("maker", "codename", "model", "platform")
+              if (want.get(k) or "").strip() and (have.get(k) or "").strip()]
+    if not shared:
+        return "none"
+    # all shared fields agree here (no conflict). Grade by how much is corroborated.
+    strong = [k for k in shared if k in ("maker", "model", "platform")]
+    if "codename" in shared and strong:
+        return "exact"
+    if "codename" in shared:
+        return "codename"
+    # shares some hardware field but not codename - weak, treat as codename-grade
+    return "codename"
+
+
+def rooting_db_get(info):
+    """Look up a saved entry for a device.
+
+    Returns a copy of the entry with a "match" field:
+        "exact"     - composite identity corroborated (codename + >=1 of
+                      maker/model/platform agree, nothing conflicts)
+        "codename"  - only the codename could be confirmed; full hardware identity
+                      unconfirmed (missing fields, not a positive conflict)
+        "ambiguous" - several saved variants are compatible; caller should let the
+                      user choose. The copy also carries "candidates": [keys].
+    Entries whose identity POSITIVELY conflicts with the device are never returned.
+    `info` may also be a bare codename string (compatibility) - that can only ever
+    yield a "codename" (or "ambiguous") match, never "exact"."""
+    db = load_rooting_db()
+    if not db:
+        return None
+    if isinstance(info, str):
+        want = {"codename": info.strip(), "maker": "", "model": "", "platform": ""}
+    else:
+        want = device_identity(info)
+
+    graded = []   # (quality, key, entry)
+    for key, e in db.items():
+        q = identity_match_quality(want, _entry_identity(e))
+        if q in ("exact", "codename"):
+            graded.append((q, key, e))
+    if not graded:
+        return None
+    exacts = [g for g in graded if g[0] == "exact"]
+    if len(exacts) == 1:
+        return dict(exacts[0][2], match="exact")
+    if len(exacts) > 1:
+        return dict(exacts[0][2], match="ambiguous", candidates=[g[1] for g in exacts])
+    # no exact: codename-grade matches
+    cods = [g for g in graded if g[0] == "codename"]
+    if len(cods) == 1:
+        return dict(cods[0][2], match="codename")
+    return dict(cods[0][2], match="ambiguous", candidates=[g[1] for g in cods])
+
+
+def rooting_db_get_key(key):
+    """Fetch one entry by its exact DB key (used when the user picks a variant)."""
+    db = load_rooting_db()
+    e = db.get(key)
+    return dict(e, match="exact") if e else None
+
+
+def rooting_db_put(info, res):
+    """Store one AI rooting result under the device's composite identity.
+    `info` is the device_info() dict (or, for refresh-all, a reconstructed one).
+    Returns True only if the entry was actually persisted to disk."""
+    if not isinstance(res, dict) or not res.get("answer"):
+        return False
+    db = load_rooting_db()
+    identity = device_identity(info)
+    if not any(identity.values()):
+        return False
+    props = (info or {}).get("props", {})
+    region = (props.get("ro.miui.region") or props.get("ro.boot.hwcountry")
+              or props.get("ro.boot.hwc") or (info or {}).get("region", ""))
+    db[identity_key_str(identity)] = {
+        "identity": identity,
+        "codename": identity.get("codename", ""),
+        "maker": identity.get("maker", ""),
+        "model_number": identity.get("model", ""),
+        "marketname": (info or {}).get("marketname", ""),
+        "answer": res["answer"],
+        "provider": res.get("provider", ""),
+        "model": res.get("model", ""),
+        "when": res.get("when", time.strftime("%Y-%m-%d %H:%M")),
+        "researched_release": props.get("ro.build.version.release", ""),
+        "researched_sdk": props.get("ro.build.version.sdk", ""),
+        "researched_patch": props.get("ro.build.version.security_patch", ""),
+        "researched_build": (props.get("ro.mi.os.version.incremental")
+                             or props.get("ro.build.version.incremental", "")),
+        "researched_fingerprint": props.get("ro.build.fingerprint", ""),
+        "chip": identity.get("platform", "") or props.get("ro.product.board", ""),
+        "soc": props.get("ro.board.platform", "") or props.get("ro.product.board", ""),
+        "region": region,
+    }
+    return _write_rooting_db(db)
+
+
+def rooting_db_delete(key):
+    """Delete by the exact DB key (as shown in the database window)."""
+    db = load_rooting_db()
+    if key in db:
+        del db[key]
+        return _write_rooting_db(db)
+    # tolerate being given a bare codename
+    for k in list(db):
+        if (_entry_identity(db[k]).get("codename", "")).lower() == str(key).strip().lower():
+            del db[k]
+            return _write_rooting_db(db)
+    return False
+
+
+def rooting_compatibility(entry, info):
+    """Compare the connected device's firmware with what the cached entry was
+    researched at. Does NOT do lexicographical version comparison. Returns
+    (status, message, fields) where status is:
+        "match"    - same build fingerprint (or same build/API where fingerprint
+                     is absent): firmware-specific steps should still apply
+        "hardware" - same model, firmware differs: hardware/unlock research still
+                     applies, but firmware-specific flashing steps need checking
+        "verify"   - compatibility can't be established -> REQUIRES VERIFICATION
+    fields maps each compared field -> (same|differs|unknown, old, now)."""
+    if not entry or not info:
+        return "verify", "no data to compare", {}
+    props = info.get("props", {})
+    now = {"fingerprint": props.get("ro.build.fingerprint", ""),
+           "sdk": props.get("ro.build.version.sdk", ""),
+           "release": props.get("ro.build.version.release", ""),
+           "patch": props.get("ro.build.version.security_patch", ""),
+           "build": (props.get("ro.mi.os.version.incremental")
+                     or props.get("ro.build.version.incremental", ""))}
+    was = {"fingerprint": entry.get("researched_fingerprint", ""),
+           "sdk": entry.get("researched_sdk", ""),
+           "release": entry.get("researched_release", ""),
+           "patch": entry.get("researched_patch", ""),
+           "build": entry.get("researched_build", "")}
+    fields = {}
+    for k in now:
+        if now[k] and was[k]:
+            fields[k] = ("same" if now[k] == was[k] else "differs", was[k], now[k])
+        else:
+            fields[k] = ("unknown", was[k], now[k])
+
+    # Any field present on both sides that disagrees means firmware is not identical.
+    differs = [k for k in ("fingerprint", "build", "patch", "sdk", "release")
+               if now[k] and was[k] and now[k] != was[k]]
+
+    if now["fingerprint"] and was["fingerprint"]:
+        if now["fingerprint"] == was["fingerprint"]:
+            # fingerprint matches; make sure nothing else present contradicts it
+            contradict = [k for k in ("build", "patch", "sdk", "release")
+                          if now[k] and was[k] and now[k] != was[k]]
+            if contradict:
+                return "verify", ("build fingerprint matches but %s disagrees - treat as needing "
+                                  "verification" % ", ".join(contradict)), fields
+            return "match", "same build fingerprint - firmware is identical", fields
+        same_api = now["sdk"] and was["sdk"] and now["sdk"] == was["sdk"]
+        msg = "same API level, different build" if same_api else "different API level and build"
+        return "hardware", "firmware differs (%s)" % msg, fields
+
+    # No usable fingerprint on at least one side.
+    if differs:
+        # a build or security-patch difference is a real firmware change; an API/
+        # release-only difference means hardware research may still apply.
+        if any(k in ("build", "patch", "fingerprint") for k in differs):
+            return "hardware", "firmware differs (%s changed)" % ", ".join(differs), fields
+        return "hardware", "API/Android level differs (%s) - firmware-specific steps need " \
+                           "checking" % ", ".join(differs), fields
+
+    # Nothing contradicts. Is there enough POSITIVE evidence to call it identical?
+    # A matching API/SDK level alone is NOT enough (same API can ship different
+    # builds, patches and boot images). Require a matching build or fingerprint.
+    strong_same = [k for k in ("fingerprint", "build") if now[k] and was[k] and now[k] == was[k]]
+    if strong_same:
+        # corroborate with patch if we have it on both sides
+        if now["patch"] and was["patch"] and now["patch"] != was["patch"]:
+            return "hardware", "same build but different security patch", fields
+        return "match", "firmware looks the same (%s match)" % ", ".join(strong_same), fields
+    api_same = now["sdk"] and was["sdk"] and now["sdk"] == was["sdk"]
+    if api_same:
+        return "hardware", ("only the API level is confirmed equal - build/patch unknown, so "
+                            "firmware-specific steps require verification"), fields
+    return "verify", "can't compare firmware - the device or the saved entry is missing build details", fields
+
+
+def rooting_entry_stale(entry, info):
+    """Back-compat boolean: True when the entry is not an exact firmware match."""
+    status, _, _ = rooting_compatibility(entry, info)
+    return status != "match"

@@ -14,6 +14,9 @@ file needs to change.
 """
 
 SAFE, CAUTION, CRITICAL = "safe", "caution", "critical"
+# UNKNOWN = not enough evidence to classify. It is NOT "safe": it means the tool
+# can't vouch for the app either way. Rendered distinctly from SAFE in the UI.
+UNKNOWN = "unknown"
 
 KNOWN = {
     # ------------------------------------------------------------------
@@ -539,9 +542,11 @@ RISK_TEXT = {
     SAFE: "\u2705 Safe to turn off",
     CAUTION: "\u26a0 Be careful",
     CRITICAL: "\u26d4 Don't turn off",
+    UNKNOWN: "\u2753 Not assessed",
 }
 
-RISK_SHORT = {SAFE: "\u2705 safe", CAUTION: "\u26a0 careful", CRITICAL: "\u26d4 keep on"}
+RISK_SHORT = {SAFE: "\u2705 safe", CAUTION: "\u26a0 careful", CRITICAL: "\u26d4 keep on",
+              UNKNOWN: "\u2753 unknown"}
 
 
 def lookup(package):
@@ -556,12 +561,49 @@ def lookup(package):
     return None
 
 
-def guess(package, system):
-    """Fallback risk + reason for packages not in the lists above."""
+def guess(package, system, from_store=None, hidden=None):
+    """Fallback risk + reason for packages not in the lists above.
+
+    from_store: True if installed from a recognised app store, False if sideloaded
+                (APK/ADB/unknown), None if not known.
+    hidden:     True if the app has no launcher icon, None/False otherwise.
+    The user-app case is deliberately NOT a blanket 'safe': a sideloaded or
+    hidden app is user-installed too, and that's exactly what shouldn't be
+    waved through. Turning an app OFF is still reversible and never deletes
+    data, so the worst case here is caution, not critical."""
     p = package.lower()
+    off_note = ("Turning an app OFF is reversible and doesn't delete it, but it can interrupt "
+                "something that depends on it - a keyboard, launcher, VPN, accessibility service "
+                "or another app - so check what it is first.")
     if not system:
-        return SAFE, ("You installed it (or it came from an app store). Turning it off just "
-                      "stops this app; nothing in the system depends on it.")
+        # Evidence, strongest indicator first. None of these are proof on their own;
+        # the verdict reflects how much is known, and store origin is NOT a clean bill.
+        if hidden is True and from_store is False:
+            return CAUTION, ("Two things worth a look: it was installed from outside an app store, "
+                             "and it has no icon in the app drawer. Each has innocent explanations "
+                             "(plugins and keyboards have no icon; you may have sideloaded it on "
+                             "purpose), but together they're worth checking in the Security tab "
+                             "before you trust it. " + off_note)
+        if from_store is False:
+            return CAUTION, ("It was installed from an APK file or over ADB rather than through an "
+                             "app store. That's normal for apps you sideloaded deliberately, but it "
+                             "wasn't vetted by a store, so check it if you don't recognise it. "
+                             + off_note)
+        if hidden is True:
+            return CAUTION, ("It has no icon in the app drawer. That's normal for keyboards, "
+                             "plugins, widgets and some accessibility tools, but it's also a thing "
+                             "worth confirming if you don't recognise the app. " + off_note)
+        if from_store is True:
+            return UNKNOWN, ("You installed this from an app store, which is the normal path - but a "
+                             "store app can still be unwanted, compromised or depended on by "
+                             "something else, so this tool can't call it safe by origin alone. "
+                             "Use the Apps tab's AI lookup or the Security tab to learn what it is. "
+                             + off_note)
+        # origin genuinely unknown: say so plainly, don't guess either way
+        return UNKNOWN, ("Not enough is known here to classify it: this app isn't in the built-in "
+                         "list and its installation source couldn't be determined. That isn't a "
+                         "red flag by itself - look it up (Apps tab > Ask AI) or check the Security "
+                         "tab to see where it came from. " + off_note)
     if "provider" in p:
         return CAUTION, ("The name says 'provider' - that's usually a data store other apps "
                          "read from. Apps that use it may break.")

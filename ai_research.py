@@ -16,11 +16,13 @@ Needs the official SDKs:  pip install anthropic openai
 import json
 import os
 import re
+import threading
 import time
 
 CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
                           "adb_manager")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "ai_config.json")
+ROOT_DB_FILE = os.path.join(CONFIG_DIR, "root_research_db.json")
 
 PROVIDERS = {
     "anthropic": {"label": "Anthropic (Claude)", "env": "ANTHROPIC_API_KEY",
@@ -457,6 +459,95 @@ def research_rooting(provider, cfg, info, timeout=240):
     except Exception as e:
         res["error"] = explain_error(e)
     return res
+
+
+# --------------------------------------------------------------------------
+# rooting research database: one saved AI answer per device model (codename)
+# --------------------------------------------------------------------------
+
+_root_db_lock = threading.Lock()
+ROOT_INFO_PROPS = ("ro.product.model", "ro.product.manufacturer", "ro.product.brand", "ro.board.platform",
+                   "ro.product.board", "ro.build.version.release", "ro.build.version.sdk",
+                   "ro.mi.os.version.incremental", "ro.build.version.incremental", "ro.build.display.id",
+                   "ro.boot.arb_version")
+
+
+def root_info_for_db(info):
+    """The part of device_info() needed to ask the AI again later, without the phone."""
+    return {"codename": info.get("codename", ""), "marketname": info.get("marketname", ""),
+            "miui": info.get("miui", ""), "bootloader": info.get("bootloader", ""),
+            "arb": bool(info.get("arb")), "is_xiaomi": bool(info.get("is_xiaomi")),
+            "props": {k: v for k, v in (info.get("props") or {}).items() if k in ROOT_INFO_PROPS}}
+
+
+def info_build(info):
+    p = info.get("props") or {}
+    return (p.get("ro.mi.os.version.incremental") or p.get("ro.build.version.incremental")
+            or p.get("ro.build.display.id") or "")
+
+
+def root_db_load():
+    with _root_db_lock:
+        try:
+            with open(ROOT_DB_FILE, encoding="utf-8") as f:
+                db = json.load(f)
+            return db if isinstance(db, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+
+def _root_db_save(db):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = ROOT_DB_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(db, f, indent=1, ensure_ascii=False)
+    os.replace(tmp, ROOT_DB_FILE)
+
+
+def root_db_get(codename):
+    return root_db_load().get((codename or "").lower())
+
+
+def root_db_put(info, res):
+    """Store a research result for this model. A failed attempt never replaces a good
+    saved answer - it is recorded as last_error instead. Returns the stored entry."""
+    key = (info.get("codename") or "").lower()
+    if not key:
+        return None
+    with _root_db_lock:
+        try:
+            with open(ROOT_DB_FILE, encoding="utf-8") as f:
+                db = json.load(f)
+            if not isinstance(db, dict):
+                db = {}
+        except (OSError, ValueError):
+            db = {}
+        old = db.get(key)
+        if res.get("answer"):
+            entry = {"info": root_info_for_db(info), "result": res,
+                     "updated": time.strftime("%Y-%m-%d %H:%M"), "updated_ts": time.time()}
+        elif isinstance(old, dict) and (old.get("result") or {}).get("answer"):
+            entry = dict(old)
+            entry["last_error"] = res.get("error") or "no answer"
+            entry["last_error_when"] = time.strftime("%Y-%m-%d %H:%M")
+        else:
+            entry = {"info": root_info_for_db(info), "result": res,
+                     "updated": time.strftime("%Y-%m-%d %H:%M"), "updated_ts": time.time()}
+        db[key] = entry
+        _root_db_save(db)
+        return entry
+
+
+def root_db_delete(codenames):
+    with _root_db_lock:
+        try:
+            with open(ROOT_DB_FILE, encoding="utf-8") as f:
+                db = json.load(f)
+        except (OSError, ValueError):
+            return
+        for c in codenames:
+            db.pop((c or "").lower(), None)
+        _root_db_save(db)
 
 
 def research(provider, cfg, app, props, timeout=240):

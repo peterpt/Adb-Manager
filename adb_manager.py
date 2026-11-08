@@ -569,6 +569,15 @@ def scan_packages(serial):
         details = {}
     props = device_props(serial)
     used = in_use_packages(serial)
+    # Launcher (icon) discovery: True = has an icon, False = confirmed none,
+    # None = couldn't determine. Only meaningful for non-removed packages.
+    user_pkgs = [p for p, pa in paths.items()]
+    try:
+        launcher_set, launcher_method = sa.launcher_packages(
+            lambda c, t=60: adb_shell(serial, c, timeout=t), user_pkgs)
+        launcher_known = launcher_method is not None   # None => discovery failed
+    except Exception:
+        launcher_set, launcher_known = set(), False
 
     apps = {}
     for pkg, path in list(paths.items()) + list(removed.items()):
@@ -602,6 +611,9 @@ def scan_packages(serial):
             "granted": d.get("granted", []),
             "in_use": used.get(pkg),
             "removed": pkg in removed,
+            # icon: True has a launcher icon, False confirmed none, None unknown.
+            # Only trusted when discovery worked and the package was in scope.
+            "icon": (pkg in launcher_set) if (launcher_known and pkg not in removed) else None,
             "group": group_of(pkg, is_sys),
         }
     return {"apps": apps, "props": props}
@@ -1524,6 +1536,7 @@ class AppsTab(ttk.Frame):
         self.tree.tag_configure("safe", foreground="#2e7d32")
         self.tree.tag_configure("caution", foreground="#b26a00")
         self.tree.tag_configure("critical", foreground="#c62828")
+        self.tree.tag_configure("unknown", foreground="#5a6b7b")
         self.tree.tag_configure("off", background="#e6e6e6")
         sb = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
@@ -1549,6 +1562,7 @@ class AppsTab(ttk.Frame):
         self.details.tag_configure("safe", foreground="#2e7d32", font=("TkDefaultFont", 12, "bold"))
         self.details.tag_configure("caution", foreground="#b26a00", font=("TkDefaultFont", 12, "bold"))
         self.details.tag_configure("critical", foreground="#c62828", font=("TkDefaultFont", 12, "bold"))
+        self.details.tag_configure("unknown", foreground="#5a6b7b", font=("TkDefaultFont", 12, "bold"))
         self.details.tag_configure("warn", foreground="#c62828")
         self.details.tag_configure("b", font=("TkDefaultFont", 10, "bold"))
         self.details.tag_configure("bk_research", foreground="#2e7d32")
@@ -1738,10 +1752,24 @@ class AppsTab(ttk.Frame):
         if k:
             risk, what, if_off = k["risk"], k["what"], k["if_off"]
         else:
-            risk, if_off = kb.guess(a["package"], a["system"])
+            # Three-state origin: True recognised store, False recognised
+            # sideload/ADB source, None unknown/missing/unrecognised. Absence of
+            # an installer is NOT proof of sideloading, so it stays None.
+            from_store = None
+            if not a["system"]:
+                inst = (a.get("installer") or "").strip()
+                if inst:
+                    from_store = True if inst in sa.STORES else (False if inst in sa.FILE_INSTALLERS
+                                                                 else None)
+            # Three-state hidden: a[icon] is True/False/None from scan-time launcher
+            # discovery. hidden is its inverse; None stays None (inspection failed).
+            icon = a.get("icon")
+            hidden = (not icon) if icon is not None else None
+            risk, if_off = kb.guess(a["package"], a["system"], from_store=from_store, hidden=hidden)
             what = None
-        if not a["system"] and risk == kb.CRITICAL:
-            risk = kb.CAUTION
+        # NOTE: no blanket CRITICAL->CAUTION downgrade for user apps. A user-
+        # installed app can genuinely be critical/high-risk; the built-in list
+        # and in_use logic set risk on evidence, not on system-vs-user status.
         if a["in_use"]:
             risk = kb.CRITICAL
             if_off = ("This is the %s you are using right now. Turning it off could leave "
@@ -1936,7 +1964,9 @@ class AppsTab(ttk.Frame):
                 w(kb.RISK_TEXT[kb.CAUTION] + "\n", "caution")
                 w("   other things may stop working - read the note\n")
                 w(kb.RISK_TEXT[kb.CRITICAL] + "\n", "critical")
-                w("   the device may misbehave or not start - leave it on\n\n")
+                w("   the device may misbehave or not start - leave it on\n")
+                w(kb.RISK_TEXT[kb.UNKNOWN] + "\n", "unknown")
+                w("   not enough is known to vouch for it - look it up before trusting it\n\n")
                 w("Grey rows are apps that are turned off.\n"
                   "Turning an app off never deletes it or its data; you can turn it back on here.",
                   "dim")
@@ -3103,7 +3133,7 @@ class NetworkTab(ttk.Frame):
                     and q not in self.names.get(s["remote_ip"], "").lower():
                 continue
             groups.setdefault(s["uid"] % 100000, []).append(s)
-        rank = {"critical": 0, "caution": 1, "safe": 2, "": 3}
+        rank = {"critical": 0, "caution": 1, "unknown": 2, "safe": 3, "": 4}
 
         def worst(items):
             return min((self.risk(s) for s in items), key=lambda r: rank[r])
@@ -3479,7 +3509,11 @@ class SecurityTab(ttk.Frame):
         facts = sa.collect(shell, apps, socks)
         users = sorted(p for p, a in apps.items() if not a["system"] and not a.get("removed"))
         self.say("Security: checking which apps hide their icon ...")
-        launcher = sa.launcher_packages(shell, users)[0] if users else set()
+        if users:
+            lset, lmethod = sa.launcher_packages(shell, users)
+            launcher = lset if lmethod is not None else None   # None => unknown, not "all hidden"
+        else:
+            launcher = set()
         access = sa.access_lists(facts)
         found = (sa.check_device(facts) + sa.check_access(facts, access, launcher, label) +
                  sa.check_origin(facts, launcher, label) + sa.check_usage(facts, launcher, label))
@@ -3717,6 +3751,7 @@ class DeviceInfoWindow(tk.Toplevel):
         txt.tag_configure("ok", foreground="#2e7d32")
         txt.tag_configure("link", foreground="#1f5fbf", underline=True)
         self._links = {}
+        self.txt = txt
         w = lambda t, tag=(): txt.insert("end", t, tag)  # noqa: E731
 
         name = info.get("marketname") or "This device"
@@ -3748,15 +3783,23 @@ class DeviceInfoWindow(tk.Toplevel):
             for text, url in links:
                 w("\u2022 " + text + "\n")
                 self.add_link(txt, url)
-
+        txt.insert("end", "\n")
+        self._ai_mark = txt.index("end-1c")   # cached/live AI answer goes here
         txt.configure(state="disabled")
+
+        entry = sa.rooting_db_get(info)
+        if entry:
+            self.render_db_entry(entry)
         btns = ttk.Frame(self, padding=(14, 0, 14, 14))
         btns.pack(fill="x")
-        self.txt = txt
         ttk.Button(btns, text="Close", command=self.destroy).pack(side="right")
         ttk.Button(btns, text="Copy all", command=lambda: self.copy(txt)).pack(side="right", padx=6)
         self.ai_btn = ttk.Button(btns, text="Research rooting with AI", command=self.research_rooting)
         self.ai_btn.pack(side="left")
+        self.refresh_btn = ttk.Button(btns, text="Refresh this model", command=self.refresh_model)
+        self.refresh_btn.pack(side="left", padx=4)
+        self.db_btn = ttk.Button(btns, text="Database ...", command=self.open_db)
+        self.db_btn.pack(side="left")
         self.ai_note = ttk.Label(btns, text="", foreground="#777777")
         self.ai_note.pack(side="left", padx=8)
 
@@ -3818,10 +3861,15 @@ class DeviceInfoWindow(tk.Toplevel):
         ttk.Button(row, text="Ask this AI", command=go).pack(side="right", padx=6)
         win.grab_set()
 
+    def refresh_model(self):
+        # same as researching, but makes clear it overwrites the stored entry
+        self.research_rooting()
+
     def _start_ai(self, provider, cfg):
         self.ai_busy = True
         self.ai_stop.clear()
         self.ai_btn.state(["disabled"])
+        self.refresh_btn.state(["disabled"])
         self.ai_note.configure(text="Asking %s (web search, a minute or two) ..."
                                % ai.PROVIDERS[provider]["label"])
         self.render_ai_placeholder(provider)
@@ -3834,7 +3882,11 @@ class DeviceInfoWindow(tk.Toplevel):
     def _ai_done(self, res):
         self.ai_busy = False
         self.ai_btn.state(["!disabled"])
+        self.refresh_btn.state(["!disabled"])
         self.ai_note.configure(text="")
+        saved = sa.rooting_db_put(self.info, res) if res.get("answer") else False
+        if res.get("answer") and not saved:
+            res = dict(res, save_failed=True)
         if not self.winfo_exists():
             return
         self.render_ai(res)
@@ -3856,6 +3908,75 @@ class DeviceInfoWindow(tk.Toplevel):
         t.configure(state="disabled")
         t.see("end")
 
+    def render_db_entry(self, entry):
+        """Show a stored answer from the rooting database (no AI call)."""
+        t = self._ai_section_start()
+        w = lambda text, tag=(): t.insert("end", text, tag)  # noqa: E731
+        w("\nAI rooting research \u2014 saved\n", "h2")
+        match = entry.get("match", "exact")
+        # (1) hardware identity confidence - kept separate from firmware below
+        hardware_confirmed = (match == "exact")
+        if match == "codename":
+            w("\u26a0 Matched by codename only. The full hardware identity could not be confirmed "
+              "(maker/model/platform weren't all available to compare), so this saved answer might "
+              "belong to a different variant. Treat it as a guide and verify before flashing.\n",
+              "warn")
+        elif match == "ambiguous":
+            cands = entry.get("candidates", [])
+            w("\u26a0 Several saved variants are compatible with this device (%d). Showing one - "
+              "open 'Database' to pick the exact model. The others:\n" % len(cands), "warn")
+            for k in cands[1:6]:
+                w("    \u2022 %s\n" % k, "dim")
+        w("From the rooting database: researched %s by %s%s, for Android %s%s.\n" % (
+            entry.get("when", "?"), ai.PROVIDERS.get(entry.get("provider"), {}).get("label",
+            entry.get("provider", "?")), (" " + entry["model"]) if entry.get("model") else "",
+            entry.get("researched_release") or "?",
+            (" build " + entry["researched_build"]) if entry.get("researched_build") else ""), "dim")
+        # (2) firmware comparison - only meaningful once hardware is the same device
+        status, cmsg, _ = sa.rooting_compatibility(entry, self.info)
+        if not hardware_confirmed:
+            w("Firmware comparison is not shown because the hardware identity isn't confirmed - "
+              "confirm the model first.\n", "dim")
+        elif status == "match":
+            w("\u2705 Same hardware, and firmware matches what was researched (%s).\n" % cmsg, "ok")
+        elif status == "hardware":
+            w("\u26a0 Same phone model, but %s. The unlock/hardware research still applies; any "
+              "firmware-specific flashing step (which boot.img, which firmware package) must be "
+              "re-checked. Press 'Refresh this model' to update.\n" % cmsg, "warn")
+        else:
+            w("\u26d4 REQUIRES VERIFICATION: %s. Don't rely on the firmware-specific steps until "
+              "you've confirmed them. Press 'Refresh this model'.\n" % cmsg, "warn")
+        self._render_answer_fields(w, entry["answer"])
+        w("\nPress 'Refresh this model' to ask the AI again and update this entry.\n", "dim")
+        t.configure(state="disabled")
+        t.see(self._ai_mark)
+
+    def _render_answer_fields(self, w, a):
+        if a.get("summary"):
+            w(a["summary"] + "\n")
+        risk = (a.get("brick_risk") or "").lower()
+        rtag = "warn" if risk.startswith(("high", "medium")) else ()
+        pairs = [("Can it be unlocked?", a.get("can_unlock"), "ok" if a.get("can_unlock") == "yes"
+                  else "warn" if a.get("can_unlock") in ("no", "difficult") else ()),
+                 ("Unlock method", a.get("unlock_method"), ()),
+                 ("Needs Windows?", a.get("needs_windows"), ()),
+                 ("Waiting period", a.get("wait_time"), ()),
+                 ("TWRP / OrangeFox", a.get("twrp"), ()),
+                 ("Root method", a.get("root_method"), ()),
+                 ("Brick risk", a.get("brick_risk"), rtag),
+                 ("Anti-rollback", a.get("anti_rollback"), ()),
+                 ("Device", a.get("device"), ())]
+        for label, value, tag in pairs:
+            if value:
+                w("\n" + label + ": ", "label")
+                w(value + "\n", tag)
+        if a.get("confidence"):
+            w("\nAI confidence: %s\n" % a["confidence"], "dim")
+        if a.get("sources"):
+            w("Sources (click to open)\n", "label")
+            for u in a["sources"][:10]:
+                self.add_link(self.txt, u)
+
     def render_ai(self, res):
         t = self._ai_section_start()
         w = lambda text, tag=(): t.insert("end", text, tag)  # noqa: E731
@@ -3869,36 +3990,221 @@ class DeviceInfoWindow(tk.Toplevel):
             t.see(self._ai_mark)
             return
         a = res["answer"]
-        w("This is the AI's research - verify against the sources before flashing anything.\n", "dim")
-        if a["summary"]:
-            w(a["summary"] + "\n")
-        risk = a["brick_risk"].lower()
-        rtag = "warn" if risk.startswith(("high", "medium")) else ()
-        pairs = [("Can it be unlocked?", a["can_unlock"], "ok" if a["can_unlock"] == "yes"
-                  else "warn" if a["can_unlock"] in ("no", "difficult") else ()),
-                 ("Unlock method", a["unlock_method"], ()),
-                 ("Needs Windows?", a["needs_windows"], ()),
-                 ("Waiting period", a["wait_time"], ()),
-                 ("TWRP / OrangeFox", a["twrp"], ()),
-                 ("Root method", a["root_method"], ()),
-                 ("Brick risk", a["brick_risk"], rtag),
-                 ("Anti-rollback", a["anti_rollback"], ()),
-                 ("Device", a["device"], ())]
-        for label, value, tag in pairs:
-            if value:
-                w("\n" + label + ": ", "label")
-                w(value + "\n", tag)
-        w("\nAI confidence: %s\n" % a["confidence"], "dim")
-        if a["sources"]:
-            w("Sources (click to open)\n", "label")
-            for u in a["sources"][:10]:
-                self.add_link(t, u)
+        if res.get("save_failed"):
+            w("Fresh AI research (could NOT be saved to the database - check disk/permissions). "
+              "Verify against the sources before flashing.\n", "warn")
+        else:
+            w("Fresh AI research - saved to the database. Verify against the sources before flashing.\n",
+              "dim")
+        self._render_answer_fields(w, a)
         t.configure(state="disabled")
         t.see(self._ai_mark)
+
+    def open_db(self):
+        win = getattr(self, "_db_win", None)
+        if win is not None and win.winfo_exists():
+            win.lift()
+            return
+        self._db_win = RootingDBWindow(self, self.app)
 
     def copy(self, txt):
         self.clipboard_clear()
         self.clipboard_append(txt.get("1.0", "end").strip())
+
+
+class RootingDBWindow(tk.Toplevel):
+    """The saved rooting database: one row per codename, with refresh and delete."""
+
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.title("Rooting database")
+        self.transient(parent)
+        self.app = app
+        self.minsize(640, 360)
+        self.busy = False
+        self.stop = threading.Event()
+
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="Rooting info saved per device identity (maker + codename + model + "
+                  "platform). Opening a known device shows its saved answer with no AI call; a "
+                  "different variant that shares a codename is matched only as a labelled fallback.",
+                  foreground="#555555", wraplength=620, justify="left").pack(fill="x")
+        cols = ("codename", "name", "maker", "model", "unlock", "risk", "by", "when", "android")
+        self.tree = ttk.Treeview(frm, columns=cols, show="headings", selectmode="browse", height=10)
+        for c, head, wdt in (("codename", "Codename", 100), ("name", "Marketing name", 120),
+                             ("maker", "Maker", 80), ("model", "Model", 100),
+                             ("unlock", "Unlock?", 70), ("risk", "Brick risk", 100),
+                             ("by", "Researched by", 100), ("when", "When", 90),
+                             ("android", "Android", 60)):
+            self.tree.heading(c, text=head)
+            self.tree.column(c, width=wdt, stretch=(c == "name"))
+        sb = ttk.Scrollbar(frm, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True, pady=(6, 0))
+        sb.pack(side="right", fill="y", pady=(6, 0))
+
+        row = ttk.Frame(self, padding=(10, 0, 10, 10))
+        row.pack(fill="x")
+        self.refresh_one_btn = ttk.Button(row, text="Refresh selected", command=self.refresh_selected)
+        self.refresh_one_btn.pack(side="left")
+        self.refresh_all_btn = ttk.Button(row, text="Refresh whole database", command=self.refresh_all)
+        self.refresh_all_btn.pack(side="left", padx=4)
+        self.del_btn = ttk.Button(row, text="Delete selected", command=self.delete_selected)
+        self.del_btn.pack(side="left")
+        self.stop_btn = ttk.Button(row, text="Stop", command=self.stop.set)
+        self.status = ttk.Label(row, text="", foreground="#555555")
+        self.status.pack(side="left", padx=10)
+        ttk.Button(row, text="Close", command=self.destroy).pack(side="right")
+        self.populate()
+
+    def populate(self):
+        self.tree.delete(*self.tree.get_children())
+        db = sa.load_rooting_db()
+        for key in sorted(db):
+            e = db[key]
+            ident = e.get("identity", {})
+            a = e.get("answer", {})
+            self.tree.insert("", "end", iid=key, values=(
+                ident.get("codename", "") or e.get("codename", "") or "?",
+                e.get("marketname", "") or "-",
+                ident.get("maker", "") or e.get("maker", "") or "-",
+                ident.get("model", "") or e.get("model_number", "") or "-",
+                a.get("can_unlock", "?"), (a.get("brick_risk", "") or "?")[:18],
+                ai.PROVIDERS.get(e.get("provider"), {}).get("label", e.get("provider", "?")),
+                (e.get("when", "") or "")[:10], e.get("researched_release", "") or "-"))
+        self.status.configure(text="%d model(s) saved" % len(db))
+
+    def _lock(self, busy):
+        self.busy = busy
+        for b in (self.refresh_one_btn, self.refresh_all_btn, self.del_btn):
+            b.state(["disabled"] if busy else ["!disabled"])
+        if busy:
+            self.stop_btn.pack(side="left", padx=4, after=self.del_btn)
+        else:
+            self.stop_btn.pack_forget()
+
+    def _provider(self):
+        cfg = ai.load_config()
+        have = [p for p in ai.PROVIDERS if ai.api_key(cfg, p)]
+        if not have:
+            messagebox.showinfo("No AI key", "No AI provider has an API key yet.\n\nAdd one in the "
+                                "Apps tab > AI settings.", parent=self)
+            return None, None
+        main = cfg.get("provider", "anthropic")
+        return (main if main in have else have[0]), cfg
+
+    def refresh_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            self.app.info("Select a model first")
+            return
+        provider, cfg = self._provider()
+        if not provider:
+            return
+        self._run([sel[0]], provider, cfg)
+
+    def refresh_all(self):
+        db = sa.load_rooting_db()
+        if not db:
+            self.app.info("The database is empty")
+            return
+        provider, cfg = self._provider()
+        if not provider:
+            return
+        if not messagebox.askyesno("Refresh whole database",
+                                   "Re-ask %s about all %d saved model(s)? That's %d AI call(s), billed "
+                                   "to your API account.\n\nThis researches the saved models - it "
+                                   "doesn't need those phones connected." % (
+                                       ai.PROVIDERS[provider]["label"], len(db), len(db)), parent=self):
+            return
+        self._run(sorted(db), provider, cfg)
+
+    def _run(self, codenames, provider, cfg):
+        if self.busy:
+            return
+        self.stop.clear()
+        self._lock(True)
+        threading.Thread(target=self._worker, args=(codenames, provider, cfg), daemon=True).start()
+
+    def _worker(self, keys, provider, cfg):
+        done = saved_fail = ai_fail = errored = 0
+        try:
+            db = sa.load_rooting_db()
+            for i, key in enumerate(keys):
+                if self.stop.is_set():
+                    break
+                try:
+                    entry = db.get(key)
+                    if not entry:
+                        continue
+                    ident = sa._entry_identity(entry)
+                    name = entry.get("marketname") or ident.get("codename") or key
+                    self.app.q.put(("call", self._progress, "Refreshing %d/%d: %s ..." % (
+                        i + 1, len(keys), name)))
+                    # rebuild the FULL stored identity + firmware context so nothing is lost
+                    info = {"codename": ident.get("codename", ""),
+                            "marketname": entry.get("marketname", ""), "miui": "", "bootloader": "",
+                            "region": entry.get("region", ""),
+                            "props": {"ro.product.manufacturer": ident.get("maker", ""),
+                                      "ro.product.model": ident.get("model", ""),
+                                      "ro.board.platform": ident.get("platform", "") or entry.get("soc", ""),
+                                      "ro.product.board": entry.get("chip", ""),
+                                      "ro.miui.region": entry.get("region", ""),
+                                      "ro.build.version.release": entry.get("researched_release", ""),
+                                      "ro.build.version.sdk": entry.get("researched_sdk", ""),
+                                      "ro.build.version.security_patch": entry.get("researched_patch", ""),
+                                      "ro.build.fingerprint": entry.get("researched_fingerprint", ""),
+                                      "ro.build.version.incremental": entry.get("researched_build", "")},
+                            "arb": False}
+                    res = ai.research_rooting(provider, cfg, info)
+                    if not res.get("answer"):
+                        ai_fail += 1
+                        self.app.q.put(("call", self._note_error, name, res.get("error", "no answer")))
+                        continue
+                    # count success ONLY if persistence actually succeeded
+                    if sa.rooting_db_put(info, res):
+                        done += 1
+                    else:
+                        saved_fail += 1
+                        self.app.q.put(("call", self._note_error, name, "AI answered but saving failed"))
+                except Exception as e:   # one bad model must not kill the whole run
+                    errored += 1
+                    self.app.q.put(("call", self._note_error, key, "%s: %s" % (type(e).__name__, e)))
+        finally:
+            # completion is always delivered, even on cancel or unexpected failure
+            self.app.q.put(("call", self._finished, done, len(keys), ai_fail, saved_fail, errored))
+
+    def _progress(self, text):
+        self.status.configure(text=text)
+        self.app.info(text)
+
+    def _note_error(self, cn, err):
+        self.app.error("%s: %s" % (cn, err))
+
+    def _finished(self, done, total, ai_fail=0, saved_fail=0, errored=0):
+        self._lock(False)
+        self.populate()
+        parts = ["Refreshed %d of %d model(s)" % (done, total)]
+        if ai_fail:
+            parts.append("%d AI-failed" % ai_fail)
+        if saved_fail:
+            parts.append("%d save-failed" % saved_fail)
+        if errored:
+            parts.append("%d errored" % errored)
+        if self.stop.is_set():
+            parts.append("stopped")
+        msg = parts[0] + (" (" + ", ".join(parts[1:]) + ")" if len(parts) > 1 else "")
+        self.status.configure(text=msg)
+        (self.app.error if (ai_fail or saved_fail or errored) else self.app.info)(msg)
+
+    def delete_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        if messagebox.askyesno("Delete", "Remove '%s' from the rooting database?" % sel[0], parent=self):
+            sa.rooting_db_delete(sel[0])
+            self.populate()
 
 
 class SecuritySettings(tk.Toplevel):
@@ -4027,7 +4333,7 @@ class UninstallDialog(tk.Toplevel):
         users = [i for i in items if not i["system"]]
         systems = [i for i in items if i["system"]]
         updated = [i for i in systems if i["updated"]]
-        mark = {kb.SAFE: "\u2705", kb.CAUTION: "\u26a0", kb.CRITICAL: "\u26d4"}
+        mark = {kb.SAFE: "\u2705", kb.CAUTION: "\u26a0", kb.CRITICAL: "\u26d4", kb.UNKNOWN: "\u2753"}
 
         def listing(rows):
             for i in rows[:10]:
