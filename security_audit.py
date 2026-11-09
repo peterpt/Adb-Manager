@@ -329,22 +329,45 @@ def launcher_packages(shell, pkgs):
     found = set(m.group(1) for m in re.finditer(r"(?m)^\s*([A-Za-z][\w.]*)/[\w.$]+\s*$", out))
     if found:
         return found & set(pkgs), "query-activities"
-    # query-activities produced nothing: fall back to per-package dumps. Track
-    # whether ANY dump actually succeeded, so total failure is reported as None.
+    # query-activities produced nothing usable. It may have genuinely returned no
+    # rows, OR failed WITHOUT raising (the shell wrapper can hide the exit code and
+    # Android prints errors to stdout). Don't trust error-shaped output as an
+    # authoritative "none" - fall back to per-package dumps, and only treat a dump
+    # as evidence when it actually looks like a package dump.
     have, any_ok = set(), False
     for p in pkgs:
         try:
             dump = shell("dumpsys package " + p, 30) or ""
-            any_ok = True
         except Exception:
             continue
+        if _looks_like_cmd_error(dump) or not _looks_like_pkg_dump(dump):
+            continue   # failed or empty/unusable output -> not evidence of "no icon"
+        any_ok = True
         if "android.intent.category.LAUNCHER" in dump:
             have.add(p)
     if have:
         return have, "per-package"
     if any_ok:
-        return set(), "per-package"       # genuinely none have a launcher icon
-    return set(), None                     # discovery failed - caller: treat as unknown
+        return set(), "per-package"       # at least one real dump, none had a launcher
+    return set(), None                     # discovery failed entirely -> caller: unknown
+
+
+def _looks_like_cmd_error(text):
+    """True if shell output looks like a command failure rather than real data
+    (Android/toybox print these to stdout, so a non-raising shell hides them)."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    head = t[:200].lower()
+    return any(s in head for s in ("error:", "exception", "not found", "unknown command",
+                                   "no such", "usage:", "permission denial", "can't find",
+                                   "cannot find", "inaccessible or not found"))
+
+
+def _looks_like_pkg_dump(text):
+    """True if a 'dumpsys package <pkg>' output looks like a genuine package dump."""
+    t = text or ""
+    return ("Package [" in t) or ("codePath=" in t) or ("versionName=" in t)
 
 
 # --------------------------------------------------------------------------
@@ -496,6 +519,7 @@ def device_info(shell):
                  "ro.product.name", "ro.product.device", "ro.product.marketname",
                  "ro.product.odm.marketname", "ro.boot.product.hardware.sku", "ro.boot.hardware.sku",
                  "ro.product.board", "ro.board.platform", "ro.product.cpu.abi",
+                 "ro.soc.model", "ro.soc.manufacturer",
                  "ro.build.version.release", "ro.build.version.sdk", "ro.build.version.incremental",
                  "ro.build.id", "ro.build.display.id", "ro.build.version.security_patch",
                  "ro.build.date", "ro.build.type", "ro.build.tags", "ro.build.fingerprint",
@@ -1225,76 +1249,136 @@ def tracker_findings(apps, labeler, reports):
 ROOTING_DB_SCHEMA = 2   # 1 = legacy codename-keyed flat dict; 2 = {schema, entries{}}
 
 
-def _write_rooting_db(entries):
-    """Persist the entries map privately (0600 file, 0700 dir), with schema version."""
+class RootingDBError(Exception):
+    """Raised when the rooting DB can't be stored safely (e.g. private perms failed)."""
+
+
+_rooting_db_future = [False]   # set when a newer-than-supported schema is seen
+
+
+def rooting_db_is_future():
+    """True if the on-disk DB was written by a newer app version (schema > ours).
+    In that case we never rewrite it and operate read-only to avoid data loss."""
+    return _rooting_db_future[0]
+
+
+def _ensure_private_dir():
+    """Create CONFIG_DIR as 0700. Raises RootingDBError if perms can't be set."""
     try:
         os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    except OSError as e:
+        raise RootingDBError("can't create %s: %s" % (CONFIG_DIR, e))
+    try:
         os.chmod(CONFIG_DIR, 0o700)
+    except OSError as e:
+        raise RootingDBError("can't set private (0700) permissions on %s: %s" % (CONFIG_DIR, e))
+
+
+def _write_rooting_db(entries, force=False):
+    """Persist the entries map privately (0600 file, 0700 dir) with schema version.
+    Returns True on success, False on failure (never raises to GUI callers). Refuses
+    to overwrite a future-schema file unless force=True (used to deliberately reset)."""
+    if _rooting_db_future[0] and not force:
+        return False
+    try:
+        _ensure_private_dir()
+    except RootingDBError:
+        return False
+    ok = save_json(ROOTING_DB_FILE, {"schema": ROOTING_DB_SCHEMA, "entries": entries}, private=True)
+    if ok and force:
+        _rooting_db_future[0] = False   # we just wrote a current-schema file
+    return ok
+
+
+def _backup_once():
+    """Copy the current DB file to .bak once, with private perms (0600)."""
+    try:
+        if os.path.exists(ROOTING_DB_FILE) and not os.path.exists(ROOTING_DB_FILE + ".bak"):
+            import shutil as _sh
+            _sh.copy2(ROOTING_DB_FILE, ROOTING_DB_FILE + ".bak")
+            try:
+                os.chmod(ROOTING_DB_FILE + ".bak", 0o600)
+            except OSError:
+                pass
     except OSError:
         pass
-    return save_json(ROOTING_DB_FILE, {"schema": ROOTING_DB_SCHEMA, "entries": entries}, private=True)
 
 
 def load_rooting_db():
-    """Return the entries map {key: entry}, migrating legacy formats once.
+    """Return the entries map {key: entry}, migrating older formats once.
 
-    Migration is collision-safe: if two legacy codename-only records would map to
-    the same composite key, the colliding one is kept under a disambiguated key so
-    nothing silently disappears. A one-time .bak of the pre-migration file is left
-    beside it."""
+    Migration decides from the TOP-LEVEL structure, not per-entry:
+      - current schema (2): return entries as-is.
+      - future schema (>2): don't touch it; operate read-only (rooting_db_is_future).
+      - any older/flat structure: migrate every entry to composite keys and rewrite
+        as schema 2. Collisions are kept (disambiguated), nothing is dropped, and a
+        one-time 0600 .bak of the pre-migration file is left beside it."""
+    _rooting_db_future[0] = False
     raw = load_json(ROOTING_DB_FILE, {})
     if not isinstance(raw, dict) or not raw:
         return {}
-    if raw.get("schema") == ROOTING_DB_SCHEMA and isinstance(raw.get("entries"), dict):
+    schema = raw.get("schema")
+    if isinstance(schema, int) and schema > ROOTING_DB_SCHEMA:
+        _rooting_db_future[0] = True   # newer app wrote this - preserve it untouched
+        return raw.get("entries", {}) if isinstance(raw.get("entries"), dict) else {}
+    if schema == ROOTING_DB_SCHEMA and isinstance(raw.get("entries"), dict):
         return raw["entries"]
 
-    # legacy: either a bare {codename: entry} map (schema 1) or a schema-1.x variant
-    legacy = raw.get("entries", raw) if isinstance(raw.get("entries"), dict) else raw
-    entries, changed = {}, False
-    for key, entry in legacy.items():
+    # Anything else is an older/intermediate structure needing migration: a bare
+    # {codename/key: entry} map, or a wrapper with entries{} but an older schema,
+    # or entries that already have identity dicts but no current schema wrapper.
+    source = raw.get("entries") if isinstance(raw.get("entries"), dict) else raw
+    entries = {}
+    for key, entry in source.items():
         if key in ("schema", "entries") or not isinstance(entry, dict):
             continue
         if "identity" not in entry:
             entry["identity"] = {"maker": entry.get("maker", ""),
                                  "codename": entry.get("codename", key),
                                  "model": entry.get("model_number", ""),
-                                 "platform": entry.get("chip", "")}
-            changed = True
+                                 "platform": entry.get("chip", ""),
+                                 "region": entry.get("region", "")}
         new_key = identity_key_str(entry["identity"])
         if new_key in entries:        # collision: keep both, don't overwrite
-            changed = True
             n = 2
             while "%s#%d" % (new_key, n) in entries:
                 n += 1
             new_key = "%s#%d" % (new_key, n)
         entries[new_key] = entry
-    if changed:
-        try:
-            if os.path.exists(ROOTING_DB_FILE) and not os.path.exists(ROOTING_DB_FILE + ".bak"):
-                import shutil as _sh
-                _sh.copy2(ROOTING_DB_FILE, ROOTING_DB_FILE + ".bak")
-        except OSError:
-            pass
-        _write_rooting_db(entries)
+    _backup_once()
+    _write_rooting_db(entries)   # always rewrite older structures in current schema
     return entries
 
 
 def device_identity(info):
-    """The preferred composite identity for a device: maker + codename + model + platform.
-    Any part may be '' if the device didn't report it."""
+    """The composite identity for a device. Any part may be '' if the device
+    didn't report it. The key is built from maker|codename|model|platform|region
+    so regional variants (different unlock policy / firmware) don't overwrite each
+    other. SoC fields are recorded for display/variant reasoning but NOT invented."""
     props = (info or {}).get("props", {})
     return {
         "maker": (props.get("ro.product.manufacturer") or props.get("ro.product.brand") or "").strip(),
         "codename": (info or {}).get("codename", "").strip(),
         "model": props.get("ro.product.model", "").strip(),
         "platform": (props.get("ro.board.platform") or props.get("ro.product.board") or "").strip(),
+        "region": (props.get("ro.miui.region") or props.get("ro.boot.hwcountry")
+                   or props.get("ro.boot.hwc") or (info or {}).get("region", "")).strip(),
+        # SoC identifiers kept distinct; these are NOT the same as board/platform
+        "soc_model": props.get("ro.soc.model", "").strip(),
+        "soc_manufacturer": props.get("ro.soc.manufacturer", "").strip(),
+        "board": props.get("ro.product.board", "").strip(),
     }
 
 
+# Fields that form the DB key (identity that distinguishes a flashable variant).
+KEY_FIELDS = ("maker", "codename", "model", "platform", "region")
+# Fields compared for conflict/agreement (SoC adds corroboration when present).
+MATCH_FIELDS = ("maker", "codename", "model", "platform", "region", "soc_model", "board")
+
+
 def identity_key_str(identity):
-    """The DB key for an identity. All four parts, lowercased, '|'-joined."""
-    return "|".join((identity.get("maker", ""), identity.get("codename", ""),
-                     identity.get("model", ""), identity.get("platform", ""))).lower()
+    """The DB key for an identity: maker|codename|model|platform|region, lowercased."""
+    return "|".join((identity.get(f, "") or "") for f in KEY_FIELDS).lower()
 
 
 def _entry_identity(e):
@@ -1302,38 +1386,57 @@ def _entry_identity(e):
     return {"maker": i.get("maker", "") or e.get("maker", ""),
             "codename": i.get("codename", "") or e.get("codename", ""),
             "model": i.get("model", "") or e.get("model_number", ""),
-            "platform": i.get("platform", "") or e.get("chip", "")}
+            "platform": i.get("platform", "") or e.get("chip", ""),
+            "region": i.get("region", "") or e.get("region", ""),
+            "soc_model": i.get("soc_model", ""),
+            "soc_manufacturer": i.get("soc_manufacturer", ""),
+            "board": i.get("board", "")}
 
 
 def identity_conflict(a, b):
     """True if two identities POSITIVELY disagree on any field both actually have.
     Missing fields don't conflict - only values present on both sides and differing."""
-    for k in ("maker", "codename", "model", "platform"):
+    for k in MATCH_FIELDS:
         va, vb = (a.get(k) or "").strip().lower(), (b.get(k) or "").strip().lower()
         if va and vb and va != vb:
             return True
     return False
 
 
+# The identity fields that, together with codename, make a variant "sufficiently
+# complete" to call a match exact. (region distinguishes regional variants.)
+_VARIANT_FIELDS = ("maker", "model", "platform", "region")
+
+
 def identity_match_quality(want, have):
-    """How well two identities match, from the fields actually present on BOTH.
-    Returns 'exact' only when every field present on both sides agrees AND at least
-    codename plus one more identifying field (maker/model/platform) are present on
-    both. 'codename' when only the codename is shared evidence. 'conflict' when any
-    shared field disagrees. 'none' when there's no shared identifying evidence."""
+    """Grade how well two identities match, from fields present on BOTH sides.
+
+      "conflict" - any shared field positively disagrees.
+      "exact"    - codename agrees AND every variant field present on both agrees
+                   AND enough of them are present to distinguish a variant
+                   (codename + >=2 of maker/model/platform/region).
+      "partial"  - codename agrees and some variant evidence agrees, but not enough
+                   to fully establish the variant.
+      "codename" - ONLY the codename is shared evidence.
+      "none"     - no shared codename -> never auto-reuse device-specific steps.
+
+    A matching codename is REQUIRED for any reuse grade: without it, we return
+    "none" even if maker/model/platform happen to line up, because rooting steps
+    are keyed to the codename."""
     if identity_conflict(want, have):
         return "conflict"
-    shared = [k for k in ("maker", "codename", "model", "platform")
-              if (want.get(k) or "").strip() and (have.get(k) or "").strip()]
-    if not shared:
-        return "none"
-    # all shared fields agree here (no conflict). Grade by how much is corroborated.
-    strong = [k for k in shared if k in ("maker", "model", "platform")]
-    if "codename" in shared and strong:
+    wc = (want.get("codename") or "").strip().lower()
+    hc = (have.get("codename") or "").strip().lower()
+    if not wc or not hc or wc != hc:
+        return "none"   # codename not confirmed on both sides -> no reuse
+    # codename agrees. Count variant fields present AND agreeing on both sides.
+    agree = [k for k in _VARIANT_FIELDS
+             if (want.get(k) or "").strip() and (have.get(k) or "").strip()
+             and (want.get(k) or "").strip().lower() == (have.get(k) or "").strip().lower()]
+    if len(agree) >= 2:
         return "exact"
-    if "codename" in shared:
-        return "codename"
-    # shares some hardware field but not codename - weak, treat as codename-grade
+    if len(agree) >= 1:
+        return "partial"
     return "codename"
 
 
@@ -1361,27 +1464,32 @@ def rooting_db_get(info):
     graded = []   # (quality, key, entry)
     for key, e in db.items():
         q = identity_match_quality(want, _entry_identity(e))
-        if q in ("exact", "codename"):
+        if q in ("exact", "partial", "codename"):
             graded.append((q, key, e))
     if not graded:
         return None
-    exacts = [g for g in graded if g[0] == "exact"]
-    if len(exacts) == 1:
-        return dict(exacts[0][2], match="exact")
-    if len(exacts) > 1:
-        return dict(exacts[0][2], match="ambiguous", candidates=[g[1] for g in exacts])
-    # no exact: codename-grade matches
-    cods = [g for g in graded if g[0] == "codename"]
-    if len(cods) == 1:
-        return dict(cods[0][2], match="codename")
-    return dict(cods[0][2], match="ambiguous", candidates=[g[1] for g in cods])
+    # pick the strongest grade present, but if more than one entry shares the best
+    # grade the result is ambiguous and the caller must let the user choose.
+    for grade in ("exact", "partial", "codename"):
+        hits = [g for g in graded if g[0] == grade]
+        if not hits:
+            continue
+        if len(hits) == 1:
+            return dict(hits[0][2], match=grade, key=hits[0][1])
+        return dict(hits[0][2], match="ambiguous",
+                    candidates=[g[1] for g in graded], ambiguous_grade=grade)
+    return None
 
 
 def rooting_db_get_key(key):
-    """Fetch one entry by its exact DB key (used when the user picks a variant)."""
+    """Fetch one entry by its exact DB key, as a MANUAL selection.
+
+    match="selected" signals the user picked this variant by hand - it does NOT
+    assert the saved variant matches the connected device, so the caller computes
+    compatibility separately."""
     db = load_rooting_db()
     e = db.get(key)
-    return dict(e, match="exact") if e else None
+    return dict(e, match="selected", key=key) if e else None
 
 
 def rooting_db_put(info, res):
@@ -1390,13 +1498,15 @@ def rooting_db_put(info, res):
     Returns True only if the entry was actually persisted to disk."""
     if not isinstance(res, dict) or not res.get("answer"):
         return False
+    if _rooting_db_future[0]:
+        return False   # never overwrite a newer-schema DB
     db = load_rooting_db()
+    if _rooting_db_future[0]:        # load may have detected a future schema
+        return False
     identity = device_identity(info)
     if not any(identity.values()):
         return False
     props = (info or {}).get("props", {})
-    region = (props.get("ro.miui.region") or props.get("ro.boot.hwcountry")
-              or props.get("ro.boot.hwc") or (info or {}).get("region", ""))
     db[identity_key_str(identity)] = {
         "identity": identity,
         "codename": identity.get("codename", ""),
@@ -1413,25 +1523,32 @@ def rooting_db_put(info, res):
         "researched_build": (props.get("ro.mi.os.version.incremental")
                              or props.get("ro.build.version.incremental", "")),
         "researched_fingerprint": props.get("ro.build.fingerprint", ""),
+        # kept for display/back-compat; distinct SoC fields live in identity
         "chip": identity.get("platform", "") or props.get("ro.product.board", ""),
-        "soc": props.get("ro.board.platform", "") or props.get("ro.product.board", ""),
-        "region": region,
+        "soc_model": identity.get("soc_model", ""),
+        "soc_manufacturer": identity.get("soc_manufacturer", ""),
+        "board": identity.get("board", ""),
+        "region": identity.get("region", ""),
     }
     return _write_rooting_db(db)
 
 
 def rooting_db_delete(key):
-    """Delete by the exact DB key (as shown in the database window)."""
+    """Delete by the exact DB key (as shown in the database window).
+
+    A bare codename is accepted ONLY when it matches exactly one entry; if several
+    variants share it, deletion is refused (returns False) so the caller must pass
+    the exact key. This prevents deleting an arbitrary variant."""
     db = load_rooting_db()
     if key in db:
         del db[key]
         return _write_rooting_db(db)
-    # tolerate being given a bare codename
-    for k in list(db):
-        if (_entry_identity(db[k]).get("codename", "")).lower() == str(key).strip().lower():
-            del db[k]
-            return _write_rooting_db(db)
-    return False
+    matches = [k for k in db
+               if (_entry_identity(db[k]).get("codename", "")).lower() == str(key).strip().lower()]
+    if len(matches) == 1:
+        del db[matches[0]]
+        return _write_rooting_db(db)
+    return False   # 0 matches, or ambiguous (several variants) -> refuse
 
 
 def rooting_compatibility(entry, info):
@@ -1492,19 +1609,26 @@ def rooting_compatibility(entry, info):
                            "checking" % ", ".join(differs), fields
 
     # Nothing contradicts. Is there enough POSITIVE evidence to call it identical?
-    # A matching API/SDK level alone is NOT enough (same API can ship different
-    # builds, patches and boot images). Require a matching build or fingerprint.
-    strong_same = [k for k in ("fingerprint", "build") if now[k] and was[k] and now[k] == was[k]]
-    if strong_same:
-        # corroborate with patch if we have it on both sides
-        if now["patch"] and was["patch"] and now["patch"] != was["patch"]:
-            return "hardware", "same build but different security patch", fields
-        return "match", "firmware looks the same (%s match)" % ", ".join(strong_same), fields
-    api_same = now["sdk"] and was["sdk"] and now["sdk"] == was["sdk"]
-    if api_same:
-        return "hardware", ("only the API level is confirmed equal - build/patch unknown, so "
-                            "firmware-specific steps require verification"), fields
-    return "verify", "can't compare firmware - the device or the saved entry is missing build details", fields
+    # A matching fingerprint is conclusive; otherwise require the incremental build
+    # to agree AND be corroborated by another independent property (API or patch),
+    # because a build string alone can collide or be reused and doesn't pin the
+    # boot image. One identifier matching with other key fields missing -> verify.
+    if now["fingerprint"] and was["fingerprint"] and now["fingerprint"] == was["fingerprint"]:
+        return "match", "same build fingerprint", fields   # (handled above, kept for safety)
+    build_same = now["build"] and was["build"] and now["build"] == was["build"]
+    if build_same:
+        corroboration = []
+        if now["sdk"] and was["sdk"] and now["sdk"] == was["sdk"]:
+            corroboration.append("API")
+        if now["patch"] and was["patch"] and now["patch"] == was["patch"]:
+            corroboration.append("patch")
+        if corroboration:
+            return "match", "same build, corroborated by %s" % "+".join(corroboration), fields
+        return "verify", ("only the build identifier matches - no fingerprint, and API/patch "
+                          "aren't both confirmed, so firmware isn't established"), fields
+    # No fingerprint, no matching build: insufficient to establish either a match
+    # OR a hardware-compatible difference. This is uncertainty, not "hardware".
+    return "verify", "can't establish firmware compatibility - build/fingerprint not confirmed", fields
 
 
 def rooting_entry_stale(entry, info):

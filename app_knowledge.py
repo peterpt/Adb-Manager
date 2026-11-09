@@ -539,7 +539,7 @@ PERM_TEXT = {
 }
 
 RISK_TEXT = {
-    SAFE: "\u2705 Safe to turn off",
+    SAFE: "\u2705 Low risk based on available package information",
     CAUTION: "\u26a0 Be careful",
     CRITICAL: "\u26d4 Don't turn off",
     UNKNOWN: "\u2753 Not assessed",
@@ -564,9 +564,12 @@ def lookup(package):
 def guess(package, system, from_store=None, hidden=None):
     """Fallback risk + reason for packages not in the lists above.
 
-    from_store: True if installed from a recognised app store, False if sideloaded
-                (APK/ADB/unknown), None if not known.
-    hidden:     True if the app has no launcher icon, None/False otherwise.
+    from_store: True  = positively identified recognised app store.
+                False = positively identified sideload / file / ADB install source.
+                None  = installer unavailable or unrecognised (NOT assumed sideload).
+    hidden:     True  = confirmed no launcher icon.
+                False = launcher icon confirmed present.
+                None  = launcher inspection unavailable or inconclusive.
     The user-app case is deliberately NOT a blanket 'safe': a sideloaded or
     hidden app is user-installed too, and that's exactly what shouldn't be
     waved through. Turning an app OFF is still reversible and never deletes
@@ -585,10 +588,10 @@ def guess(package, system, from_store=None, hidden=None):
                              "purpose), but together they're worth checking in the Security tab "
                              "before you trust it. " + off_note)
         if from_store is False:
-            return CAUTION, ("It was installed from an APK file or over ADB rather than through an "
-                             "app store. That's normal for apps you sideloaded deliberately, but it "
-                             "wasn't vetted by a store, so check it if you don't recognise it. "
-                             + off_note)
+            return CAUTION, ("Not installed through a recognised app store (it came from an APK "
+                             "file or over ADB). That's the installation route, not a judgement of "
+                             "the app itself - verify the source if you don't recognise this "
+                             "application. " + off_note)
         if hidden is True:
             return CAUTION, ("It has no icon in the app drawer. That's normal for keyboards, "
                              "plugins, widgets and some accessibility tools, but it's also a thing "

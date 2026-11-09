@@ -88,7 +88,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import filedialog, font as tkfont, messagebox, simpledialog, ttk
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import app_knowledge as kb  # noqa: E402
@@ -1746,26 +1746,66 @@ class AppsTab(ttk.Frame):
             return play["name"]
         return pkg
 
+    @staticmethod
+    def origin_state(a):
+        """Three-state install origin: True store, False sideload, None unknown.
+        Absence of an installer is NOT proof of sideloading -> None."""
+        if a["system"]:
+            return None
+        inst = (a.get("installer") or "").strip()
+        if not inst:
+            return None
+        if inst in sa.STORES:
+            return True
+        if inst in sa.FILE_INSTALLERS:
+            return False
+        return None
+
+    @staticmethod
+    def hidden_state(a):
+        """Three-state hidden: True no icon, False has icon, None unknown."""
+        icon = a.get("icon")
+        return (not icon) if icon is not None else None
+
+    def app_warnings(self, a):
+        """Independent evidence worth flagging REGARDLESS of built-in knowledge.
+        Returns a list of (level, text). Used so a known package name can't hide a
+        suspicious installer, a missing launcher icon, or failed inspection."""
+        if a["system"] or a.get("removed"):
+            return []
+        warns = []
+        origin = self.origin_state(a)
+        hidden = self.hidden_state(a)
+        known = kb.lookup(a["package"])
+        is_known_exact = bool(known and known.get("exact"))
+        if origin is False:
+            warns.append((kb.CAUTION, "Installed from an APK/ADB rather than a recognised store - "
+                                      "verify the source if you don't recognise it."))
+        elif origin is None and a.get("installer", "") == "":
+            warns.append((kb.UNKNOWN, "Its installation source couldn't be determined."))
+        if hidden is True:
+            warns.append((kb.CAUTION, "It has no icon in the app drawer. Normal for keyboards, "
+                                      "plugins and some tools, but worth confirming."))
+        elif hidden is None:
+            warns.append((kb.UNKNOWN, "Couldn't check whether it has a launcher icon."))
+        # A KNOWN package name arriving from an unexpected route is the impersonation
+        # case - call it out explicitly, since the built-in label would look reassuring.
+        if is_known_exact and (origin is False or hidden is True):
+            warns.insert(0, (kb.CAUTION, "This package name is a known app, but the installed copy "
+                                         "arrived in an unexpected way (see below). If you didn't "
+                                         "install it from the usual place, it may be impersonating "
+                                         "the real app - check it in the Security tab."))
+        return warns
+
     def assess(self, a):
-        """(risk, what, if_off) for an app record."""
+        """(risk, what, if_off) from built-in knowledge + origin/hidden evidence.
+        Independent warnings are returned separately by app_warnings()."""
         k = kb.lookup(a["package"])
         if k:
             risk, what, if_off = k["risk"], k["what"], k["if_off"]
         else:
-            # Three-state origin: True recognised store, False recognised
-            # sideload/ADB source, None unknown/missing/unrecognised. Absence of
-            # an installer is NOT proof of sideloading, so it stays None.
-            from_store = None
-            if not a["system"]:
-                inst = (a.get("installer") or "").strip()
-                if inst:
-                    from_store = True if inst in sa.STORES else (False if inst in sa.FILE_INSTALLERS
-                                                                 else None)
-            # Three-state hidden: a[icon] is True/False/None from scan-time launcher
-            # discovery. hidden is its inverse; None stays None (inspection failed).
-            icon = a.get("icon")
-            hidden = (not icon) if icon is not None else None
-            risk, if_off = kb.guess(a["package"], a["system"], from_store=from_store, hidden=hidden)
+            risk, if_off = kb.guess(a["package"], a["system"],
+                                    from_store=self.origin_state(a), hidden=self.hidden_state(a))
             what = None
         # NOTE: no blanket CRITICAL->CAUTION downgrade for user apps. A user-
         # installed app can genuinely be critical/high-risk; the built-in list
@@ -1995,6 +2035,12 @@ class AppsTab(ttk.Frame):
             w("It's still inside the system - 'Restore removed' brings it back.\n", "dim")
         w("\n")
         w(kb.RISK_TEXT[risk] + "\n", risk)
+        warns = self.app_warnings(a)
+        if warns:
+            w("\nWorth checking\n", "h2")
+            for lvl, text in warns:
+                w(("\u26a0 " if lvl == kb.CAUTION else "\u2753 ") + text + "\n",
+                  "caution" if lvl == kb.CAUTION else "unknown")
 
         w("What it does\n", "h2")
         if what:
@@ -3006,9 +3052,12 @@ class NetworkTab(ttk.Frame):
         return t is not None and time.time() - t < NEWDEST_SECONDS
 
     def owner_key(self, uid):
-        app_id = uid % 100000
+        # stable key for the destination log: package set + Android user, so the
+        # same app in different profiles is tracked separately
         pkgs = self.owner_pkgs(uid)
-        return "+".join(sorted(pkgs)) if pkgs and app_id >= 10000 else "uid:%d" % app_id
+        user = self.android_user(uid)
+        base = "+".join(sorted(pkgs)) if pkgs and self.app_id(uid) >= 10000 else "uid:%d" % self.app_id(uid)
+        return base if user == 0 else "%s@user%d" % (base, user)
 
     def note_destination(self, s):
         """Log one internet connection; True if it is a destination this app never used."""
@@ -3052,21 +3101,34 @@ class NetworkTab(ttk.Frame):
     def key(s):
         return (s["proto"], s["local_ip"], s["local_port"], s["uid"])
 
+    @staticmethod
+    def android_user(uid):
+        """The Android user/profile id a UID belongs to (0 = owner, 10+ = profiles)."""
+        return uid // 100000
+
+    @staticmethod
+    def app_id(uid):
+        """The per-user app id (same app shares this across profiles)."""
+        return uid % 100000
+
     def owner_pkgs(self, uid):
-        return self.uid_map.get(uid % 100000, [])
+        # package name is the same app across profiles, so look up by app-id
+        return self.uid_map.get(self.app_id(uid), [])
 
     def owner_name(self, uid):
-        app_id = uid % 100000
+        app_id = self.app_id(uid)
+        user = self.android_user(uid)
         pkgs = self.owner_pkgs(uid)
         lbl = self.app.apps_tab.label
+        # suffix shown only for non-owner profiles, so normal phones are unchanged
+        usuffix = "" if user == 0 else "  [user %d]" % user
         if app_id < 10000:
-            base = SYSTEM_UIDS.get(app_id, "Android system service (UID %d)" % app_id)
-            return base
+            return SYSTEM_UIDS.get(app_id, "Android system service (UID %d)" % app_id) + usuffix
         if not pkgs:
             return "Unknown app (UID %d)" % uid
         if len(pkgs) == 1:
-            return lbl(pkgs[0])
-        return "%s + %d more (shared ID)" % (lbl(sorted(pkgs)[0]), len(pkgs) - 1)
+            return lbl(pkgs[0]) + usuffix
+        return "%s + %d more (shared ID)%s" % (lbl(sorted(pkgs)[0]), len(pkgs) - 1, usuffix)
 
     @staticmethod
     def fmt(ip, port):
@@ -3132,7 +3194,7 @@ class NetworkTab(ttk.Frame):
                     and q not in str(s["local_port"]) and q not in s["remote_ip"] \
                     and q not in self.names.get(s["remote_ip"], "").lower():
                 continue
-            groups.setdefault(s["uid"] % 100000, []).append(s)
+            groups.setdefault(s["uid"], []).append(s)   # full UID: keep profiles distinct
         rank = {"critical": 0, "caution": 1, "unknown": 2, "safe": 3, "": 4}
 
         def worst(items):
@@ -3140,7 +3202,7 @@ class NetworkTab(ttk.Frame):
         order = sorted(groups.items(), key=lambda kv: (rank[worst(kv[1])],
                                                       self.owner_name(kv[1][0]["uid"]).lower()))
         reselect = None
-        for app_id, items in order:
+        for guid, items in order:
             n_open = sum(1 for s in items if s["kind"] == "listen")
             n_conn = sum(1 for s in items if s["kind"] == "connected")
             bits = []
@@ -3148,13 +3210,13 @@ class NetworkTab(ttk.Frame):
                 bits.append("%d open" % n_open)
             if n_conn:
                 bits.append("%d connection%s" % (n_conn, "" if n_conn == 1 else "s"))
-            oid = "o:%d" % app_id
+            oid = "o:%d" % guid
             w = worst(items)
             self.tree.insert("", "end", iid=oid, open=True,
                              text="%s  (%s)" % (self.owner_name(items[0]["uid"]), ", ".join(bits) or "other"),
                              tags=("owner",) + ((w,) if w in ("critical", "caution") else ()))
-            self.rows[oid] = ("owner", app_id)
-            if keep == ("owner", app_id):
+            self.rows[oid] = ("owner", guid)
+            if keep == ("owner", guid):
                 reselect = oid
             items.sort(key=lambda s: (s["kind"] != "listen", s["local_port"] if s["kind"] == "listen"
                                       else 0, self.remote_label(s)))
@@ -3301,7 +3363,8 @@ class NetworkTab(ttk.Frame):
         if not row:
             self.app.info("Select an app or a line first")
             return
-        app_id = row[1] if row[0] == "owner" else row[1]["uid"] % 100000
+        uid = row[1] if row[0] == "owner" else row[1]["uid"]
+        app_id = self.app_id(uid)
         pkgs = self.uid_map.get(app_id, [])
         if app_id < 10000 and not pkgs:
             self.app.info("That's a part of Android itself, not an app in the list")
@@ -3908,48 +3971,95 @@ class DeviceInfoWindow(tk.Toplevel):
         t.configure(state="disabled")
         t.see("end")
 
+    @staticmethod
+    def _identity_line(ident):
+        bits = [ident.get(k, "") for k in ("maker", "codename", "model", "platform", "region")]
+        return " / ".join(b for b in bits if b) or "(identity unknown)"
+
     def render_db_entry(self, entry):
-        """Show a stored answer from the rooting database (no AI call)."""
+        """Show a stored answer from the rooting database (no AI call).
+
+        Ambiguous matches NEVER auto-display device-specific instructions: the user
+        must pick the variant. Firmware compatibility is shown only once the
+        hardware identity is established (exact match or manual selection)."""
         t = self._ai_section_start()
         w = lambda text, tag=(): t.insert("end", text, tag)  # noqa: E731
         w("\nAI rooting research \u2014 saved\n", "h2")
         match = entry.get("match", "exact")
-        # (1) hardware identity confidence - kept separate from firmware below
-        hardware_confirmed = (match == "exact")
-        if match == "codename":
-            w("\u26a0 Matched by codename only. The full hardware identity could not be confirmed "
-              "(maker/model/platform weren't all available to compare), so this saved answer might "
-              "belong to a different variant. Treat it as a guide and verify before flashing.\n",
-              "warn")
-        elif match == "ambiguous":
+
+        # --- ambiguous: show candidate identities and a chooser, NOT instructions
+        if match == "ambiguous":
             cands = entry.get("candidates", [])
-            w("\u26a0 Several saved variants are compatible with this device (%d). Showing one - "
-              "open 'Database' to pick the exact model. The others:\n" % len(cands), "warn")
-            for k in cands[1:6]:
-                w("    \u2022 %s\n" % k, "dim")
-        w("From the rooting database: researched %s by %s%s, for Android %s%s.\n" % (
+            grade = entry.get("ambiguous_grade", "codename")
+            w("\u26a0 Several saved variants could match this device (%d), by %s. The exact variant "
+              "isn't established, so no device-specific steps are shown. Choose the one that matches "
+              "your phone:\n" % (len(cands), {"exact": "hardware identity", "partial": "partial "
+              "identity", "codename": "codename"}.get(grade, grade)), "warn")
+            self._cand_buttons = []
+            for key in cands[:8]:
+                e = sa.rooting_db_get_key(key)
+                ident = sa._entry_identity(e) if e else {}
+                w("    \u2022 " + self._identity_line(ident) + "\n", "dim")
+                self._add_choose_button(t, key, self._identity_line(ident))
+            w("\nOr press 'Refresh this model' to research this device's exact identity now.\n", "dim")
+            t.configure(state="disabled")
+            t.see(self._ai_mark)
+            return
+
+        # --- single match (exact / partial / codename / selected)
+        hardware_confirmed = match in ("exact", "selected")
+        if match == "selected":
+            w("You picked this saved variant by hand. It is shown as-is; compatibility with the "
+              "connected phone is computed below but not assumed.\n", "dim")
+        elif match == "partial":
+            w("\u26a0 Partial identity match: the codename agrees and some of maker/model/platform/"
+              "region agree, but not enough to fully establish the exact variant. Treat "
+              "device-specific steps as needing confirmation.\n", "warn")
+        elif match == "codename":
+            w("\u26a0 Matched by codename only. The full hardware identity could not be confirmed, "
+              "so this saved answer might belong to a different variant. Treat it as a guide and "
+              "verify before flashing.\n", "warn")
+        w("Saved identity: %s\n" % self._identity_line(sa._entry_identity(entry)), "dim")
+        w("Researched %s by %s%s, for Android %s%s.\n" % (
             entry.get("when", "?"), ai.PROVIDERS.get(entry.get("provider"), {}).get("label",
             entry.get("provider", "?")), (" " + entry["model"]) if entry.get("model") else "",
             entry.get("researched_release") or "?",
             (" build " + entry["researched_build"]) if entry.get("researched_build") else ""), "dim")
-        # (2) firmware comparison - only meaningful once hardware is the same device
-        status, cmsg, _ = sa.rooting_compatibility(entry, self.info)
+        # firmware compatibility - only once hardware identity is established
         if not hardware_confirmed:
-            w("Firmware comparison is not shown because the hardware identity isn't confirmed - "
-              "confirm the model first.\n", "dim")
-        elif status == "match":
-            w("\u2705 Same hardware, and firmware matches what was researched (%s).\n" % cmsg, "ok")
-        elif status == "hardware":
-            w("\u26a0 Same phone model, but %s. The unlock/hardware research still applies; any "
-              "firmware-specific flashing step (which boot.img, which firmware package) must be "
-              "re-checked. Press 'Refresh this model' to update.\n" % cmsg, "warn")
+            w("Firmware comparison isn't shown because the hardware identity isn't confirmed - "
+              "confirm the exact model first (Refresh, or pick it in the Database).\n", "dim")
         else:
-            w("\u26d4 REQUIRES VERIFICATION: %s. Don't rely on the firmware-specific steps until "
-              "you've confirmed them. Press 'Refresh this model'.\n" % cmsg, "warn")
+            status, cmsg, _ = sa.rooting_compatibility(entry, self.info)
+            if status == "match":
+                w("\u2705 Same hardware, and firmware matches what was researched (%s).\n" % cmsg, "ok")
+            elif status == "hardware":
+                w("\u26a0 Same phone model, but %s. The unlock/hardware research still applies; any "
+                  "firmware-specific flashing step (which boot.img, which firmware package) must be "
+                  "re-checked. Press 'Refresh this model' to update.\n" % cmsg, "warn")
+            else:
+                w("\u26d4 REQUIRES VERIFICATION: %s. Don't rely on the firmware-specific steps "
+                  "until you've confirmed them. Press 'Refresh this model'.\n" % cmsg, "warn")
         self._render_answer_fields(w, entry["answer"])
         w("\nPress 'Refresh this model' to ask the AI again and update this entry.\n", "dim")
         t.configure(state="disabled")
         t.see(self._ai_mark)
+
+    def _add_choose_button(self, t, key, label):
+        """Inline 'Use this variant' button in the ambiguous candidate list."""
+        btn = ttk.Button(t, text="Use this variant",
+                         command=lambda k=key: self._choose_variant(k))
+        t.window_create("end", window=btn)
+        t.insert("end", "  " + label + "\n", "dim")
+
+    def _choose_variant(self, key):
+        entry = sa.rooting_db_get_key(key)   # match="selected"
+        if not entry:
+            self.app.info("That saved variant is no longer in the database")
+            return
+        self.txt.configure(state="normal")
+        self.txt.delete(self._ai_mark, "end")
+        self.render_db_entry(entry)
 
     def _render_answer_fields(self, w, a):
         if a.get("summary"):
@@ -4579,6 +4689,7 @@ class App:
         self.dev_combo.pack(side="left", padx=4)
         self.dev_combo.bind("<<ComboboxSelected>>", self.on_device_selected)
         ttk.Button(top, text="Rescan", command=self.scan_devices).pack(side="left")
+        ttk.Button(top, text="About", command=self.show_about).pack(side="right")
 
         # --- tabs
         self.nb = ttk.Notebook(root)
@@ -4949,6 +5060,50 @@ class App:
             self.error("Delete failed - " + errors[0])
         else:
             self.info("Deleted %s" % what)
+
+    def show_about(self):
+        win = getattr(self, "_about_win", None)
+        if win is not None and win.winfo_exists():
+            win.lift()
+            return
+        self._about_win = win = tk.Toplevel(self.root)
+        win.title("About ADB Manager")
+        win.transient(self.root)
+        win.resizable(False, False)
+        frm = ttk.Frame(win, padding=16)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="ADB Manager", font=("TkDefaultFont", 14, "bold")).pack(anchor="w")
+        ttk.Label(frm, text="Android device manager: files, apps, network and security, over ADB.",
+                  foreground="#555555").pack(anchor="w", pady=(0, 10))
+        grid = ttk.Frame(frm)
+        grid.pack(fill="x")
+        rows = [("Original idea:", "https://github.com/peterpt/Adb-Manager", True),
+                ("Code builder:", "Claude (Anthropic)", False),
+                ("Code review:", "ChatGPT (OpenAI)", False)]
+        for r, (label, value, is_link) in enumerate(rows):
+            ttk.Label(grid, text=label, font=("TkDefaultFont", 10, "bold")).grid(
+                row=r, column=0, sticky="w", padx=(0, 8), pady=2)
+            if is_link:
+                link = tk.Label(grid, text=value, foreground="#1f5fbf", cursor="hand2")
+                f = tkfont.Font(link, link.cget("font"))
+                f.configure(underline=True)
+                link.configure(font=f)
+                link.grid(row=r, column=1, sticky="w", pady=2)
+                link.bind("<Button-1>", lambda e, u=value: self._open_url(u))
+            else:
+                ttk.Label(grid, text=value).grid(row=r, column=1, sticky="w", pady=2)
+        ttk.Separator(frm).pack(fill="x", pady=12)
+        ttk.Label(frm, text="Gemini (Google) was deliberately excluded from package research: "
+                  "because Android and most of the inspected packages are Google's own, a Google "
+                  "model would have a structural conflict of interest assessing them.",
+                  foreground="#555555", wraplength=420, justify="left").pack(anchor="w")
+        ttk.Button(frm, text="Close", command=win.destroy).pack(side="right", pady=(12, 0))
+
+    def _open_url(self, url):
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
 
     def on_close(self):
         if self.transferring:
