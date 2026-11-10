@@ -186,16 +186,73 @@ def load_json(path, default):
         return default
 
 
-def save_json(path, data, private=False):
+def ensure_dir(path, private=False):
+    """Create a directory (and parents). With private=True the directory itself is
+    forced to 0700. Raises OSError if it can't be created or made private."""
+    os.makedirs(path, mode=0o700 if private else 0o777, exist_ok=True)
+    if private:
+        os.chmod(path, 0o700)
+
+
+def atomic_write_json(path, data, private=True, indent=1):
+    """Write JSON so the file is either the complete old version or the complete
+    new one - never half-written, never left with loose permissions.
+
+      - the temp file has a UNIQUE name (mkstemp) in the same folder, so two
+        writers can't trample each other's temp file;
+      - private=True (the default): file 0600 from the moment it exists, folder 0700;
+      - data is flushed + fsync'd before the rename, and the rename is atomic: a
+        reader sees either the whole old file or the whole new one;
+      - the folder is fsync'd afterwards to make the rename survive a power cut,
+        but only BEST EFFORT (errors there are ignored for portability), so crash
+        durability of the rename itself is not guaranteed - atomicity is;
+      - on any failure the temp file is removed and OSError is RAISED (callers
+        decide how to report it - nothing is silently swallowed here).
+    Values that JSON can't encode raise OSError too (wrapping the TypeError)."""
+    import tempfile
+    folder = os.path.dirname(os.path.abspath(path))
+    ensure_dir(folder, private=private)
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600 if private else 0o644)
+        payload = json.dumps(data, indent=indent, ensure_ascii=False)
+    except (TypeError, ValueError) as e:
+        raise OSError("can't encode data for %s: %s" % (path, e))
+    fd, tmp = tempfile.mkstemp(dir=folder, prefix="." + os.path.basename(path) + ".",
+                               suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600 if private else 0o644)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=1, ensure_ascii=False)
-        if private:
-            os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
+            fd = None
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)   # the mode was set on the temp file, before this
+        tmp = None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    try:   # best effort only: see docstring (atomic yes, crash-durable not guaranteed)
+        dfd = os.open(folder, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+
+
+def save_json(path, data, private=True):
+    """atomic_write_json() for callers that want True/False instead of an exception.
+    Private (0600/0700) by default: everything we keep describes the user's devices."""
+    try:
+        atomic_write_json(path, data, private=private)
         return True
     except OSError:
         return False
@@ -857,14 +914,27 @@ def check_usage(facts, launcher, labeler):
 # snapshots: fingerprint the device, compare with the previous check
 # --------------------------------------------------------------------------
 
-def build_snapshot(serial, facts, access, launcher, identities):
+def build_snapshot(serial, facts, access, launcher, identities, prev=None):
+    """Snapshot of the device for 'changes since last check'.
+
+    Signing certificate: taken from this version's identity when known. When it
+    ISN'T known (no deep scan of this version yet - e.g. right after any app
+    update - or base.apk couldn't be read), the last KNOWN cert from the previous
+    snapshot is carried forward and marked "cert_unverified". So an unknown cert
+    is never treated as a changed one, and the known signer is never forgotten:
+    the next time the real cert is read it's compared against that last known
+    one, so a replacement that happened in between is still caught."""
     apps = {}
+    prev_apps = (prev or {}).get("apps", {})
     for p, a in facts["apps"].items():
         if a.get("removed"):
             continue
         ident = identities.get(identity_key(p, a)) or {}
+        cert, unverified = ident.get("cert", ""), False
+        if not cert and (prev_apps.get(p) or {}).get("cert"):
+            cert, unverified = prev_apps[p]["cert"], True
         apps[p] = {"v": a.get("version", ""), "vc": a.get("version_code", ""), "sys": bool(a.get("system")),
-                   "inst": a.get("installer", ""), "cert": ident.get("cert", ""),
+                   "inst": a.get("installer", ""), "cert": cert, "cert_unverified": unverified,
                    "perms": sorted(x for x in a.get("granted", []) if x in SENSITIVE_PERMS),
                    "icon": None if launcher is None or a.get("system") else (p in launcher)}
     p = facts["props"]
@@ -889,14 +959,23 @@ def last_snapshot(serial):
 
 
 def save_snapshot(serial, snap):
+    """Save a device snapshot privately (0600 file, 0700 folders). Returns True only
+    if the new snapshot is safely on disk. Old snapshots are pruned ONLY after a
+    successful save, so a failed write never costs us the previous reference."""
     d = snap_dir(serial)
-    save_json(os.path.join(d, time.strftime("%Y%m%d-%H%M%S") + ".json"), snap)
+    try:
+        ensure_dir(os.path.dirname(d), private=True)   # snapshots/ itself
+        atomic_write_json(os.path.join(d, time.strftime("%Y%m%d-%H%M%S") + ".json"),
+                          snap, private=True)
+    except OSError:
+        return False
     try:
         files = sorted(f for f in os.listdir(d) if f.endswith(".json"))
         for f in files[:-KEEP_SNAPSHOTS]:
             os.remove(os.path.join(d, f))
     except OSError:
-        pass
+        pass   # pruning is housekeeping; the new snapshot is already saved
+    return True
 
 
 def compare_snapshots(prev, cur, labeler):
@@ -1073,6 +1152,101 @@ def apk_identity(path):
             "cert": certs[0] if certs else "", "certs": certs}
 
 
+# ---- whole-app identity: base + every installed split ----------------------
+#
+# An installed app can be several APK files: base.apk plus "split" APKs - config
+# splits (split_config.arm64_v8a.apk: native code for this CPU; ...xxhdpi.apk:
+# screen-density resources; ...pt.apk: language) and feature splits
+# (split_<feature>.apk: optional modules). Code can live in ANY of them, so a
+# deep scan must fingerprint and look up every part, not just base.apk.
+
+def apk_part_kind(name):
+    """'base', 'config' or 'feature' from an installed APK file name."""
+    n = os.path.basename(name)
+    if n == "base.apk":
+        return "base"
+    if n.startswith("split_config.") or ".config." in n:
+        return "config"
+    return "feature"
+
+
+def apk_part_label(part):
+    """Plain-language name of one part, for the results screen."""
+    n = os.path.basename(part.get("name") or part.get("path") or "")
+    kind = part.get("kind") or apk_part_kind(n)
+    if kind == "base":
+        return "main app file"
+    stem = n[:-4] if n.endswith(".apk") else n
+    if kind == "config":
+        what = stem.split("config.", 1)[-1]
+        if re.match(r"^(arm|x86|mips)", what):
+            return "processor-specific code (%s)" % what
+        if what.endswith("dpi"):
+            return "screen-size pictures (%s)" % what
+        return "extra part for this phone (%s)" % what
+    return "optional feature '%s'" % (stem[len("split_"):] if stem.startswith("split_") else stem)
+
+
+def make_app_identity(pkg, parts):
+    """Combine per-part results into one identity record.
+
+    parts: [{"path", "name", "kind", and EITHER "sha256","size","cert","certs"
+             OR "error": why that part couldn't be read}]
+
+    Returns a record that keeps the old top-level fields (sha256/size/cert/certs
+    of base.apk, so snapshots and cert-change detection keep working) plus:
+      parts      - every part, read or not
+      coverage   - "full" only if EVERY part was read and hashed; else "partial"
+      unread     - names of parts that couldn't be read
+      signers    - evidence-based, in this order of precedence:
+                   "different" - base's signer set is known and at least one
+                                 readable part has a DIFFERENT known set. One
+                                 confirmed mismatch is enough, even if some other
+                                 part's signer couldn't be read;
+                   "unknown"   - no mismatch found, but base's signer or some
+                                 readable part's signer couldn't be read;
+                   "same"      - every readable part has the base's signer set.
+      signers_unknown - names of readable parts whose signer couldn't be read
+                   (so a "different" verdict never implies every signer is known)"""
+    base = next((x for x in parts if x.get("kind") == "base"), None)
+    unread = [x["name"] for x in parts if x.get("error") or not x.get("sha256")]
+    ok = base is not None and base.get("sha256")
+    ident = {"pkg": pkg, "parts": parts,
+             "coverage": "full" if parts and ok and not unread else "partial",
+             "unread": unread,
+             "sha256": base.get("sha256", "") if base else "",
+             "size": base.get("size", 0) if base else 0,
+             "cert": base.get("cert", "") if base else "",
+             "certs": base.get("certs", []) if base else []}
+    base_set = set(ident["certs"])
+    readable = [x for x in parts if x.get("sha256")]
+    no_signer = [x["name"] for x in readable if not x.get("certs")]
+    if base_set and any(x.get("certs") and set(x["certs"]) != base_set for x in readable):
+        signers = "different"          # confirmed evidence wins
+    elif not base_set or no_signer:
+        signers = "unknown"
+    else:
+        signers = "same"
+    ident["signers"] = signers
+    ident["signers_unknown"] = no_signer
+    return ident
+
+
+def identity_complete(ident):
+    """True if a cached identity covers ALL parts (old base-only records don't)."""
+    return isinstance(ident, dict) and isinstance(ident.get("parts"), list) and \
+        ident.get("coverage") == "full"
+
+
+def identity_parts(ident):
+    """The parts of an identity; an old base-only record becomes one base part."""
+    if isinstance(ident.get("parts"), list):
+        return ident["parts"]
+    return [{"name": "base.apk", "kind": "base", "sha256": ident.get("sha256", ""),
+             "size": ident.get("size", 0), "cert": ident.get("cert", ""),
+             "certs": ident.get("certs", [])}]
+
+
 # --------------------------------------------------------------------------
 # outside services (all optional)
 # --------------------------------------------------------------------------
@@ -1174,49 +1348,127 @@ def exodus_report(cfg, pkg, version_code):
             "exact": bool(exact), "link": "https://reports.exodus-privacy.eu.org/en/reports/%s/latest/" % pkg}
 
 
+def part_verdict(r):
+    """One part's lookup result -> 'bad', 'sus', 'clean', 'unknown' or 'error'.
+    'clean' means VirusTotal knows this exact file and no scanner flags it;
+    MalwareBazaar not knowing a file is NOT proof it's clean."""
+    vt, mb = (r or {}).get("vt"), (r or {}).get("mb")
+    if (vt and vt.get("malicious", 0) >= 3) or (mb and mb.get("known")):
+        return "bad"
+    if vt and (vt.get("malicious", 0) > 0 or vt.get("suspicious", 0) > 0):
+        return "sus"
+    if vt and vt.get("known"):
+        return "clean"
+    if (vt and vt.get("error")) or (mb and mb.get("error")):
+        return "error"
+    return "unknown"
+
+
+def _lookup_lines(vt, mb):
+    lines = []
+    if vt:
+        if vt.get("error"):
+            lines.append("VirusTotal: " + vt["error"])
+        elif not vt.get("known"):
+            lines.append("VirusTotal: this exact file was never uploaded there (unknown - not proof of "
+                         "anything either way)")
+        else:
+            lines.append("VirusTotal: %d of %d virus scanners flag it%s" % (
+                vt["malicious"], vt["engines"], (" as '%s'" % vt["label"]) if vt.get("label") else ""))
+    if mb:
+        if mb.get("error"):
+            lines.append("MalwareBazaar: " + mb["error"])
+        elif mb.get("known"):
+            lines.append("MalwareBazaar: KNOWN MALWARE%s" % (" (%s)" % mb["family"] if mb.get("family") else ""))
+        else:
+            lines.append("MalwareBazaar: not in the malware database")
+    return lines
+
+
 def reputation_findings(apps, labeler, idents, rep):
+    """One malware finding per app, judged over ALL its parts:
+      - any part flagged            -> BAD
+      - any part suspicious         -> WARN
+      - some part couldn't be read  -> INFO 'only partly checked' (never OK)
+      - every part known & clean    -> OK
+      - otherwise                   -> INFO 'not known to the databases'
+    Plus a separate WARN when parts are signed by different keys."""
     out = []
     for p, ident in idents.items():
-        r = rep.get(ident["sha256"], {})
         lbl = label_of(apps, labeler, p)
-        vt, mb = r.get("vt"), r.get("mb")
-        bad = (vt and vt.get("malicious", 0) >= 3) or (mb and mb.get("known"))
-        sus = vt and (vt.get("malicious", 0) > 0 or vt.get("suspicious", 0) > 0)
+        parts = identity_parts(ident)
+        legacy = not isinstance(ident.get("parts"), list)
+        read = [x for x in parts if x.get("sha256")]
+        unread = [x for x in parts if not x.get("sha256")]
+        verdicts = [(x, part_verdict(rep.get(x["sha256"])), rep.get(x["sha256"]) or {}) for x in read]
+        kinds = {v for _, v, _ in verdicts}
+        multi = len(parts) > 1
+
         lines = []
-        if vt:
-            if vt.get("error"):
-                lines.append("VirusTotal: " + vt["error"])
-            elif not vt.get("known"):
-                lines.append("VirusTotal: this exact file was never uploaded there (unknown - not proof of "
-                             "anything either way)")
+        for x, v, r in verdicts:
+            ll = _lookup_lines(r.get("vt"), r.get("mb")) or ["not looked up yet"]
+            if multi:
+                lines.append("%s: %s" % (apk_part_label(x).capitalize(), "; ".join(ll)))
             else:
-                lines.append("VirusTotal: %d of %d virus scanners flag it%s" % (
-                    vt["malicious"], vt["engines"], (" as '%s'" % vt["label"]) if vt.get("label") else ""))
-        if mb:
-            if mb.get("error"):
-                lines.append("MalwareBazaar: " + mb["error"])
-            elif mb.get("known"):
-                lines.append("MalwareBazaar: KNOWN MALWARE%s" % (" (%s)" % mb["family"] if mb.get("family") else ""))
-            else:
-                lines.append("MalwareBazaar: not in the malware database")
-        if not lines:
+                lines.extend(ll)
+        for x in unread:
+            lines.append("%s: couldn't be read from the phone (%s) - NOT checked" % (
+                apk_part_label(x).capitalize(), x.get("error") or "unknown reason"))
+        if legacy:
+            lines.append("Only the main app file was checked (result from an older version of this "
+                         "program). Run a deep scan to check every part of the app.")
+        if not any(r.get("vt") or r.get("mb") for _, _, r in verdicts) and not unread:
             lines.append("No lookup service is set up - add a key in Security settings.")
-        if bad:
+
+        partial = bool(unread) or legacy or ident.get("coverage") == "partial"
+        if "bad" in kinds:
             level, title = BAD, "Flagged as malware: %s" % lbl
-        elif sus:
+        elif "sus" in kinds:
             level, title = WARN, "Some scanners are suspicious of: %s" % lbl
-        elif vt and vt.get("known"):
-            level, title = OK, "Clean on VirusTotal: %s" % lbl
+        elif partial:
+            level, title = INFO, "Only partly checked: %s" % lbl
+        elif read and kinds == {"clean"}:
+            level, title = OK, "Clean on VirusTotal: %s%s" % (lbl, " (all %d parts)" % len(parts) if multi else "")
         else:
             level, title = INFO, "Not known to the databases: %s" % lbl
+        if partial and level in (BAD, WARN):
+            lines.append("Note: %s part(s) couldn't be checked at all." % (len(unread) or "some"))
         advice = ("Uninstall it, change passwords you used on this device, and check the 'Powerful access' "
-                  "section." if bad else ("A few detections can be false alarms (often adware or "
-                                         "aggressive trackers). Look at the link and decide." if sus else ""))
-        tech = "sha256 %s\ncert %s" % (ident["sha256"], ident.get("cert") or "-")
-        for x in (vt, mb):
-            if x and x.get("link"):
-                tech += "\n" + x["link"]
-        out.append(finding("malware", level, title, "\n".join(lines), advice, tech, pkg=p, key="malware:%s" % p))
+                  "section." if level == BAD else (
+                      "A few detections can be false alarms (often adware or aggressive trackers). "
+                      "Look at the link and decide." if level == WARN else (
+                          "Run the deep scan again; if a part still can't be read, the phone may be "
+                          "blocking access to it." if partial else "")))
+        tech = []
+        for x in parts:
+            tech.append("%s  %s  sha256 %s  cert %s" % (
+                x.get("name", "?"), x.get("kind", "?"), x.get("sha256") or "-",
+                (x.get("cert") or "-") if x.get("sha256") else "-"))
+            r = rep.get(x.get("sha256") or "", {})
+            for y in (r.get("vt"), r.get("mb")):
+                if y and y.get("link"):
+                    tech.append("    " + y["link"])
+        tech.append("coverage %s, signers %s" % ("legacy-base-only" if legacy else ident.get("coverage", "?"),
+                                                 ident.get("signers", "unknown")))
+        out.append(finding("malware", level, title, "\n".join(lines), advice, "\n".join(tech),
+                           pkg=p, key="malware:%s" % p))
+
+        if ident.get("signers") == "different":
+            base_set = set(ident.get("certs") or [])
+            odd = [apk_part_label(x) for x in read if x.get("certs") and set(x["certs"]) != base_set]
+            unk = [apk_part_label(x) for x in read if not x.get("certs")]
+            text = ("Every part of an app should be signed by the same developer key - Android normally "
+                    "refuses to install it otherwise. Here these parts don't match the main app file: %s. "
+                    "This can mean the app was tampered with, or that this program misread a signature."
+                    % ", ".join(odd))
+            if unk:
+                text += (" The signature of %s couldn't be read at all, so it's unknown whether "
+                         "it matches." % ", ".join(unk))
+            out.append(finding(
+                "malware", WARN, "Parts of %s are signed by different keys" % lbl, text,
+                "Compare with a fresh copy from a trusted store before trusting this app.",
+                "\n".join("%s certs %s" % (x.get("name"), ",".join(x.get("certs") or []) or "-")
+                          for x in read), pkg=p, key="malware-signers:%s" % p))
     out.sort(key=lambda f: (LEVEL_RANK[f["level"]], f["title"].lower()))
     return out
 

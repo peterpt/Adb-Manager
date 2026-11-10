@@ -71,13 +71,34 @@ def load_config():
 
 
 def save_config(cfg):
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    tmp = CONFIG_FILE + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, CONFIG_FILE)
+    """Save the AI settings (they hold API keys): 0700 folder, 0600 file, unique temp
+    file, fsync, atomic rename. Raises OSError on failure; the temp file is removed."""
+    import tempfile
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    os.chmod(CONFIG_DIR, 0o700)
+    payload = json.dumps(cfg, indent=2)
+    fd, tmp = tempfile.mkstemp(dir=CONFIG_DIR, prefix="." + os.path.basename(CONFIG_FILE) + ".",
+                               suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = None
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, CONFIG_FILE)
+        tmp = None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def api_key(cfg, provider):

@@ -63,6 +63,7 @@ Requires: Python 3.6+ with tkinter (apt install python3-tk), adb in PATH
 """
 
 import argparse
+import copy
 import csv
 import html
 import ipaddress
@@ -572,9 +573,17 @@ def scan_packages(serial):
     # Launcher (icon) discovery: True = has an icon, False = confirmed none,
     # None = couldn't determine. Only meaningful for non-removed packages.
     user_pkgs = [p for p, pa in paths.items()]
+
+    def _launcher_shell(c, t=60):
+        # launcher_packages expects stdout TEXT, not the (rc, out, err) tuple.
+        # Raise on a non-zero exit so a failed command is treated as "unknown",
+        # not as "this package has no launcher icon".
+        rc, out, err = adb_shell(serial, c, timeout=t)
+        if rc != 0:
+            raise AdbError(last_line(err, out) or "command failed (rc=%d)" % rc)
+        return out
     try:
-        launcher_set, launcher_method = sa.launcher_packages(
-            lambda c, t=60: adb_shell(serial, c, timeout=t), user_pkgs)
+        launcher_set, launcher_method = sa.launcher_packages(_launcher_shell, user_pkgs)
         launcher_known = launcher_method is not None   # None => discovery failed
     except Exception:
         launcher_set, launcher_known = set(), False
@@ -650,9 +659,53 @@ def pm_set_enabled(serial, pkg, enable, use_root=False):
 
 
 def pm_paths(serial, pkg):
-    """APK file(s) of an installed package on the device (base + split parts)."""
+    """APK file(s) of an installed package on the device (base + split parts).
+    Raises AdbError if 'pm path' fails - a failed command must never look like
+    "this app has no files" (same class of bug as the old launcher one)."""
     rc, out, err = adb_shell(serial, "pm path " + shlex.quote(pkg), timeout=30)
+    if rc != 0:
+        raise AdbError("pm path %s failed: %s" % (pkg, (err or out).strip() or "exit code %d" % rc))
     return [l[len("package:"):].strip() for l in out.splitlines() if l.startswith("package:")]
+
+
+def read_app_identity(serial, pkg, work, stop):
+    """Pull EVERY installed APK part of pkg (base + feature + config splits) into
+    `work`, fingerprint each one (sha256 + signer), delete the copies, and return
+    sa.make_app_identity(...). A part that can't be pulled or read is recorded
+    with an "error" (coverage becomes "partial") instead of being skipped.
+
+    Returns None if the user pressed Stop while this app was being read (an
+    interrupted read is not "unreadable" and must not be cached), and raises
+    AdbError if the device won't say where the app's files are."""
+    paths = pm_paths(serial, pkg)
+    if not paths:
+        raise AdbError("the device listed no files for %s" % pkg)
+    parts = []
+    for i, remote in enumerate(paths):
+        if stop.is_set():
+            return None
+        name = posixpath.basename(remote)
+        part = {"path": remote, "name": name, "kind": sa.apk_part_kind(name)}
+        local = os.path.join(work, "%03d_%s" % (i, re.sub(r"[^A-Za-z0-9._-]+", "_", name) or "part.apk"))
+        try:
+            rc, msg = adb_transfer([ADB, "-s", serial, "pull", remote, local], lambda x: None, stop)
+            if stop.is_set():
+                return None
+            if rc != 0 or not os.path.exists(local):
+                part["error"] = "copy failed: %s" % ((msg or "").strip().splitlines()[-1:] or
+                                                    ["exit code %d" % rc])[0]
+            else:
+                try:
+                    part.update(sa.apk_identity(local))
+                except OSError as e:
+                    part["error"] = "couldn't read the copied file: %s" % (e.strerror or e)
+        finally:
+            try:
+                os.remove(local)
+            except OSError:
+                pass
+        parts.append(part)
+    return sa.make_app_identity(pkg, parts)
 
 
 def save_apk_copy(serial, pkg, version, dest_root, cancel):
@@ -884,38 +937,268 @@ ACTIONS_LOG = os.path.join(CONFIG_DIR, "actions.log")
 AI_CACHE_FILE = os.path.join(CONFIG_DIR, "ai_research.json")
 
 
+class JsonStoreError(OSError):
+    """Raised internally when the file on disk must not be overwritten."""
+
+
 class JsonStore:
-    """Small thread-safe JSON dict saved to disk after every change."""
+    """Small JSON dict kept in memory and saved to disk after every change.
+
+    How a change is saved (the important part):
+      every put()/update() is queued as a PENDING OPERATION. A save takes an
+      exclusive lock file (shared by every copy of the app), reads the CURRENT
+      file, replays all pending operations onto it IN ORDER, writes the result
+      atomically, then releases the lock. So update() always runs its function on
+      the latest data on disk - never on a stale copy this process loaded earlier -
+      and two running copies of the app can change different entries under the
+      same key (e.g. two packages of one device) without erasing each other.
+
+    Other rules:
+      - private: file 0600, folder 0700; an older looser file is tightened on load
+        (if that fails it is reported, not ignored);
+      - atomic: unique temp file + fsync + rename (sa.atomic_write_json);
+      - thread-safe: one re-entrant lock; get() hands out deep copies;
+      - fail closed: ONLY a missing file counts as a new empty store. A file that
+        is unreadable, empty (0 bytes - likely truncated), not valid JSON or not a
+        dict - at start-up OR later - is never overwritten. At start-up it is
+        moved aside (under the shared lock) to a unique, private .corrupt-* name;
+        if that's not possible the store is read-only;
+      - errors are reported: put()/update() return False when the change couldn't
+        be written, last_error says why, and the change stays pending in memory
+        (visible to get()) and is retried on the next save.
+
+    update() functions may run more than once (once for the in-memory view, and
+    again on each save attempt against the latest disk data), so they must be
+    pure: build the new value only from the value they are given."""
 
     def __init__(self, path):
         self.path = path
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
+        self.last_error = None      # why the most recent save failed (None = fine)
+        self.load_problem = None    # what was wrong with the file at start-up
+        self.read_only = False
+        self._pending = []          # ("put", key, value) / ("update", key, fn, default)
+        self.data = self._load()
+
+    # ---- loading -----------------------------------------------------------
+
+    def _note_load(self, msg):
+        self.load_problem = msg if not self.load_problem else self.load_problem + "; " + msg
+
+    def _open_lock(self):
+        """Take the exclusive lock file shared by every copy of the app (the same
+        one _save uses). Returns the fd to close (closing releases it).
+        The store's folder is created (0700) if needed: stores always live in our
+        private config folder."""
+        sa.ensure_dir(os.path.dirname(os.path.abspath(self.path)), private=True)
+        fd = os.open(self.path + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
         try:
-            with open(path, encoding="utf-8") as f:
-                self.data = json.load(f)
-            if not isinstance(self.data, dict):
-                self.data = {}
-        except (OSError, ValueError):
-            self.data = {}
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except ImportError:   # not on Linux/macOS: in-process lock still applies
+            pass
+        except OSError:
+            os.close(fd)
+            raise
+        return fd
+
+    def _load(self):
+        """Read the store at start-up. A missing file is a new, empty store; nothing
+        else gets that treatment. When a file exists, the check AND any recovery of
+        a damaged file happen under the shared lock, so two copies of the app
+        starting at once never fight over the same damaged file: the second one
+        simply finds it already moved aside (missing -> new empty store)."""
+        if not os.path.lexists(self.path):
+            return {}                      # nothing to protect; no lock needed
+        lockf = None
+        try:
+            lockf = self._open_lock()
+        except OSError as e:
+            self.read_only = True
+            self._note_load("can't lock %s (%s) - changes won't be saved this session" % (
+                self.path, e.strerror or e))
+            # still read it (read-only) so the session can show what's saved
+        try:
+            return self._load_locked(recover=lockf is not None)
+        finally:
+            if lockf is not None:
+                try:
+                    os.close(lockf)
+                except OSError:
+                    pass
+
+    def _load_locked(self, recover):
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                raw = f.read()
+        except FileNotFoundError:
+            return {}                      # another copy already moved it aside
+        except (OSError, UnicodeDecodeError) as e:
+            self.read_only = True
+            self._note_load("can't read %s (%s) - changes won't be saved this session" % (
+                self.path, getattr(e, "strerror", None) or e))
+            return {}
+        try:
+            os.chmod(self.path, 0o600)   # tighten files written by older versions
+        except OSError as e:
+            self._note_load("couldn't make %s private (0600): %s - other users on this "
+                            "computer may be able to read it" % (self.path, e.strerror or e))
+        try:
+            # an EXISTING empty file is NOT an empty store: it is most likely a
+            # store that got truncated, so it is treated as damaged like any other.
+            data = json.loads(raw)
+        except ValueError:
+            data = None
+        if isinstance(data, dict):
+            return data
+        what = "empty (0 bytes)" if not raw else "damaged"
+        if not recover:
+            self.read_only = True
+            self._note_load("%s is %s; it was left as it is" % (self.path, what))
+            return {}
+        aside = self._move_aside()
+        if aside:
+            self._note_load("%s was %s; it was kept as %s and a fresh one started" % (
+                os.path.basename(self.path), what, aside))
+        else:
+            self.read_only = True
+            self._note_load("%s is %s and couldn't be moved aside (%s) - it was left as it "
+                            "is and changes won't be saved this session" % (
+                                self.path, what, self._aside_error or "unknown error"))
+        return {}
+
+    def _move_aside(self):
+        """Move the damaged file to a .corrupt-* name. Order matters:
+          1. hard-link it under a name that never replaces an earlier backup
+             (os.link fails if the name exists);
+          2. make that backup private (0600 - the link shares the original's inode);
+             if this fails, remove the new link and leave the original untouched;
+          3. only then remove the original name.
+        Returns the backup path, or None (with self._aside_error set) on failure -
+        the caller then keeps the store read-only."""
+        self._aside_error = None
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        for n in range(1000):
+            aside = "%s.corrupt-%s-%d%s" % (self.path, stamp, os.getpid(), "" if not n else "-%d" % n)
+            try:
+                os.link(self.path, aside)
+            except FileExistsError:
+                continue
+            except OSError as e:
+                self._aside_error = "couldn't create a backup copy (%s)" % (e.strerror or e)
+                return None
+            try:
+                os.chmod(aside, 0o600)
+            except OSError as e:
+                self._aside_error = "couldn't make the backup private (%s)" % (e.strerror or e)
+                try:
+                    os.unlink(aside)
+                except OSError:
+                    self._aside_error += "; an unprotected backup was left at %s" % aside
+                return None
+            try:
+                os.unlink(self.path)
+            except OSError as e:
+                self._aside_error = "couldn't remove the damaged file (%s)" % (e.strerror or e)
+                try:
+                    os.unlink(aside)
+                except OSError:
+                    pass
+                return None
+            return aside
+        self._aside_error = "no free backup name"
+        return None
+
+    def _read_disk(self):
+        """Current file contents under the save lock. Missing -> {}. Anything else
+        that isn't a readable JSON dict raises JsonStoreError (fail closed)."""
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                raw = f.read()
+        except FileNotFoundError:
+            return {}
+        except (OSError, UnicodeDecodeError) as e:
+            raise JsonStoreError("%s can't be read (%s); it was left untouched" % (
+                os.path.basename(self.path), getattr(e, "strerror", None) or e))
+        if not raw:
+            raise JsonStoreError("%s is empty (0 bytes) on disk - probably truncated; it was "
+                                 "left untouched" % os.path.basename(self.path))
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            data = None
+        if not isinstance(data, dict):
+            raise JsonStoreError("%s on disk is damaged (not valid data); it was left untouched"
+                                 % os.path.basename(self.path))
+        return data
+
+    # ---- reading -----------------------------------------------------------
 
     def get(self, key, default=None):
         with self.lock:
-            return self.data.get(key, default)
+            if key not in self.data:
+                return default
+            return copy.deepcopy(self.data[key])
+
+    def keys(self):
+        with self.lock:
+            return list(self.data)
+
+    # ---- writing -----------------------------------------------------------
+
+    @staticmethod
+    def _apply(data, op):
+        if op[0] == "put":
+            data[op[1]] = copy.deepcopy(op[2])
+        else:
+            _, key, fn, default = op
+            data[key] = copy.deepcopy(fn(copy.deepcopy(data.get(key, default))))
 
     def put(self, key, value):
+        """Replace one key and save. Returns True only if it is safely on disk."""
         with self.lock:
-            self.data[key] = value
-            self._save()
+            op = ("put", key, copy.deepcopy(value))
+            self._apply(self.data, op)
+            self._pending.append(op)
+            return self._save()
+
+    def update(self, key, fn, default=None):
+        """Cross-process atomic read-modify-write of one key: on save, fn is applied
+        to the value currently ON DISK (under the lock). Returns True if saved."""
+        with self.lock:
+            op = ("update", key, fn, copy.deepcopy(default))
+            self._apply(self.data, op)       # immediate in-memory view
+            self._pending.append(op)
+            return self._save()
 
     def _save(self):
+        """Replay pending operations onto the latest disk data and write it.
+        Caller holds self.lock. On any failure nothing on disk changes and the
+        pending operations are kept for the next attempt."""
+        if self.read_only:
+            self.last_error = self.load_problem or "store is read-only"
+            return False
+        lockf = None
         try:
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            tmp = self.path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, indent=1, ensure_ascii=False)
-            os.replace(tmp, self.path)
-        except OSError:
-            pass
+            lockf = self._open_lock()
+            merged = self._read_disk()
+            for op in self._pending:
+                self._apply(merged, op)
+            sa.atomic_write_json(self.path, merged, private=True)
+            self._pending = []
+            self.data = merged            # now matches disk, incl. other copies' changes
+            self.last_error = None
+            return True
+        except OSError as e:              # JsonStoreError is an OSError too
+            self.last_error = str(e) if isinstance(e, JsonStoreError) else "%s: %s" % (
+                os.path.basename(self.path), e.strerror or e)
+            return False
+        finally:
+            if lockf is not None:
+                try:
+                    os.close(lockf)       # closing releases the flock
+                except OSError:
+                    pass
 
 
 def log_action(serial, verb, pkg, ok, msg):
@@ -1478,6 +1761,8 @@ class AppsTab(ttk.Frame):
         self.cache = JsonStore(CACHE_FILE)
         self.turned_off = JsonStore(TURNED_OFF_FILE)
         self.ai_cache = JsonStore(AI_CACHE_FILE)
+        self._store_warned = set()   # stores whose save failure we already showed
+        self.after(800, self._report_store_problems)
         self.job = None              # name of the running background job
         self.stop = threading.Event()
         self.fetching = set()        # packages being looked up right now
@@ -2436,7 +2721,12 @@ class AppsTab(ttk.Frame):
             return
         self._ai_win = AISettings(self.app.root, self.update_ai_label)
 
-    def ask_ai(self, compare):
+    def _has_cached_answer(self, pkg, provider):
+        """True if there's already a usable saved answer for this package+provider."""
+        r = (self.ai_cache.get(pkg) or {}).get(provider)
+        return isinstance(r, dict) and bool(r.get("answer"))
+
+    def ask_ai(self, compare, refresh=False):
         pkgs = self.selected_pkgs()
         if not pkgs:
             self.app.info("Select one or more apps first (not the group headings)")
@@ -2454,21 +2744,41 @@ class AppsTab(ttk.Frame):
                                 parent=self.app.root)
             self.open_ai_settings()
             return
-        n = len(pkgs) * len(provs)
-        if n > 2 and not messagebox.askyesno(
-                "Ask AI", "This sends %d request(s): %d app(s) x %d AI(s).\n\nEach request runs "
-                "several web searches and is billed to your API account. Answers are saved, "
-                "so you only pay once per app.\n\nGo ahead?" % (n, len(pkgs), len(provs)),
-                parent=self.app.root):
+        # Build only the (pkg, provider) pairs that actually need an API call.
+        # Unless this is an explicit refresh, reuse any usable cached answer.
+        tasks = {}
+        reused = 0
+        for pkg in pkgs:
+            need = [p for p in provs if refresh or not self._has_cached_answer(pkg, p)]
+            reused += len(provs) - len(need)
+            if need:
+                tasks[pkg] = need
+        if not tasks:
+            self.app.info("Already researched - showing the saved answer%s (use 'Refresh' to "
+                          "re-ask)" % ("s" if len(pkgs) > 1 else ""))
+            self.render(self.shown_pkg)
             return
-        apps = {p: dict(self.apps[p]) for p in pkgs}
-        self.start_job("asking the AI", self._ai_worker, pkgs, provs, cfg, dict(self.props), apps)
+        n = sum(len(v) for v in tasks.values())
+        note = ("" if not reused else "  (%d already cached, skipped)" % reused)
+        verb = "Refresh" if refresh else "Ask AI"
+        if n > 2 and not messagebox.askyesno(
+                verb, "This sends %d request(s)%s.\n\nEach runs several web searches and is billed "
+                "to your API account. Answers are saved, so you only pay once per app unless you "
+                "refresh.\n\nGo ahead?" % (n, note), parent=self.app.root):
+            return
+        task_pkgs = list(tasks)
+        apps = {p: dict(self.apps[p]) for p in task_pkgs}
+        self.start_job("asking the AI", self._ai_worker, task_pkgs, tasks, cfg, dict(self.props), apps)
 
-    def _ai_worker(self, pkgs, provs, cfg, props, apps):
+    def refresh_ai(self):
+        self.ask_ai(False, refresh=True)
+
+    def _ai_worker(self, pkgs, tasks, cfg, props, apps):
         failed = done = 0
         for i, pkg in enumerate(pkgs):
             if self.stop.is_set():
                 break
+            provs = tasks[pkg]   # only the providers that actually need calling
             names = " and ".join(ai.PROVIDERS[p]["label"] for p in provs)
             self.post(self.app.info, "Asking %s about %s (%d/%d) - this can take a minute or two ..."
                       % (names, pkg, i + 1, len(pkgs)))
@@ -2490,16 +2800,40 @@ class AppsTab(ttk.Frame):
             done += 1
         self.post(self._ai_done, done, len(pkgs), failed)
 
+    def _report_store_problems(self):
+        """Tell the user once if a saved-data file was damaged or unreadable at start."""
+        for st in (self.cache, self.turned_off, self.ai_cache):
+            if st.load_problem:
+                self.app.error("Saved data problem: " + st.load_problem)
+
+    def _store_saved(self, store, ok, what):
+        """Report a failed save (once per store until it works again)."""
+        if ok:
+            self._store_warned.discard(store.path)
+            return True
+        if store.path not in self._store_warned:
+            self._store_warned.add(store.path)
+            self.app.error("Couldn't save %s to disk (%s). It's kept for this session only."
+                           % (what, store.last_error or "unknown error"))
+        return False
+
     def _ai_result(self, pkg, prov, res):
-        entry = dict(self.ai_cache.get(pkg) or {})
-        old = entry.get(prov)
-        if res.get("error") and isinstance(old, dict) and old.get("answer"):
-            old = dict(old)              # keep the older good answer
-            old["last_error"] = res["error"]
-            entry[prov] = old
-        else:
-            entry[prov] = res
-        self.ai_cache.put(pkg, entry)
+        # merge() may be replayed later (JsonStore pending op), so it must only use
+        # frozen values: a private copy of the result, never the caller's object.
+        res = copy.deepcopy(res)
+
+        def merge(entry):
+            entry = entry if isinstance(entry, dict) else {}
+            old = entry.get(prov)
+            if res.get("error") and isinstance(old, dict) and old.get("answer"):
+                old = dict(old)              # keep the older good answer
+                old["last_error"] = res["error"]
+                entry[prov] = old
+            else:
+                entry[prov] = copy.deepcopy(res)
+            return entry
+        self._store_saved(self.ai_cache, self.ai_cache.update(pkg, merge, {}),
+                          "the AI answer for %s" % pkg)
         if self.shown_pkg == pkg:
             self.render(pkg)
 
@@ -2598,7 +2932,7 @@ class AppsTab(ttk.Frame):
     def _fetched(self, pkg, res):
         self.fetching.discard(pkg)
         if not res.get("error") or res.get("play") or res.get("web"):
-            self.cache.put(pkg, res)
+            self._store_saved(self.cache, self.cache.put(pkg, res), "the lookup for %s" % pkg)
         self.refresh_row(pkg)
         if self.shown_pkg == pkg:
             if res.get("error") and not (res.get("play") or res.get("web")):
@@ -2752,15 +3086,22 @@ class AppsTab(ttk.Frame):
         self.end_job()
         if serial != self.serial:
             return
-        mine = dict(self.turned_off.get(serial, {}) or {})
-        for p, ok, msg in results:
-            if not ok or p not in self.apps:
-                continue
-            if enable:
-                mine.pop(p, None)
-            else:
-                mine[p] = time.strftime("%Y-%m-%d %H:%M")
-        self.turned_off.put(serial, mine)
+        # apply() may be replayed later (JsonStore pending op), so everything it
+        # needs is frozen NOW: which packages changed, and the timestamp. It must
+        # not read self.apps or the clock when it runs.
+        stamp = time.strftime("%Y-%m-%d %H:%M")
+        changed = tuple(p for p, ok, msg in results if ok and p in self.apps)
+
+        def apply(mine, changed=changed, stamp=stamp, enable=bool(enable)):
+            mine = mine if isinstance(mine, dict) else {}
+            for p in changed:
+                if enable:
+                    mine.pop(p, None)
+                else:
+                    mine[p] = stamp
+            return mine
+        self._store_saved(self.turned_off, self.turned_off.update(serial, apply, {}),
+                          "the list of apps this program turned off (used for Undo)")
         if disabled is not None:
             for p, a in self.apps.items():
                 a["disabled"] = p in disabled
@@ -3069,7 +3410,13 @@ class NetworkTab(ttk.Frame):
         learning = time.time() < self.learn_until
         if is_new:
             known.append(dest)
-            sa.save_json(self.seen_path(), self.seen)
+            if not sa.save_json(self.seen_path(), self.seen):
+                if not getattr(self, "_seen_save_warned", False):
+                    self._seen_save_warned = True
+                    self.app.error("Couldn't save the list of known destinations to disk - new "
+                                   "destinations are remembered for this session only")
+            else:
+                self._seen_save_warned = False
         alert = is_new and not learning
         sig = (s["uid"], s["remote_ip"], s["remote_port"])
         if sig not in self.logged or alert:
@@ -3524,15 +3871,18 @@ class SecurityTab(ttk.Frame):
             n = len([a for a in (apps or {}).values() if not a["system"] and not a.get("removed")])
             keys = [k for k, v in (("VirusTotal", cfg["virustotal_key"]), ("MalwareBazaar", cfg["malwarebazaar_key"]),
                                    ("Exodus", cfg["exodus_token"])) if v]
-            msg = ("The deep scan copies %s you installed to this computer (into a temporary folder, deleted "
-                   "afterwards) to read their signature and fingerprint.\n\n" % (
+            msg = ("The deep scan copies %s you installed to this computer - every part of each app, "
+                   "not just the main file - into a temporary folder (deleted afterwards) to read their "
+                   "signature and fingerprint.\n\n" % (
                        "the %d apps" % n if apps is not None else "the apps"))
             msg += (("Then it asks %s about them - only the fingerprint (hash) and package name are sent, never "
                      "the apps themselves." % " and ".join(keys)) if keys else
                     "No lookup service is set up, so it only reads signatures. Add free keys in Security "
                     "settings to check apps against malware databases and tracker reports.")
             if cfg["virustotal_key"]:
-                msg += "\n\nVirusTotal's free key allows 4 lookups a minute, so this can take a while."
+                msg += ("\n\nVirusTotal's free key allows 4 lookups a minute, and apps made of several "
+                        "parts need one lookup per part, so this can take a while. Results are remembered, "
+                        "so the next deep scan only looks up what changed.")
             if not messagebox.askyesno("Deep scan", msg + "\n\nStart?", parent=self.app.root):
                 return
         self.busy = "deep scan" if deep else "checkup"
@@ -3582,6 +3932,7 @@ class SecurityTab(ttk.Frame):
                  sa.check_origin(facts, launcher, label) + sa.check_usage(facts, launcher, label))
 
         idcache = sa.load_json(sa.IDENTITY_FILE, {})
+        save_problems = []           # cache files that couldn't be written this run
         targets = users + ([p for p, a in apps.items() if a["system"] and a.get("updated_system")
                             and not a.get("removed")] if cfg.get("deep_include_updated_system") else [])
         if deep:
@@ -3591,69 +3942,78 @@ class SecurityTab(ttk.Frame):
                     if self.stop.is_set():
                         break
                     k = sa.identity_key(p, apps[p])
-                    if k in idcache:
-                        continue
-                    self.say("Deep scan: reading %d/%d %s ..." % (i + 1, len(targets), p))
+                    if sa.identity_complete(idcache.get(k)):
+                        continue     # every part already fingerprinted for this exact version
+                    self.say("Deep scan: reading %d/%d %s (all its parts) ..." % (i + 1, len(targets), p))
                     try:
-                        paths = pm_paths(serial, p)
-                    except AdbError:
+                        ident = read_app_identity(serial, p, work, self.stop)
+                    except AdbError as e:
+                        # keep an older (even partial) record if there is one; else record why
+                        if k not in idcache:
+                            idcache[k] = sa.make_app_identity(p, [{"path": "", "name": "base.apk",
+                                                                  "kind": "base", "error": str(e)}])
                         continue
-                    base = next((x for x in paths if x.endswith("/base.apk")), paths[0] if paths else "")
-                    if not base:
-                        continue
-                    local = os.path.join(work, "a.apk")
-                    rc, msg = adb_transfer([ADB, "-s", serial, "pull", base, local], lambda x: None, self.stop)
-                    if rc != 0 or not os.path.exists(local):
-                        continue
-                    try:
-                        ident = sa.apk_identity(local)
-                        ident["pkg"] = p
+                    if ident is not None:
                         idcache[k] = ident
-                    except OSError:
-                        pass
-                    finally:
-                        try:
-                            os.remove(local)
-                        except OSError:
-                            pass
-                sa.save_json(sa.IDENTITY_FILE, idcache)
+                if not sa.save_json(sa.IDENTITY_FILE, idcache):
+                    save_problems.append("app fingerprints (%s)" % os.path.basename(sa.IDENTITY_FILE))
             finally:
                 shutil.rmtree(work, ignore_errors=True)
 
-        snap = sa.build_snapshot(serial, facts, access, launcher, idcache)
-        found += sa.compare_snapshots(sa.last_snapshot(serial), snap, label)
-        if not self.stop.is_set():
-            sa.save_snapshot(serial, snap)
+        prev_snap = sa.last_snapshot(serial)
+        snap = sa.build_snapshot(serial, facts, access, launcher, idcache, prev=prev_snap)
+        found += sa.compare_snapshots(prev_snap, snap, label)
+        if not self.stop.is_set() and not sa.save_snapshot(serial, snap):
+            found.append(sa.finding(
+                "changes", sa.WARN, "Couldn't save this check as the new reference",
+                "The results below are fine, but they could not be written to disk (%s). "
+                "Next time, 'changes since last check' will compare against the older saved "
+                "check instead. Check free space and permissions of that folder." % sa.SNAP_DIR,
+                key="changes:save-failed"))
 
         idents = {p: idcache[sa.identity_key(p, apps[p])] for p in targets
                   if sa.identity_key(p, apps[p]) in idcache}
         rep = sa.load_json(sa.REPUTATION_FILE, {})
         if deep and (cfg["virustotal_key"] or cfg["malwarebazaar_key"]):
-            vt_ok, last_vt = bool(cfg["virustotal_key"]), 0.0
-            for i, (p, ident) in enumerate(sorted(idents.items())):
+            # every readable part of every app, each distinct file looked up once
+            work_items, seen_hash = [], set()
+            for p, ident in sorted(idents.items()):
+                for part in sa.identity_parts(ident):
+                    h = part.get("sha256")
+                    if h and h not in seen_hash:
+                        seen_hash.add(h)
+                        work_items.append((p, part, h))
+            vt_ok, last_vt, rep_save_failed = bool(cfg["virustotal_key"]), 0.0, False
+            n = len(work_items)
+            for i, (p, part, h) in enumerate(work_items):
                 if self.stop.is_set():
                     break
-                entry = dict(rep.get(ident["sha256"], {}))
+                what = "%s - %s" % (p, sa.apk_part_label(part))
+                entry = dict(rep.get(h, {}))
                 fresh = time.time() - entry.get("time", 0) < 7 * 86400
                 if vt_ok and not (fresh and entry.get("vt") and not entry["vt"].get("error")):
                     wait = 15.5 - (time.time() - last_vt)
                     while wait > 0 and not self.stop.is_set():
-                        self.say("Deep scan: VirusTotal %d/%d (free key: waiting %ds) ..." % (i + 1, len(idents), wait))
+                        self.say("Deep scan: VirusTotal %d/%d (free key: waiting %ds) ..." % (i + 1, n, wait))
                         time.sleep(min(1.0, wait))
                         wait -= 1.0
                     if self.stop.is_set():
                         break
-                    self.say("Deep scan: VirusTotal %d/%d %s ..." % (i + 1, len(idents), p))
-                    entry["vt"] = sa.virustotal(cfg["virustotal_key"], ident["sha256"])
+                    self.say("Deep scan: VirusTotal %d/%d %s ..." % (i + 1, n, what))
+                    entry["vt"] = sa.virustotal(cfg["virustotal_key"], h)
                     last_vt = time.time()
                     if entry["vt"].get("quota") or "rejected" in entry["vt"].get("error", ""):
                         vt_ok = False
                 if cfg["malwarebazaar_key"] and not (fresh and entry.get("mb") and not entry["mb"].get("error")):
-                    self.say("Deep scan: MalwareBazaar %d/%d %s ..." % (i + 1, len(idents), p))
-                    entry["mb"] = sa.malwarebazaar(cfg["malwarebazaar_key"], ident["sha256"])
+                    self.say("Deep scan: MalwareBazaar %d/%d %s ..." % (i + 1, n, what))
+                    entry["mb"] = sa.malwarebazaar(cfg["malwarebazaar_key"], h)
                 entry["time"] = time.time()
-                rep[ident["sha256"]] = entry
-                sa.save_json(sa.REPUTATION_FILE, rep)
+                rep[h] = entry
+                # each write holds the WHOLE cache, so only the latest write's outcome
+                # matters: a later success also saves the results of an earlier failure
+                rep_save_failed = not sa.save_json(sa.REPUTATION_FILE, rep)
+            if rep_save_failed:
+                save_problems.append("virus-scanner results (%s)" % os.path.basename(sa.REPUTATION_FILE))
         mal = sa.reputation_findings(apps, label, idents, rep) if idents else []
         if not mal:
             mal = [sa.finding("malware", sa.INFO, "Not checked yet - run a deep scan%s" % (
@@ -3674,7 +4034,10 @@ class SecurityTab(ttk.Frame):
                 reports[p] = r
                 tcache = sa.load_json(sa.TRACKERS_FILE, {})
                 tcache[p] = {"vc": apps[p].get("version_code"), "time": time.time(), "result": r}
-                sa.save_json(sa.TRACKERS_FILE, tcache)
+                if not sa.save_json(sa.TRACKERS_FILE, tcache):
+                    msg = "tracker reports (%s)" % os.path.basename(sa.TRACKERS_FILE)
+                    if msg not in save_problems:
+                        save_problems.append(msg)
         trk = sa.tracker_findings(apps, label, reports) if reports else []
         if not trk:
             trk = [sa.finding("trackers", sa.INFO, "Not checked yet - %s" % (
@@ -3682,6 +4045,13 @@ class SecurityTab(ttk.Frame):
                 "add a free Exodus Privacy token in Security settings, then run a deep scan"),
                 key="trackers:none")]
         found += trk
+        if save_problems:
+            found.append(sa.finding(
+                "changes", sa.WARN, "Some scan results couldn't be saved",
+                "The results shown are fine, but these couldn't be written to disk: %s. Next time "
+                "they will be fetched again (slower, and uses more of your free lookup quota). "
+                "Check free space and permissions of %s." % (", ".join(save_problems), sa.CONFIG_DIR),
+                key="changes:cache-save-failed"))
         return {"findings": found, "stopped": self.stop.is_set(), "deep": deep}
 
     def _failed(self, msg):
