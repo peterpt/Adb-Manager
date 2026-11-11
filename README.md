@@ -11,6 +11,8 @@ It works through Android's own debugging bridge (`adb`). **No root is needed**, 
 ## What it does
 
 ### 📁 Files
+<img width="1024" height="768" alt="image" src="https://github.com/user-attachments/assets/88162887-0a0a-44c3-a6be-24aa3d6e83b2" />
+
 A two-pane file manager: your computer on the left, the device on the right.
 
 - Copy both ways, create folders, rename, delete
@@ -19,6 +21,8 @@ A two-pane file manager: your computer on the left, the device on the right.
 - Keys: `F5` copy to the other side · `F7` new folder · `F2` rename · `Del` delete · `Backspace` parent folder · `Ctrl+H` hidden files · `Ctrl+R` refresh
 
 ### 📱 Apps
+<img width="1024" height="768" alt="image" src="https://github.com/user-attachments/assets/e88cf57c-6400-4f6e-ab13-6375bf28bb71" />
+
 Every installed package, grouped (Google / Android / phone maker / apps you installed), with sub-packages nested under their parent. For each app it tells you, in plain words:
 
 - **What it does**: from a built-in list of ~190 common packages, from Google Play, or from a web search when an app isn't on Play
@@ -37,6 +41,8 @@ What you can do with apps:
 - **Inspect code…**: look inside the app's files without running it (see [Code inspector](#-code-inspector)).
 
 ### 🌐 Network
+<img width="1024" height="768" alt="image" src="https://github.com/user-attachments/assets/520e5ee4-0a7f-48ac-93f8-f5e486c4a0d3" />
+
 What is happening on the device's network right now, read from Android's own tables (`/proc/net`) and matched to the app that owns each connection. No root needed.
 
 - **Open ports**: what is waiting for connections, and whether only the device itself or *anyone on your Wi-Fi* can reach it
@@ -46,6 +52,8 @@ What is happening on the device's network right now, read from Android's own tab
 - UDP is handled correctly: short-lived client sockets (DNS lookups, fast web traffic) are shown as "temporary", not as open ports
 
 ### 🛡️ Security
+<img width="1024" height="768" alt="image" src="https://github.com/user-attachments/assets/ef06221a-8310-49f2-a65c-463048f01e11" />
+
 A checkup of the things malware depends on, each result explained with what it means and what to do.
 
 - **Device protection**:
