@@ -103,6 +103,8 @@ How it's kept safe and honest:
 - **Limits**: what an app downloads, builds or decrypts *while running* can't be seen by reading its files; the window says so. The Network tab shows what apps actually connect to.
 
 ### 🤖 Optional AI research
+<img width="1024" height="768" alt="image" src="https://github.com/user-attachments/assets/974cdf4e-b761-4c56-ab57-0fffe4acadb1" />
+
 Uses **Anthropic (Claude)** or **OpenAI**, with web search, through your own API key. Nothing is ever sent to an AI automatically; every request is a button you press.
 
 - **About an app**: what it is, what it collects, known issues. Answers are saved, so an app isn't researched (and billed) twice.
