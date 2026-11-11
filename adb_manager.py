@@ -56,10 +56,11 @@ Saved data (in ~/.config/adb_manager/):
     snapshots/            one device fingerprint per security check
     network_seen/ network_log/   destinations each app used, and the log
 
-Requires: Python 3.6+ with tkinter (apt install python3-tk), adb in PATH
-          (or ADB=/path/to/adb), Linux/macOS. app_knowledge.py and
-          ai_research.py and security_audit.py in the same folder. For AI research: pip install
-          anthropic and/or openai.
+Requires: Python 3 with tkinter (apt install python3-tk) - tested with 3.11 and 3.12 -
+          adb in PATH (or ADB=/path/to/adb), Linux (Windows isn't supported).
+          app_knowledge.py, ai_research.py and security_audit.py in the same folder.
+          Optional: pip install anthropic and/or openai (AI research); Androguard 4.1.4
+          in its own venv (code inspector) - see README.md.
 """
 
 import argparse
@@ -668,7 +669,7 @@ def pm_paths(serial, pkg):
     return [l[len("package:"):].strip() for l in out.splitlines() if l.startswith("package:")]
 
 
-def read_app_identity(serial, pkg, work, stop):
+def read_app_identity(serial, pkg, work, stop, keep=False):
     """Pull EVERY installed APK part of pkg (base + feature + config splits) into
     `work`, fingerprint each one (sha256 + signer), delete the copies, and return
     sa.make_app_identity(...). A part that can't be pulled or read is recorded
@@ -676,7 +677,10 @@ def read_app_identity(serial, pkg, work, stop):
 
     Returns None if the user pressed Stop while this app was being read (an
     interrupted read is not "unreadable" and must not be cached), and raises
-    AdbError if the device won't say where the app's files are."""
+    AdbError if the device won't say where the app's files are.
+
+    keep=True (code inspector): the copies are NOT deleted - each readable part
+    gets "local": its path inside `work` (a private folder the caller removes)."""
     paths = pm_paths(serial, pkg)
     if not paths:
         raise AdbError("the device listed no files for %s" % pkg)
@@ -697,13 +701,16 @@ def read_app_identity(serial, pkg, work, stop):
             else:
                 try:
                     part.update(sa.apk_identity(local))
+                    if keep:
+                        part["local"] = local
                 except OSError as e:
                     part["error"] = "couldn't read the copied file: %s" % (e.strerror or e)
         finally:
-            try:
-                os.remove(local)
-            except OSError:
-                pass
+            if not part.get("local"):
+                try:
+                    os.remove(local)
+                except OSError:
+                    pass
         parts.append(part)
     return sa.make_app_identity(pkg, parts)
 
@@ -1407,13 +1414,42 @@ def hex_ip(h):
     return str(ip.ipv4_mapped) if ip.ipv4_mapped else str(ip)
 
 
+# Linux's default range of temporary ("ephemeral") ports handed out for outgoing
+# traffic; read from the device when possible (ip_local_port_range).
+EPHEMERAL_DEFAULT = (32768, 60999)
+
+
+def parse_port_range(text):
+    m = re.match(r"\s*(\d+)\s+(\d+)\s*$", text or "")
+    if m and 0 < int(m.group(1)) <= int(m.group(2)) <= 65535:
+        return int(m.group(1)), int(m.group(2))
+    return None
+
+
 def parse_proc_net(text):
-    """Parse '==tcp' / '==udp6' ... sections of /proc/net files. Returns (sockets, errors)."""
+    """Parse '==tcp' / '==udp6' ... sections of /proc/net files (and an optional
+    '==portrange' section). Returns (sockets, errors).
+
+    TCP: state 0A = listening (an open port), 01 = connected.
+    UDP has NO listening state. An unconnected UDP socket shows state 07 (CLOSE):
+      - on a FIXED port (outside the temporary range) it receives on that port,
+        like a server does (mDNS 5353, DHCP 68 ...)      -> kind "listen";
+      - on a TEMPORARY port it's almost always the client side of DNS, QUIC
+        (HTTP/3) and similar, not a service waiting for others -> kind
+        "udp_temp", which is not counted as an open port and raises no alerts."""
     socks, errors, proto = [], [], None
-    for line in text.splitlines():
+    lines = text.splitlines()
+    eph = None
+    for i, line in enumerate(lines):
+        if line.strip() == "==portrange" and i + 1 < len(lines):
+            eph = parse_port_range(lines[i + 1])
+    low, high = eph or EPHEMERAL_DEFAULT
+    for line in lines:
         line = line.strip()
         if line.startswith("=="):
             proto = line[2:]
+            continue
+        if proto == "portrange":
             continue
         parts = line.split()
         if not proto or not parts:
@@ -1435,16 +1471,23 @@ def parse_proc_net(text):
         if rec["proto"] == "tcp":
             rec["state"] = TCP_STATES.get(st, st)
             rec["kind"] = "listen" if st == "0A" else ("connected" if st == "01" else "other")
+        elif st == "01":
+            rec["state"], rec["kind"] = "CONNECTED", "connected"
+        elif st == "07" and low <= rec["local_port"] <= high:
+            rec["state"], rec["kind"] = "TEMPORARY", "udp_temp"
+        elif st == "07":
+            rec["state"], rec["kind"] = "OPEN", "listen"
         else:
-            rec["state"] = "CONNECTED" if st == "01" else ("OPEN" if st == "07" else st)
-            rec["kind"] = "connected" if st == "01" else ("listen" if st == "07" else "other")
+            rec["state"], rec["kind"] = st, "other"
+        rec["eph_range"] = "%d-%d%s" % (low, high, "" if eph else " (default)")
         socks.append(rec)
     return socks, errors
 
 
 def read_sockets(serial):
     rc, out, err = adb_shell(serial, "for f in tcp tcp6 udp udp6; do echo ==$f; "
-                                     "cat /proc/net/$f 2>&1; done", timeout=30)
+                                     "cat /proc/net/$f 2>&1; done; echo ==portrange; "
+                                     "cat /proc/sys/net/ipv4/ip_local_port_range 2>&1", timeout=30)
     socks, errors = parse_proc_net(out)
     if not socks and (errors or err.strip()):
         raise AdbError("the device won't show its network table: %s"
@@ -1788,6 +1831,9 @@ class AppsTab(ttk.Frame):
         self.uninstall_btn.pack(side="left", padx=(4, 0))
         self.restore_btn = ttk.Button(top, text="Restore removed", command=self.restore_selected)
         self.restore_btn.pack(side="left", padx=4)
+        self.inspect_btn = ttk.Button(top, text="Inspect code\u2026", command=self.inspect_selected)
+        self.inspect_btn.pack(side="left", padx=4)
+        self._inspect_wins = {}
         ttk.Label(top, text="  Search:").pack(side="left")
         ent = ttk.Entry(top, textvariable=self.search_var, width=20)
         ent.pack(side="left", padx=4)
@@ -2196,6 +2242,27 @@ class AppsTab(ttk.Frame):
         if pkg in self.apps and self.tree.exists(iid):
             vals, tags = self.row_values(self.apps[pkg])
             self.tree.item(iid, text=self.label(pkg), values=vals, tags=tags)
+
+    def inspect_selected(self):
+        """Open the static code inspector for ONE selected app (nothing runs until
+        the user presses 'Inspect now' in that window)."""
+        pkgs = self.selected_pkgs()
+        if len(pkgs) != 1:
+            self.app.info("Select exactly one app to inspect (not a group heading)")
+            return
+        pkg = pkgs[0]
+        if not self.serial:
+            self.app.error("No device connected - pick one at the top")
+            return
+        if self.apps[pkg].get("removed"):
+            self.app.info("That app is removed for this user - there's nothing installed to inspect")
+            return
+        win = self._inspect_wins.get(pkg)
+        if win is not None and win.alive():
+            win.lift()
+            return
+        self._inspect_wins[pkg] = InspectWindow(self.app.root, self.app, self.serial, pkg,
+                                                dict(self.apps[pkg]), self.label(pkg))
 
     def selected_pkgs(self):
         return [iid[2:] for iid in self.tree.selection() if iid.startswith("p:")
@@ -3502,13 +3569,15 @@ class NetworkTab(ttk.Frame):
     def sock_text(self, s):
         if s["kind"] == "listen":
             return "Open port %s %d" % (s["proto"].upper(), s["local_port"])
+        if s["kind"] == "udp_temp":
+            return "Temporary UDP socket on port %d (likely client side)" % s["local_port"]
         if s["kind"] == "connected":
             return "Connected to %s:%d" % (self.remote_label(s), s["remote_port"])
         return "%s %s:%d" % (s["state"].lower().replace("_", " "), self.remote_label(s), s["remote_port"])
 
     def sock_values(self, s):
-        reach = REACH_TEXT.get(self.reach(s), "")
-        remote = "" if s["kind"] == "listen" else self.fmt(s["remote_ip"], s["remote_port"])
+        reach = "" if s["kind"] == "udp_temp" else REACH_TEXT.get(self.reach(s), "")
+        remote = "" if s["kind"] in ("listen", "udp_temp") else self.fmt(s["remote_ip"], s["remote_port"])
         return (reach, s["proto"].upper() + ("6" if s["v6"] else ""),
                 self.fmt(s["local_ip"], s["local_port"]), remote, s["state"])
 
@@ -3646,7 +3715,10 @@ class NetworkTab(ttk.Frame):
             for s in conns:
                 w("\u2022 %s:%d  (%s)\n" % (self.remote_label(s), s["remote_port"],
                                             REACH_TEXT.get(self.reach(s), "")))
-        if not opens and not conns:
+        temps = [s for s in items if s["kind"] == "udp_temp"]
+        if temps:
+            w("Temporary UDP sockets: %d (normal client traffic like name lookups)\n" % len(temps), "dim")
+        if not opens and not conns and not temps:
             w("\nOnly sockets that are closing right now.\n", "dim")
 
     def render_sock(self, w, s):
@@ -3671,8 +3743,19 @@ class NetworkTab(ttk.Frame):
                   "and read data. Turn off 'Wireless debugging' / 'ADB over network' when you don't "
                   "need it.\n", "warn")
             if s["proto"] == "udp":
-                w("\nUDP 'open' means the app can receive messages on this port. Many system "
-                  "services do this to find devices on the network or get an address.\n", "dim")
+                w("\nUDP has no 'waiting for connections' state like TCP. 'Open' here means the app "
+                  "can receive messages on this fixed port. Many system services do this to find "
+                  "devices on the network or get an address.\n", "dim")
+        elif s["kind"] == "udp_temp":
+            w("%s\n" % self.sock_text(s), "h1")
+            w("Opened by: %s\n" % owner)
+            w("What this is\n", "h2")
+            w("A UDP socket on a temporary port that isn't tied to one other side. Apps get these "
+              "for things like looking up website names (DNS) or fast web traffic (QUIC / HTTP/3). "
+              "It is the app's own end of outgoing traffic, not a service waiting for others, so "
+              "it isn't counted as an open port.\n", "ok")
+            w("\nTemporary ports on this device: %s. A program could deliberately listen on one of "
+              "these, so this is a strong hint, not proof.\n" % s.get("eph_range", "?"), "dim")
         else:
             w("%s\n" % self.sock_text(s), "h1")
             w("Opened by: %s\n" % owner)
@@ -3910,7 +3993,12 @@ class SecurityTab(ttk.Frame):
         label = self.app.apps_tab.label
 
         def shell(cmd, timeout=60):
-            return adb_shell(serial, cmd, timeout=timeout)[1]
+            # a failed command must RAISE (sa.collect records it as "couldn't check");
+            # returning its empty output would read as an all-clear
+            rc, out, err = adb_shell(serial, cmd, timeout=timeout)
+            if rc != 0:
+                raise AdbError(last_line(err, out) or "exit code %d" % rc)
+            return out
         if apps is None:
             self.say("Security: reading the app list ...")
             apps = scan_packages(serial)["apps"]
@@ -4687,6 +4775,692 @@ class RootingDBWindow(tk.Toplevel):
             self.populate()
 
 
+INSPECT_MODES = [("Automatic (recommended)", "auto"), ("Quick - faster, less detail", "quick"),
+                 ("Full - shows which code uses each address", "full")]
+CLASS_WORDS = {"malicious": "Known bad", "suspicious": "Worth a look", "unknown": "Not known",
+               "expected": "Expected"}
+SEVERITY_WORDS = {"bad": "Serious", "warn": "Worth a look", "info": "For your information"}
+STAGE_MARK = {sa.STAGE_DONE: "\u2705", sa.STAGE_SKIPPED: "\u2013", sa.STAGE_PARTIAL: "\u26a0",
+              sa.STAGE_FAILED: "\u26d4", sa.STAGE_TIMEOUT: "\u26d4", "running": "\u2026", "waiting": "\u00b7"}
+STAGE_ORDER = ["copy", "container", "manifest", "code", "resources", "native", "classify"]
+STAGE_NAMES = {"copy": "copying the app from the phone", "container": "checking the APK files",
+               "manifest": "reading the manifest", "code": "reading the code",
+               "resources": "reading resources and bundled files", "native": "reading native libraries",
+               "classify": "classifying what was found"}
+SOURCE_WORDS = {"dex": "app code", "resource": "app resources", "asset": "bundled file",
+                "native": "native library", "manifest": "manifest"}
+
+
+_LIVE_INSPECT_WINDOWS = set()    # see InspectWindow.close()
+
+
+class SendPreview(tk.Toplevel):
+    """Shows the COMPLETE text that would be sent to an AI provider, scrollable,
+    with Send / Cancel. result is True only if the user pressed Send."""
+
+    def __init__(self, master, provider_label, text):
+        super().__init__(master)
+        self.title("Send this to %s?" % provider_label)
+        self.transient(master)
+        self.result = False
+        self.minsize(560, 420)
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, wraplength=620, justify="left",
+                  text="This is the complete text that will be sent to %s - scroll to read all of it. The "
+                       "app's fixed instructions to the AI are added separately; nothing else is sent. "
+                       "Query strings, passwords and token-like values were removed. It's billed to your "
+                       "API account." % provider_label).pack(anchor="w")
+        box = ttk.Frame(frm)
+        box.pack(fill="both", expand=True, pady=8)
+        self.txt = tk.Text(box, wrap="word", width=80, height=18, font=("TkFixedFont", 9))
+        sb = ttk.Scrollbar(box, orient="vertical", command=self.txt.yview)
+        self.txt.configure(yscrollcommand=sb.set)
+        self.txt.insert("1.0", text)
+        self.txt.configure(state="disabled")
+        self.txt.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        ttk.Label(frm, text="%d characters" % len(text), foreground="#777777").pack(anchor="w")
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x", pady=(6, 0))
+        self.send_btn = ttk.Button(btns, text="Send", command=self.send)
+        self.send_btn.pack(side="right")
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right", padx=6)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+    def send(self):
+        self.result = True
+        self.destroy()
+
+
+def _dex_bytes(path):
+    try:
+        with zipfile.ZipFile(path) as z:
+            return sum(i.file_size for i in z.infolist() if re.match(r"^classes\d*\.dex$", i.filename))
+    except (zipfile.BadZipFile, OSError):
+        return 0
+
+
+class InspectWindow(tk.Toplevel):
+    """Static code inspection of ONE installed app (phase 1b UI).
+
+    Never runs the app, never asks an AI on its own: the only AI call is the
+    'Ask AI about this' button, for the one finding that is selected."""
+
+    def __init__(self, master, app, serial, pkg, appinfo, label):
+        super().__init__(master)
+        self.app, self.serial, self.pkg, self.appinfo, self.label = app, serial, pkg, appinfo, label
+        self.vc = str(appinfo.get("version_code") or "")
+        self.title("Inspect code - %s" % label)
+        self.transient(master)
+        self.minsize(820, 600)
+        self.res, self.key, self.env = None, None, None
+        self.busy, self.ai_busy = False, False
+        self.stop = threading.Event()
+        self._threads = []
+        _LIVE_INSPECT_WINDOWS.add(self)
+        self.items = {}                  # tree iid -> (kind, item)
+        self.current = None              # (kind, item) shown in the evidence pane
+        self.stage = {k: "waiting" for k in STAGE_ORDER}
+        self.show_tech = tk.BooleanVar(value=False)
+        self.mode_var = tk.StringVar(value=INSPECT_MODES[0][0])
+        self.protocol("WM_DELETE_WINDOW", self.close)
+
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text=label, font=("TkDefaultFont", 14, "bold")).pack(anchor="w")
+        ttk.Label(frm, text="%s  \u00b7  version %s (%s)" % (pkg, appinfo.get("version") or "?", self.vc or "?"),
+                  foreground="#555555").pack(anchor="w")
+        self.summary = tk.Text(frm, height=5, wrap="word", relief="flat", padx=6, pady=4, cursor="arrow",
+                               font=("TkDefaultFont", 10))
+        self.summary.pack(fill="x", pady=(6, 4))
+        for t, kw in (("big", {"font": ("TkDefaultFont", 12, "bold")}), ("ok", {"foreground": "#2e7d32"}),
+                      ("warn", {"foreground": "#b26a00"}), ("bad", {"foreground": "#c62828"}),
+                      ("dim", {"foreground": "#777777"}), ("mono", {"font": ("TkFixedFont", 9)})):
+            self.summary.tag_configure(t, **kw)
+
+        row = ttk.Frame(frm)
+        row.pack(fill="x")
+        ttk.Label(row, text="How deep:").pack(side="left")
+        ttk.Combobox(row, textvariable=self.mode_var, values=[m[0] for m in INSPECT_MODES], state="readonly",
+                     width=40).pack(side="left", padx=4)
+        self.go_btn = ttk.Button(row, text="Inspect now", command=lambda: self.inspect(force=False))
+        self.go_btn.pack(side="left", padx=4)
+        self.again_btn = ttk.Button(row, text="Inspect again", command=lambda: self.inspect(force=True))
+        self.check_btn = ttk.Button(row, text="Check again", command=self.check_again)
+        self.stop_btn = ttk.Button(row, text="Stop", command=self.stop.set)
+        ttk.Checkbutton(row, text="Show technical details", variable=self.show_tech,
+                        command=self.rerender).pack(side="right")
+        self.progress = ttk.Label(frm, text="", foreground="#555555")
+        self.progress.pack(fill="x", pady=(4, 0))
+        self.stage_lbl = ttk.Label(frm, text="", foreground="#555555", font=("TkFixedFont", 9))
+        self.stage_lbl.pack(fill="x")
+
+        pane = ttk.PanedWindow(frm, orient="vertical")
+        pane.pack(fill="both", expand=True, pady=(6, 0))
+        self.nb = ttk.Notebook(pane)
+        pane.add(self.nb, weight=3)
+        self.ep_tree = self._tree(("what", "address", "used_by", "note"),
+                                  (("What", 110), ("Address", 300), ("Used by", 170), ("Note", 220)), "Addresses")
+        self.ind_tree = self._tree(("level", "what"), (("How serious", 150), ("What", 600)), "Code warnings")
+        self.parts_txt = self._text_tab("App parts")
+        self.limits_txt = self._text_tab("What couldn't be checked")
+        low = ttk.Frame(pane)
+        pane.add(low, weight=2)
+        self.ev = tk.Text(low, height=10, wrap="word", relief="flat", padx=8, pady=6, cursor="arrow",
+                          font=("TkDefaultFont", 10))
+        sb = ttk.Scrollbar(low, orient="vertical", command=self.ev.yview)
+        self.ev.configure(yscrollcommand=sb.set)
+        btns = ttk.Frame(low)
+        btns.pack(side="bottom", fill="x", pady=(4, 0))
+        self.ask_btn = ttk.Button(btns, text="Ask AI about this", command=lambda: self.ask_ai(False),
+                                  state="disabled")
+        self.ask_btn.pack(side="left")
+        self.ask_again_btn = ttk.Button(btns, text="Ask AI again", command=lambda: self.ask_ai(True))
+        self.ai_note = ttk.Label(btns, text="Only the selected finding is sent - never the app's code.",
+                                 foreground="#777777")
+        self.ai_note.pack(side="left", padx=8)
+        self.ev.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        for t, kw in (("h1", {"font": ("TkDefaultFont", 12, "bold")}),
+                      ("h2", {"font": ("TkDefaultFont", 10, "bold"), "spacing1": 8}),
+                      ("ok", {"foreground": "#2e7d32"}), ("warn", {"foreground": "#b26a00"}),
+                      ("bad", {"foreground": "#c62828"}), ("dim", {"foreground": "#777777"}),
+                      ("mono", {"font": ("TkFixedFont", 9)})):
+            self.ev.tag_configure(t, **kw)
+        self.go_btn.state(["disabled"])
+        self._say_summary([("Checking what's needed and whether this exact version was inspected before ...",
+                            "dim")])
+        self._spawn(self._prepare)
+
+    # ---- small helpers -----------------------------------------------------
+
+    def _spawn(self, target, *args):
+        t = threading.Thread(target=target, args=args, daemon=True)
+        self._threads.append(t)
+        t.start()
+
+    def post(self, fn, *args):
+        self.app.q.put(("call", fn) + args)
+
+    def alive(self):
+        try:
+            return bool(self.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def _tree(self, cols, heads, tab):
+        f = ttk.Frame(self.nb)
+        tree = ttk.Treeview(f, columns=cols, show="headings", selectmode="browse")
+        for c, (h, w) in zip(cols, heads):
+            tree.heading(c, text=h)
+            tree.column(c, width=w, anchor="w")
+        sb = ttk.Scrollbar(f, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        for t, color in (("bad", "#c62828"), ("warn", "#b26a00"), ("ok", "#2e7d32"), ("dim", "#5a6b7b")):
+            tree.tag_configure(t, foreground=color)
+        tree.bind("<<TreeviewSelect>>", self.on_select)
+        self.nb.add(f, text=tab)
+        return tree
+
+    def _text_tab(self, tab):
+        f = ttk.Frame(self.nb)
+        t = tk.Text(f, wrap="word", relief="flat", padx=8, pady=6, cursor="arrow", font=("TkDefaultFont", 10))
+        sb = ttk.Scrollbar(f, orient="vertical", command=t.yview)
+        t.configure(yscrollcommand=sb.set)
+        t.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        t.tag_configure("h2", font=("TkDefaultFont", 10, "bold"), spacing1=6)
+        t.tag_configure("dim", foreground="#777777")
+        t.tag_configure("warn", foreground="#b26a00")
+        self.nb.add(f, text=tab)
+        return t
+
+    def _say_summary(self, chunks):
+        self.summary.configure(state="normal")
+        self.summary.delete("1.0", "end")
+        for text, tag in chunks:
+            self.summary.insert("end", text, tag)
+        self.summary.configure(state="disabled")
+
+    def _set_text(self, widget, chunks):
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        for text, tag in chunks:
+            widget.insert("end", text, tag)
+        widget.configure(state="disabled")
+
+    def _show_stages(self):
+        self.stage_lbl.configure(text="   ".join("%s %s" % (STAGE_MARK.get(self.stage[k], "\u00b7"), k)
+                                                for k in STAGE_ORDER))
+
+    # ---- opening: tools + cached result -----------------------------------
+
+    def _prepare(self):
+        try:
+            cfg = sa.load_sec_config()
+            env = sa.inspector_env(cfg)
+            ident = sa.load_json(sa.IDENTITY_FILE, {}).get(sa.identity_key(self.pkg, self.appinfo))
+            key = sa.inspection_key_from_identity(self.pkg, self.vc, ident)
+            saved = sa.load_inspection(key)
+        except Exception as e:      # never leave the window stuck in "checking ..."
+            self.post(self._prepare_failed, "%s: %s" % (type(e).__name__, e))
+            return
+        self.post(self._prepared, env, key, saved)
+
+    def _prepare_failed(self, why):
+        if not self.alive():
+            return
+        self._say_summary([("Couldn't check the inspector's tools or saved results.\n", ("big", "bad")),
+                           ("%s\n" % why, "dim"),
+                           ("Press 'Check again' to retry.\n", ())])
+        self.go_btn.pack_forget()
+        self.check_btn.pack(side="left", padx=4)
+
+    def check_again(self):
+        self.check_btn.pack_forget()
+        self.go_btn.pack(side="left", padx=4)
+        self.go_btn.state(["disabled"])
+        self._say_summary([("Checking again ...", "dim")])
+        self._spawn(self._prepare)
+
+    def _prepared(self, env, key, saved):
+        if not self.alive():
+            return
+        self.env = env
+        if not env["ok"]:
+            self._say_summary([("The code inspector isn't set up on this computer yet.\n", "big"),
+                               ("It needs a free tool called Androguard. Nothing is installed automatically "
+                                "- run these commands once in a terminal, then open this window again:\n", ()),
+                               ("\n" + env["help"] + "\n", "mono")])
+            self.summary.configure(height=14)
+            return
+        self.go_btn.state(["!disabled"])
+        if saved:
+            self.key, self.res = key, saved
+            self.render(how="saved")
+        else:
+            notes = [("Nothing inspected yet for this version.\n", "big"),
+                     ("'Inspect now' copies the app's files from the phone to a private temporary folder, "
+                      "reads them WITHOUT running anything, and deletes the copies afterwards. Nothing is "
+                      "sent anywhere.\n", ())]
+            if env["problems"]:
+                notes.append(("Note: " + "; ".join(env["problems"]) + "\n", "dim"))
+            self._say_summary(notes)
+
+    # ---- inspecting ---------------------------------------------------------
+
+    def mode(self):
+        return dict(INSPECT_MODES)[self.mode_var.get()]
+
+    def inspect(self, force):
+        if self.busy or not self.env or not self.env["ok"]:
+            return
+        if not self.serial:
+            self.app.error("No device connected - pick one at the top")
+            return
+        self.busy = True
+        self.stop.clear()
+        self.stage = {k: "waiting" for k in STAGE_ORDER}
+        self.stage["copy"] = "running"
+        self._show_stages()
+        self.go_btn.state(["disabled"])
+        self.again_btn.state(["disabled"])
+        self.stop_btn.pack(side="left", padx=4)
+        self.progress.configure(text="Copying the app's files from the phone ...")
+        self._spawn(self._work, force, self.mode())
+
+    def _work(self, force, mode):
+        """Background job. EVERY way out reports back to the window (so it never
+        stays busy), the copied APKs are always deleted, and nothing incomplete
+        is saved as a reusable result."""
+        work = None
+        try:
+            work = tempfile.mkdtemp(prefix="adbm_apk_")
+            os.chmod(work, 0o700)
+            self._work_inner(force, mode, work)
+        except Exception as e:
+            self.post(self._finished, None, None, "The inspection failed unexpectedly (%s: %s) - nothing "
+                                                  "was saved. You can try again." % (type(e).__name__, e))
+        finally:
+            if work:
+                self._remove_copies(work)
+
+    def _remove_copies(self, work):
+        """Delete the private APK copies - and SAY so if that didn't work, since
+        that's the one case where copies would stay on disk."""
+        why = ""
+        try:
+            shutil.rmtree(work)
+        except OSError as e:
+            why = e.strerror or str(e)
+        if os.path.exists(work):
+            self.post(self.app.error, "Couldn't delete the temporary copies of the app at %s (%s). They're "
+                                      "private to your user, but please delete that folder yourself."
+                      % (work, why or "unknown reason"))
+
+    def _work_inner(self, force, mode, work):
+        try:
+            ident = read_app_identity(self.serial, self.pkg, work, self.stop, keep=True)
+        except AdbError as e:
+            self.post(self._finished, None, None, "Couldn't read the app from the phone: %s" % e)
+            return
+        if ident is None or self.stop.is_set():
+            self.post(self._finished, None, None, "Stopped - nothing was saved.")
+            return
+        readable = [x for x in ident["parts"] if x.get("local")]
+        key = sa.inspection_key(self.pkg, self.vc, [x["sha256"] for x in ident["parts"]]) \
+            if ident.get("coverage") == "full" else None
+        if key and not force:
+            saved = sa.load_inspection(key)
+            if saved:
+                self.post(self._finished, saved, key, None, True)
+                return
+        if not readable:
+            self.post(self._finished, None, None, "None of the app's files could be copied from the phone.")
+            return
+        self.post(self._stage, {"stage": "copy", "done": True})
+        cfg = dict(sa.load_sec_config(), inspector_mode=mode)
+        lim = sa.inspector_limits(sum(os.path.getsize(x["local"]) for x in readable),
+                                  sum(_dex_bytes(x["local"]) for x in readable), cfg)
+        job = {"package": self.pkg, "version_code": self.vc,
+               "parts": [{"name": x["name"], "kind": x["kind"], "path": x["local"]} for x in readable],
+               "signatures": sa.inspector_signatures(sa.cached_exodus_trackers())}
+        res = sa.run_inspection(job, self.env["python"], lim,
+                                on_progress=lambda p: self.post(self._stage, p), stop=self.stop)
+        for x in ident["parts"]:
+            if not x.get("local"):
+                res["parts"].append({"name": x["name"], "kind": x.get("kind"), "analysed": False,
+                                     "problems": ["couldn't be copied from the phone: %s"
+                                                  % (x.get("error") or "unknown reason")]})
+                res.setdefault("limitations", []).append("%s couldn't be copied from the phone, so it "
+                                                         "wasn't inspected" % x["name"])
+        res["summary"] = sa.summarize_inspection(res)
+        res["label"], res["inspected"] = self.label, time.strftime("%Y-%m-%d %H:%M")
+        res["part_hashes"] = {x["name"]: x.get("sha256") for x in ident["parts"]}
+        note = None
+        interrupted = any(s["id"] == "worker" for s in res.get("stages", []))
+        if key and not interrupted:
+            try:
+                sa.save_inspection(key, res)
+            except OSError as e:
+                note = "The result couldn't be saved (%s) - it's shown for now only." % (e.strerror or e)
+        elif not key:
+            note = "Not every part of the app could be copied, so this result isn't saved."
+        self.post(self._finished, res, key if key and not interrupted else None, note)
+
+    def _stage(self, p):
+        if not self.alive():
+            return
+        st = p.get("stage")
+        if st == "copy" and p.get("done"):
+            self.stage["copy"] = sa.STAGE_DONE
+        elif st in self.stage:
+            for k in STAGE_ORDER:
+                if k == st:
+                    break
+                if self.stage[k] in ("waiting", "running"):
+                    self.stage[k] = sa.STAGE_DONE
+            self.stage[st] = "running"
+        if p.get("msg"):
+            self.progress.configure(text=p["msg"][:150] + " ...")
+        self._show_stages()
+
+    def _finished(self, res, key, note, from_cache=False):
+        if not self.alive():
+            return
+        self.busy = False
+        self.stop_btn.pack_forget()
+        self.go_btn.state(["!disabled"])
+        self.again_btn.state(["!disabled"])
+        self.progress.configure(text=note or "")
+        if res is None:
+            self.stage = {k: ("waiting" if self.stage[k] == "running" else self.stage[k]) for k in STAGE_ORDER}
+            self._show_stages()
+            if note:
+                self.app.error(note)
+            return
+        self.res = res
+        self.key = key
+        self.render(how="saved" if from_cache else "new")
+
+    # ---- showing a result ---------------------------------------------------
+
+    def rerender(self):
+        if self.res:
+            self.render(how=None)
+
+    def render(self, how=None):
+        res = self.res
+        sm = res.get("summary") or sa.summarize_inspection(res)
+        tag = {sa.OK: "ok", sa.INFO: "warn", sa.WARN: "warn", sa.BAD: "bad"}[sm["level"]]
+        chunks = [(sm["text"] + "\n", ("big", tag)), (sm["coverage"] + "\n", "dim")]
+        for n in sm.get("notes", []):
+            chunks.append(("\u2022 " + n + "\n", ()))
+        if how == "saved":
+            chunks.append(("Saved result for this exact version, inspected %s. 'Inspect again' runs it anew.\n"
+                           % (res.get("inspected") or "earlier"), "dim"))
+        if sm["level"] == sa.OK:
+            chunks.append(("This means nothing worrying was FOUND in what could be read. It isn't a promise the "
+                           "app is safe: things it downloads or decrypts while running can't be seen this way.\n",
+                           "dim"))
+        self._say_summary(chunks)
+        for s in res.get("stages", []):
+            if s["id"] in self.stage:
+                self.stage[s["id"]] = s["status"]
+        if any(s["id"] == "worker" for s in res.get("stages", [])):
+            for k in STAGE_ORDER[1:]:
+                if self.stage[k] in ("waiting", "running"):
+                    self.stage[k] = sa.STAGE_FAILED
+        self._show_stages()
+        self.go_btn.pack_forget()
+        if self.busy:
+            self.again_btn.pack(side="left", padx=4, before=self.stop_btn)
+        else:
+            self.again_btn.pack(side="left", padx=4)
+        # addresses
+        self.items.clear()
+        tech = self.show_tech.get()
+        for tree in (self.ep_tree, self.ind_tree):
+            tree.delete(*tree.get_children())
+        for i, e in enumerate(res.get("endpoints", [])):
+            locs = e.get("locations") or [{}]
+            l0 = locs[0]
+            used = e.get("owner") or ("the app itself" if l0.get("own_code") else
+                                      SOURCE_WORDS.get(l0.get("source"), "?"))
+            if tech and l0.get("cls"):
+                used += " (%s)" % l0["cls"].rsplit(".", 1)[-1]
+            note = "not encrypted" if e.get("issues") else (e.get("evidence") or [""])[0]
+            iid = "ep%d" % i
+            self.ep_tree.insert("", "end", iid=iid, values=(CLASS_WORDS[e["classification"]], e["value"], used,
+                                                            note[:120]),
+                                tags=({"malicious": "bad", "suspicious": "warn", "expected": "ok"}
+                                      .get(e["classification"], "dim"),))
+            self.items[iid] = ("endpoint", e)
+        for i, it in enumerate(res.get("indicators", [])):
+            iid = "in%d" % i
+            self.ind_tree.insert("", "end", iid=iid, values=(SEVERITY_WORDS.get(it["severity"], it["severity"]),
+                                                             it["title"]),
+                                 tags=({"bad": "bad", "warn": "warn"}.get(it["severity"], "dim"),))
+            self.items[iid] = ("indicator", it)
+        self.nb.tab(0, text="Addresses (%d)" % len(res.get("endpoints", [])))
+        self.nb.tab(1, text="Code warnings (%d)" % len(res.get("indicators", [])))
+        # parts
+        chunks = []
+        for p in res.get("parts", []):
+            chunks.append(("%s  %s\n" % ("\u2705" if p.get("analysed") else "\u26a0", p["name"]), "h2"))
+            chunks.append(("  %s\n" % {"base": "main app file", "config": "extra part for this phone",
+                                       "feature": "optional feature"}.get(p.get("kind"), p.get("kind") or ""), "dim"))
+            if p.get("dex"):
+                chunks.append(("  code files: %s\n" % ", ".join(p["dex"]), ()))
+            if p.get("native"):
+                chunks.append(("  native libraries: %s\n" % ", ".join(p["native"]), ()))
+            for pr in p.get("problems", []):
+                chunks.append(("  \u26a0 %s\n" % pr, "warn"))
+            if tech and (res.get("part_hashes") or {}).get(p["name"]):
+                chunks.append(("  sha256 %s\n" % res["part_hashes"][p["name"]], "dim"))
+        if res.get("sdks"):
+            chunks.append(("\nLibraries recognised inside the app\n", "h2"))
+            for s_ in res["sdks"]:
+                chunks.append(("\u2022 %s (%d pieces of code; from the %s)\n" % (s_["name"], s_["classes"],
+                                                                                 s_["source"]), ()))
+        if res.get("network_apis"):
+            chunks.append(("\nWays the app can connect to the network\n", "h2"))
+            chunks.append((", ".join(a["api"] for a in res["network_apis"]) + "\n", ()))
+        self._set_text(self.parts_txt, chunks)
+        # limitations
+        chunks = []
+        bad_st = [s for s in res.get("stages", []) if s["status"] not in (sa.STAGE_DONE, sa.STAGE_SKIPPED)]
+        if bad_st:
+            chunks.append(("Steps that didn't finish\n", "h2"))
+            for s in bad_st:
+                chunks.append(("\u26a0 %s: %s\n" % (s["name"], s.get("detail") or s["status"]), "warn"))
+        chunks.append(("Limits of this kind of check\n", "h2"))
+        for l_ in res.get("limitations", []):
+            chunks.append(("\u2022 %s\n" % l_, ()))
+        if tech and res.get("worker_stderr"):
+            chunks.append(("\nAnalysis program output\n", "h2"))
+            chunks.append((res["worker_stderr"][-3000:] + "\n", "dim"))
+        self._set_text(self.limits_txt, chunks)
+        self.show_evidence(None)
+
+    def on_select(self, event=None):
+        tree = event.widget if event else self.ep_tree
+        sel = tree.selection()
+        if sel and sel[0] in self.items:
+            self.show_evidence(self.items[sel[0]])
+
+    def ai_answers(self, kind, item):
+        return ((self.res or {}).get("ai") or {}).get(sa.finding_id(kind, item), {})
+
+    def show_evidence(self, sel):
+        self.current = sel
+        tech = self.show_tech.get()
+        if not sel:
+            self._set_text(self.ev, [("Click an address or a code warning above to see why it's listed.", "dim")])
+            self.ask_btn.state(["disabled"])
+            self.ask_again_btn.pack_forget()
+            return
+        kind, it = sel
+        c = []
+        if kind == "endpoint":
+            cls = it["classification"]
+            c.append((it["value"] + "\n", "h1"))
+            c.append(("%s  (confidence: %s)\n" % (CLASS_WORDS[cls], it.get("confidence")),
+                      {"malicious": "bad", "suspicious": "warn", "expected": "ok"}.get(cls, "dim")))
+            if it.get("evidence"):
+                c.append(("Why\n", "h2"))
+                c += [("\u2022 %s\n" % x, ()) for x in it["evidence"]]
+            if it.get("issues"):
+                c.append(("Problem\n", "h2"))
+                c += [("\u2022 %s\n" % x, "warn") for x in it["issues"]]
+        else:
+            c.append((it["title"] + "\n", "h1"))
+            c.append(("%s  (confidence: %s)\n" % (SEVERITY_WORDS.get(it["severity"], it["severity"]),
+                                                  it.get("confidence")),
+                      {"bad": "bad", "warn": "warn"}.get(it["severity"], "dim")))
+            c.append((it.get("detail", "") + "\n", ()))
+        locs = it.get("locations") or []
+        if locs:
+            c.append(("Where it was found\n", "h2"))
+            for l_ in locs[:8 if tech else 4]:
+                who = l_.get("owner") or ("the app's own code" if l_.get("own_code") else
+                                          SOURCE_WORDS.get(l_.get("source"), "?"))
+                line = "\u2022 in %s, part %s" % (who, l_.get("part"))
+                if tech:
+                    line += "  [%s%s%s]" % (l_.get("file") or "", (" " + l_["cls"]) if l_.get("cls") else "",
+                                           ("." + l_["method"]) if l_.get("method") else "")
+                c.append((line + "\n", ()))
+            if len(locs) > (8 if tech else 4):
+                c.append(("  ... and %d more places\n" % (len(locs) - (8 if tech else 4)), "dim"))
+        answers = self.ai_answers(kind, it)
+        for prov, r in sorted(answers.items()):
+            label = ai.PROVIDERS.get(prov, {}).get("label", prov)
+            c.append(("\nAI explanation (%s, %s)\n" % (label, r.get("when", "")), "h2"))
+            a = r.get("answer")
+            if a and not r.get("searches"):
+                c.append(("No web search was done for this answer: it's based on the AI's own knowledge, "
+                          "which may be out of date.\n", "warn"))
+            if a:
+                c.append(({"likely_normal": "Probably normal", "unclear": "Unclear",
+                           "concerning": "Concerning"}[a["assessment"]] + "\n",
+                          {"likely_normal": "ok", "unclear": "warn", "concerning": "bad"}[a["assessment"]]))
+                for k, title in (("summary", None), ("who_runs_it", "Who runs it"), ("why", "Why"),
+                                 ("what_to_do", "What you can do")):
+                    if a.get(k):
+                        c.append((("%s: " % title if title else "") + a[k] + "\n", ()))
+                for s_ in a.get("sources", []):
+                    c.append(("\u2022 %s - %s  (%s)\n" % (s_["title"], s_["url"], (
+                        "this address matches a page the AI's search returned - that shows where it came "
+                        "from, not that the page backs up the answer") if s_.get("matched") else
+                        "NOT among the pages the AI's search returned - the AI may have written it from "
+                        "memory"), "dim"))
+            if r.get("error"):
+                c.append(("Last attempt failed: %s\n" % r["error"], "warn"))
+        if tech:
+            c.append(("\nRaw data\n", "h2"))
+            c.append((json.dumps(it, indent=1, ensure_ascii=False)[:4000] + "\n", "mono"))
+        self._set_text(self.ev, c)
+        if answers and any(r.get("answer") for r in answers.values()):
+            self.ask_btn.state(["disabled"])
+            self.ask_again_btn.pack(side="left", padx=4, before=self.ai_note)
+        else:
+            self.ask_btn.state(["!disabled"] if not self.ai_busy else ["disabled"])
+            self.ask_again_btn.pack_forget()
+
+    # ---- AI, only on request ----------------------------------------------
+
+    def ask_ai(self, again):
+        if not self.current or self.ai_busy or not self.res:
+            return
+        kind, it = self.current
+        cfg = ai.load_config()
+        prov = cfg.get("provider", "anthropic")
+        if prov not in ai.PROVIDERS:
+            prov = "anthropic"
+        if not ai.api_key(cfg, prov):
+            messagebox.showinfo("API key needed", "There's no API key for %s yet.\n\nAdd it in the AI settings "
+                                "window (Apps tab)." % ai.PROVIDERS[prov]["label"], parent=self)
+            return
+        fid = sa.finding_id(kind, it)
+        if not again and (self.ai_answers(kind, it).get(prov) or {}).get("answer"):
+            self.show_evidence(self.current)      # already explained: show the saved answer, no call
+            return
+        ctx = sa.finding_context(self.res, kind, it, self.label)
+        if not self.confirm_send(ai.PROVIDERS[prov]["label"], ai.build_finding_request(ctx)):
+            return
+        self.ai_busy = True
+        self.ask_btn.state(["disabled"])
+        self.ai_note.configure(text="Asking %s about this one finding ..." % ai.PROVIDERS[prov]["label"])
+
+        def job():
+            try:
+                r = ai.explain_finding(prov, cfg, ctx)
+            except Exception as e:      # explain_finding shouldn't raise; never strand the button anyway
+                r = {"provider": prov, "when": time.strftime("%Y-%m-%d %H:%M"),
+                     "error": "unexpected problem: %s: %s" % (type(e).__name__, e)}
+            self.post(self._ai_done, fid, prov, r)
+        self._spawn(job)
+
+    def confirm_send(self, provider_label, text):
+        """Modal preview of the complete request; True only if the user presses Send."""
+        dlg = SendPreview(self, provider_label, text)
+        try:
+            dlg.grab_set()
+        except tk.TclError:
+            pass
+        self.wait_window(dlg)
+        return dlg.result
+
+    def _ai_done(self, fid, prov, r):
+        self.ai_busy = False
+        if not self.alive():
+            return
+        self.ai_note.configure(text="Only the selected finding is sent - never the app's code.")
+        slot = self.res.setdefault("ai", {}).setdefault(fid, {})
+        old = slot.get(prov)
+        if r.get("error") and isinstance(old, dict) and old.get("answer"):
+            old = dict(old)
+            old["error"] = r["error"]                     # keep the earlier good answer
+            slot[prov] = old
+        else:
+            slot[prov] = r
+        if self.key:
+            try:
+                sa.save_inspection(self.key, self.res)
+            except OSError as e:
+                self.app.error("Couldn't save the AI answer (%s) - it's shown for now only" % (e.strerror or e))
+        if r.get("error"):
+            self.app.error("AI: %s" % r["error"])
+        if self.current and sa.finding_id(*self.current) == fid:
+            self.show_evidence(self.current)
+
+    def close(self):
+        """Stop any work and close. The object stays registered until its worker
+        threads have finished, and is released from the GUI thread - so Tk
+        objects are never cleaned up from a background thread."""
+        self.stop.set()
+        root = self.app.root
+        self.destroy()
+
+        def reap():
+            if any(t.is_alive() for t in self._threads):
+                try:
+                    root.after(500, reap)
+                except tk.TclError:
+                    pass
+                return
+            self._threads = []
+            # drop the Tk variables HERE, on the GUI thread: if they were left to
+            # the garbage collector, it could free them from any thread and Tk
+            # would complain ("main thread is not in main loop")
+            self.show_tech = self.mode_var = None
+            _LIVE_INSPECT_WINDOWS.discard(self)
+        reap()
+
+
 class SecuritySettings(tk.Toplevel):
     def __init__(self, master):
         super().__init__(master)
@@ -5445,28 +6219,45 @@ class App:
         ttk.Label(frm, text="ADB Manager", font=("TkDefaultFont", 14, "bold")).pack(anchor="w")
         ttk.Label(frm, text="Android device manager: files, apps, network and security, over ADB.",
                   foreground="#555555").pack(anchor="w", pady=(0, 10))
-        grid = ttk.Frame(frm)
-        grid.pack(fill="x")
-        rows = [("Original idea:", "https://github.com/peterpt/Adb-Manager", True),
-                ("Code builder:", "Claude (Anthropic)", False),
-                ("Code review:", "ChatGPT (OpenAI)", False)]
-        for r, (label, value, is_link) in enumerate(rows):
-            ttk.Label(grid, text=label, font=("TkDefaultFont", 10, "bold")).grid(
-                row=r, column=0, sticky="w", padx=(0, 8), pady=2)
-            if is_link:
-                link = tk.Label(grid, text=value, foreground="#1f5fbf", cursor="hand2")
-                f = tkfont.Font(link, link.cget("font"))
-                f.configure(underline=True)
-                link.configure(font=f)
-                link.grid(row=r, column=1, sticky="w", pady=2)
-                link.bind("<Button-1>", lambda e, u=value: self._open_url(u))
-            else:
-                ttk.Label(grid, text=value).grid(row=r, column=1, sticky="w", pady=2)
+        # credits - kept identical to the "Credits" section of README.md
+        sections = [
+            ("Project concept & vision",
+             [("Pedro", "https://github.com/peterpt", " - original idea, product direction and requirements")]),
+            ("Code implementation",
+             [("Claude Opus 5.5 (Anthropic)", None, " - primary code builder and implementation")]),
+            ("Architecture & security review",
+             [("ChatGPT, GPT-6 (OpenAI)", None,
+               " - architecture guidance, independent code review and security analysis")]),
+            ("Testing",
+             [("Automated test suite", None, " (written by Claude, reviewed by ChatGPT), with results "
+                                             "documented per development round"),
+              ("Real-device testing", None, " - Pedro")]),
+        ]
+        for title, lines in sections:
+            ttk.Label(frm, text=title, font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(6, 0))
+            for name, url, rest in lines:
+                row = ttk.Frame(frm)
+                row.pack(anchor="w", fill="x")
+                if url:
+                    link = tk.Label(row, text=name, foreground="#1f5fbf", cursor="hand2")
+                    f = tkfont.Font(link, link.cget("font"))
+                    f.configure(underline=True)
+                    link.configure(font=f)
+                    link.pack(side="left")
+                    link.bind("<Button-1>", lambda e, u=url: self._open_url(u))
+                    ttk.Label(row, text=" (%s)" % url, foreground="#555555").pack(side="left")
+                else:
+                    ttk.Label(row, text=name).pack(side="left")
+                ttk.Label(row, text=rest, wraplength=440, justify="left").pack(side="left")
         ttk.Separator(frm).pack(fill="x", pady=12)
         ttk.Label(frm, text="Gemini (Google) was deliberately excluded from package research: "
                   "because Android and most of the inspected packages are Google's own, a Google "
                   "model would have a structural conflict of interest assessing them.",
-                  foreground="#555555", wraplength=420, justify="left").pack(anchor="w")
+                  foreground="#555555", wraplength=460, justify="left").pack(anchor="w")
+        ttk.Label(frm, text="Built through human creativity and collaboration between AI systems. Technology "
+                  "is most powerful when used responsibly, transparently and for the benefit of people.",
+                  font=("TkDefaultFont", 9, "italic"), wraplength=460, justify="left").pack(anchor="w",
+                                                                                         pady=(10, 0))
         ttk.Button(frm, text="Close", command=win.destroy).pack(side="right", pady=(12, 0))
 
     def _open_url(self, url):

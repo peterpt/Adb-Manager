@@ -321,14 +321,116 @@ def ops_with_mode(appops, op, mode="allow"):
 # reading the device
 # --------------------------------------------------------------------------
 
+SU_PATHS = ("/system/xbin/su", "/system/bin/su", "/sbin/su", "/su/bin/su", "/system/sbin/su",
+            "/data/local/xbin/su", "/data/local/bin/su", "/debug_ramdisk/su")
+SU_SENTINEL = "__ADBM_SU_DONE__"
+# Root managers, by package name. Magisk can hide its own app under a random
+# name, so NOT finding one of these is never proof of "no root".
+ROOT_MANAGER_APPS = ("com.topjohnwu.magisk", "io.github.vvb2060.magisk", "io.github.huskydg.magisk",
+                     "eu.chainfire.supersu", "com.koushikdutta.superuser", "me.weishu.kernelsu",
+                     "me.bmax.apatch")
+
+# which facts["failed"] keys each access category is read from
+ACCESS_SOURCES = {"accessibility": ("setting:accessibility",), "notifications": ("setting:notifications",),
+                  "sms": ("setting:sms",), "admin": ("admins",),
+                  "overlay": ("appops",), "usage": ("appops",), "install": ("appops",)}
+
+
+def unread(facts, *keys):
+    """Which of these reads failed (facts from older callers have no 'failed')."""
+    f = facts.get("failed") or {}
+    return [k for k in keys if k in f]
+
+
+def root_signals(facts):
+    """Root evidence, shared by the checkup AND the snapshot so they always agree.
+
+    Returns (evidence, complete, manager_apps):
+      evidence     - positive root evidence: an su program present on the device
+                     (still not proof that root works - stated in the wording);
+      complete     - False if the su check couldn't run: then "no evidence" means
+                     "don't know", never "not rooted";
+      manager_apps - root manager packages installed. Kept SEPARATE on purpose: an
+                     installed manager doesn't prove root is installed or active
+                     (it can be inactive, and a package name can be faked), so it is
+                     never counted as root evidence."""
+    evidence = ["su program at " + x for x in facts.get("su") or []]
+    managers = [x for x in ROOT_MANAGER_APPS if x in (facts.get("apps") or {})]
+    return evidence, not unread(facts, "su"), managers
+
+
+def boot_state(vb, flash_locked, vbmeta):
+    """One interpretation of verified boot, used by the checkup AND device info.
+
+    ro.boot.verifiedbootstate is authoritative when present:
+      green  -> locked bootloader, system verified with the maker's key
+      yellow -> locked bootloader, system verified with a CUSTOM key the owner
+                enrolled (custom ROM, re-locked) - NOT the same as unlocked
+      orange -> bootloader unlocked, verification not enforced
+      red    -> verification FAILED (corrupt or tampered system)
+    Without it, ro.boot.flash.locked / ro.boot.vbmeta.device_state decide.
+    Precedence when signals disagree (security-sensitive - keep it this way):
+      - red always wins ("failed"): a failed integrity check is the most serious
+        state, and lock flags can't make it better;
+      - flash.locked and vbmeta.device_state are evaluated independently; if
+        either says unlocked, the lock properties say unlocked - even when the
+        other says locked (that contradiction is recorded too);
+      - green/yellow + flash.locked=0 or vbmeta=unlocked -> "unlocked" (the less
+        safe reading wins), conflict recorded;
+      - orange + flash.locked=1 or vbmeta=locked -> stays "unlocked" (orange is
+        the less safe reading), conflict recorded.
+    Returns {"state": locked|custom_key|unlocked|failed|unknown, "conflict": text}."""
+    vb, fl, vm = (vb or "").strip().lower(), (flash_locked or "").strip(), (vbmeta or "").strip().lower()
+    # each lock property is evaluated on its own; if they contradict each other,
+    # "unlocked" wins (the less safe reading) and the contradiction is recorded
+    said = {}
+    if fl in ("0", "1"):
+        said["flash.locked=" + fl] = "locked" if fl == "1" else "unlocked"
+    if vm in ("locked", "unlocked"):
+        said["vbmeta.device_state=" + vm] = vm
+    votes = set(said.values())
+    lock_says = "unlocked" if "unlocked" in votes else ("locked" if votes else "")
+    flags = ", ".join(sorted(said))
+    notes = []
+    if len(votes) > 1:
+        notes.append("lock properties contradict each other (%s) - treated as unlocked" % flags)
+    state = {"green": "locked", "yellow": "custom_key", "orange": "unlocked", "red": "failed"}.get(vb)
+    if state is None:
+        state = lock_says or "unknown"
+    elif state == "failed":
+        if said:            # red always wins; say exactly what the flags claimed
+            notes.append("verifiedbootstate=red wins over %s" % flags)
+    elif lock_says == "unlocked" and state in ("locked", "custom_key"):
+        notes.append("verifiedbootstate=%s but %s says unlocked" % (
+            vb, ", ".join(k for k, v in sorted(said.items()) if v == "unlocked")))
+        state = "unlocked"          # the less safe reading wins when signals disagree
+    elif lock_says == "locked" and state == "unlocked":
+        notes.append("verifiedbootstate=orange but %s says locked" % flags)
+    return {"state": state, "conflict": "; ".join(notes)}
+
 def collect(shell, apps, sockets=None):
     """Everything the quick checkup needs from the device, in one place.
-    apps = the Apps tab's records (package -> dict). Returns a dict of raw facts."""
-    def get(cmd, timeout=30):
+    apps = the Apps tab's records (package -> dict). Returns a dict of raw facts.
+
+    shell(cmd, timeout) must RAISE when a command fails (non-zero exit, adb error,
+    timeout). Every read that fails is recorded in facts["failed"] {key: reason},
+    so the checks can say "couldn't check" instead of turning an empty result into
+    an all-clear. Keys: "prop:<name>", "setting:<name>", "selinux", "su", "nets",
+    "admins", "appops"."""
+    failed = {}
+
+    def get(key, cmd, timeout=30, sentinel=None):
         try:
-            return shell(cmd, timeout) or ""
-        except Exception:
+            out = shell(cmd, timeout) or ""
+        except Exception as e:
+            failed[key] = (str(e) or e.__class__.__name__).strip().splitlines()[-1][:200]
             return ""
+        if sentinel is not None:
+            if sentinel not in out:
+                failed[key] = "the command's output was incomplete"
+                return ""
+            out = out.replace(sentinel, "")
+        return out
     props = {}
     for key, prop in (("release", "ro.build.version.release"), ("sdk", "ro.build.version.sdk"),
                       ("patch", "ro.build.version.security_patch"), ("crypto", "ro.crypto.state"),
@@ -336,7 +438,7 @@ def collect(shell, apps, sockets=None):
                       ("vbmeta", "ro.boot.vbmeta.device_state"), ("debuggable", "ro.debuggable"),
                       ("adb_tcp", "service.adb.tcp.port"), ("adb_tcp2", "persist.adb.tcp.port"),
                       ("model", "ro.product.model"), ("maker", "ro.product.manufacturer")):
-        props[key] = get("getprop " + prop).strip()
+        props[key] = get("prop:" + key, "getprop " + prop).strip()
     settings = {}
     for key, ns, name in (("accessibility", "secure", "enabled_accessibility_services"),
                           ("notifications", "secure", "enabled_notification_listeners"),
@@ -353,18 +455,22 @@ def collect(shell, apps, sockets=None):
                           ("dev_options", "global", "development_settings_enabled"),
                           ("verify_adb", "global", "verifier_verify_adb_installs"),
                           ("package_verifier", "global", "package_verifier_enable")):
-        settings[key] = _clean(get("settings get %s %s" % (ns, name)))
-    selinux = get("getenforce").strip()
-    su = get("for p in /system/xbin/su /system/bin/su /sbin/su /su/bin/su /system/sbin/su "
-             "/data/local/xbin/su /data/local/bin/su; do [ -e $p ] && echo $p; done").split()
-    nets = get("ls /sys/class/net").split()
-    admins_raw = get("dumpsys device_policy", 60)
+        settings[key] = _clean(get("setting:" + key, "settings get %s %s" % (ns, name)))
+    selinux = get("selinux", "getenforce").strip()
+    # A shell loop exits with its LAST step's status, which is "not found" for almost
+    # every device - so success is proven by a sentinel, not by the exit code.
+    su = get("su", "for p in " + " ".join(SU_PATHS) + "; do [ -e $p ] && echo $p; done; "
+             "echo " + SU_SENTINEL, sentinel=SU_SENTINEL).split()
+    nets = get("nets", "ls /sys/class/net").split()
+    admins_raw = get("admins", "dumpsys device_policy", 60)
     admins = []
     for m in re.finditer(r"ComponentInfo\{([\w.]+)/", admins_raw):
         if m.group(1) not in admins:
             admins.append(m.group(1))
-    appops_raw = get("dumpsys appops", 120)
-    return {"props": props, "settings": settings, "selinux": selinux, "su": su,
+    appops_raw = get("appops", "dumpsys appops", 120)
+    if "appops" not in failed and not appops_raw.strip():
+        failed["appops"] = "the device returned nothing"
+    return {"failed": failed, "props": props, "settings": settings, "selinux": selinux, "su": su,
             "vpn_ifaces": [n for n in nets if n.startswith(("tun", "ppp", "ipsec", "wg"))],
             "admins": admins, "appops": parse_appops(appops_raw), "apps": apps,
             "sockets": sockets or []}
@@ -465,8 +571,12 @@ ROOT_NOTES = {
     "serenity": {
         "names": "Redmi A5, Redmi A7, POCO C71 (they share this codename)",
         "soc": "Unisoc T7250 (ums9230e)",
+        # the codename alone isn't enough (several models share it): the notes are
+        # only presented as applying when the device ALSO reports this chip
+        "chip_tokens": ("ums9230",),
         "mi_unlock": "blocked",
         "method": "unisoc_cve",
+        "pc_os": "Windows",       # what the documented tools for this method run on
         "twrp": "none known",
         "risk": "high",
         "notes": [
@@ -493,21 +603,46 @@ ROOT_NOTES = {
     },
 }
 
+# Unisoc/Spreadtrum chip-name prefixes, matched against whole chip-name tokens
+# (not anywhere inside a word).
 UNISOC_PLATFORMS = ("ums", "sc98", "sc77", "sc96", "t606", "t612", "t616", "t610", "t618",
-                    "t620", "t700", "t7250", "sp9", "sharkl")
+                    "t620", "t700", "t7250", "sp98", "sharkl")
+
+
+def chip_tokens(info):
+    """Lower-case chip identifiers the device reported (platform, board, SoC model)."""
+    pr = info.get("props", {}) or {}
+    text = " ".join(pr.get(k, "") for k in ("ro.board.platform", "ro.product.board", "ro.soc.model"))
+    return [t for t in re.split(r"[^a-z0-9]+", text.lower()) if t]
+
+
+def is_unisoc_chip(info):
+    pr = info.get("props", {}) or {}
+    if (pr.get("ro.soc.manufacturer") or "").strip().lower() in ("unisoc", "spreadtrum", "sprd"):
+        return True
+    return any(t.startswith(UNISOC_PLATFORMS) for t in chip_tokens(info))
 
 
 def rooting_guidance(info):
     """A plain-words rooting summary for THIS device. Returns (lines, links).
-    lines = [(level, text)]; link = (text, url). Never does anything - advice only."""
+    lines = [(level, text)]; link = (text, url). Never does anything - advice only.
+
+    Claims are gated on evidence from the device itself:
+      - a per-codename note is presented as applying only if the device ALSO
+        reports the note's chip; otherwise it's shown as "may not apply";
+      - for an unlisted Unisoc chip, CVE-2022-38694 is mentioned as something to
+        CHECK (affects certain Unisoc chips), never as the way to unlock this one;
+      - a PC operating system is named only where the specific method calls for it."""
     codename = (info.get("codename") or "").lower()
-    plat = (info.get("props", {}).get("ro.board.platform", "") + " " +
-            info.get("props", {}).get("ro.product.board", "")).lower()
-    chip = info.get("props", {}).get("ro.board.platform", "") or info.get("props", {}).get("ro.product.board", "")
-    is_unisoc = any(tok in plat for tok in UNISOC_PLATFORMS)
+    pr = info.get("props", {}) or {}
+    chip = pr.get("ro.board.platform", "") or pr.get("ro.product.board", "") or pr.get("ro.soc.model", "")
+    toks = chip_tokens(info)
+    is_unisoc = is_unisoc_chip(info)
     boot = info.get("bootloader")
     lines, links = [], []
     note = ROOT_NOTES.get(codename)
+    note_applies = bool(note) and any(t.startswith(c) for c in note.get("chip_tokens", ()) for t in toks)
+    pc_os = ""
 
     if boot == "UNLOCKED":
         lines.append((OK, "The bootloader is already UNLOCKED. You can install Magisk to root: "
@@ -520,8 +655,15 @@ def rooting_guidance(info):
         lines.append((INFO, "The bootloader lock state couldn't be read here - check it in fastboot "
                             "mode (fastboot getvar unlocked)."))
 
-    if note:
-        lines.append((INFO, "Known device: %s - %s." % (note["names"], note["soc"])))
+    if note and not note_applies:
+        lines.append((WARN, "The codename '%s' matches a known entry (%s, %s), but this device reports "
+                            "a different or unknown chip (%s). Several phones can share a codename, so "
+                            "the notes for that entry may NOT apply here - they are not shown as advice."
+                      % (codename, note["names"], note["soc"], chip or "not reported")))
+        links = [("Magisk (official)", "https://github.com/topjohnwu/Magisk/releases")]
+    elif note:
+        pc_os = note.get("pc_os", "")
+        lines.append((INFO, "Known device: %s - %s (codename and chip both match)." % (note["names"], note["soc"])))
         if note["mi_unlock"] == "blocked" and boot != "UNLOCKED":
             lines.append((BAD, "Xiaomi's official Mi Unlock does NOT work on this model."))
         for n in note["notes"]:
@@ -536,15 +678,25 @@ def rooting_guidance(info):
     else:
         # no specific entry: fall back to what the chip/maker implies
         if is_unisoc:
-            lines.append((WARN, "This is a Unisoc (Spreadtrum) chip (%s). Xiaomi's Mi Unlock often "
-                               "doesn't support Unisoc phones; unlocking usually needs a PC exploit tool "
-                               "(CVE-2022-38694) on Windows, which is higher-risk than a normal unlock."
-                          % (chip or "ums9230")))
-            links = [("CVE-2022-38694 Unisoc unlock tools (TomKing062)",
-                      "https://github.com/TomKing062/CVE-2022-38694_unlock_bootloader/releases"),
-                     ("XDA: Unisoc unlock threads", "https://xdaforums.com/tags/unisoc/"),
-                     ("Magisk (official)", "https://github.com/topjohnwu/Magisk/releases")]
+            text = ("This is a Unisoc (Spreadtrum) chip (%s). There are no notes for this exact model. "
+                    "Some Unisoc chips have a known boot-ROM flaw (CVE-2022-38694) that community tools "
+                    "use to unlock the bootloader - but whether it applies to THIS chip isn't known here. "
+                    "Check the tool's list of supported chips before anything; if yours isn't listed, "
+                    "don't try it. Exploit-based unlocking is higher-risk than a normal unlock."
+                    % (chip or "model not reported"))
+            links = []
+            if info.get("is_xiaomi"):
+                pc_os = "Windows"     # the official route below: Xiaomi's Mi Unlock tool
+                text += (" Xiaomi's official Mi Unlock tool (Windows) may or may not support this model - "
+                         "try that official route first.")
+                links.append(("Xiaomi Mi Unlock (official) - try this first", "https://en.miui.com/unlock/"))
+            lines.append((WARN, text))
+            links += [("CVE-2022-38694 Unisoc unlock tools (TomKing062) - check the supported chips",
+                       "https://github.com/TomKing062/CVE-2022-38694_unlock_bootloader/releases"),
+                      ("XDA: Unisoc unlock threads", "https://xdaforums.com/tags/unisoc/"),
+                      ("Magisk (official)", "https://github.com/topjohnwu/Magisk/releases")]
         elif info.get("is_xiaomi"):
+            pc_os = "Windows"     # Xiaomi's official Mi Unlock tool
             lines.append((INFO, "On Xiaomi, unlocking normally uses Xiaomi's Mi Unlock tool (Windows) "
                                "with your Mi account and a waiting period Xiaomi sets."))
             links = [("Xiaomi Mi Unlock (official)", "https://en.miui.com/unlock/"),
@@ -557,9 +709,11 @@ def rooting_guidance(info):
     if info.get("arb"):
         lines.append((BAD, "Anti-rollback is active: never flash firmware older than what's on the "
                            "phone, or it can brick permanently."))
-    lines.append((INFO, "This app only shows this guidance and can check the bootloader state. It "
-                        "never unlocks, flashes or roots - those are done with the PC tools above, "
-                        "which on this phone means a Windows machine."))
+    tail = ("This app only shows this guidance and can check the bootloader state. It never unlocks, "
+            "flashes or roots - those are done with separate PC tools")
+    if pc_os:
+        tail += "; the tools for this method run on %s" % pc_os
+    lines.append((INFO, tail + "."))
     return lines, links
 
 
@@ -586,7 +740,8 @@ def device_info(shell):
                  "ro.boot.warranty_bit", "ro.warranty_bit", "ro.secureboot.lockstate",
                  "ro.boot.cross_region", "ro.boot.hwc", "ro.boot.hwcountry",
                  "ro.miui.region", "ro.product.locale", "ro.boot.dynamic_partitions",
-                 "ro.boot.slot_suffix", "ro.boot.bootloader", "ro.bootloader",
+                 "ro.boot.slot_suffix", "ro.build.ab_update", "ro.virtual_ab.enabled",
+                 "ro.boot.bootloader", "ro.bootloader",
                  "ro.boot.ara_version", "ro.boot.arb_version", "ro.minarb"):
         v = g(prop)
         if v:
@@ -602,14 +757,14 @@ def device_info(shell):
            (props.get("ro.miui.ui.version.name") and "MIUI " + props["ro.miui.ui.version.name"]) or ""
     miui_build = props.get("ro.mi.os.version.incremental") or props.get("ro.build.version.incremental") or ""
 
-    # bootloader locked state, from several possible props
-    locked_raw = (props.get("ro.boot.flash.locked") or
-                  ("locked" if props.get("ro.boot.verifiedbootstate") == "green" else
-                   "unlocked" if props.get("ro.boot.verifiedbootstate") in ("orange", "yellow") else "") or
-                  ("unlocked" if props.get("ro.boot.vbmeta.device_state") == "unlocked" else
-                   "locked" if props.get("ro.boot.vbmeta.device_state") == "locked" else "") or
-                  props.get("ro.secureboot.lockstate", ""))
-    bootloader = _yesno(locked_raw, "LOCKED", "UNLOCKED")
+    # bootloader locked state - same interpretation as the security checkup
+    bs = boot_state(props.get("ro.boot.verifiedbootstate"), props.get("ro.boot.flash.locked"),
+                    props.get("ro.boot.vbmeta.device_state"))
+    if bs["state"] == "unknown":
+        bootloader = _yesno(props.get("ro.secureboot.lockstate", ""), "LOCKED", "UNLOCKED")
+    else:
+        bootloader = {"locked": "LOCKED", "custom_key": "LOCKED", "unlocked": "UNLOCKED",
+                      "failed": "VERIFICATION FAILED"}[bs["state"]]
     arb = props.get("ro.boot.arb_version") or props.get("ro.boot.ara_version") or props.get("ro.minarb") or ""
 
     identity = [("Maker", maker or "?", ""),
@@ -628,8 +783,13 @@ def device_info(shell):
 
     region = props.get("ro.miui.region") or props.get("ro.boot.hwcountry") or props.get("ro.boot.hwc") or ""
     rooting = []
-    rooting.append(("Bootloader", bootloader,
-                    "must be UNLOCKED before any root is possible; unlocking wipes the phone"))
+    rooting.append(("Bootloader", bootloader + (" (custom key - yellow)" if bs["state"] == "custom_key" else ""),
+                    ("locked, but the system is signed with the owner's own key (custom ROM that was "
+                     "re-locked)" if bs["state"] == "custom_key" else
+                     "the system failed its integrity check at boot - don't flash anything until you know "
+                     "why" if bs["state"] == "failed" else
+                     "must be UNLOCKED before any root is possible; unlocking wipes the phone")
+                    + ("  [signals disagree: %s]" % bs["conflict"] if bs["conflict"] else "")))
     if region:
         rooting.append(("Region", region,
                         "Xiaomi's unlock wait and rules differ by region" if is_xiaomi else ""))
@@ -640,10 +800,21 @@ def device_info(shell):
     warranty = props.get("ro.boot.warranty_bit") or props.get("ro.warranty_bit")
     if warranty == "1":
         rooting.append(("Warranty bit", "already tripped", "the bootloader was unlocked at some point"))
-    slots = "yes (A/B)" if props.get("ro.boot.slot_suffix") or \
-            props.get("ro.boot.dynamic_partitions") == "true" else "no / unknown"
-    rooting.append(("A/B partitions", slots,
+    # A/B slots and dynamic partitions are DIFFERENT things: many non-A/B phones
+    # have dynamic partitions. Only a slot suffix / ab_update says A/B.
+    suffix = props.get("ro.boot.slot_suffix", "")
+    if suffix or props.get("ro.build.ab_update") == "true":
+        slots = "yes (A/B)" + (", running slot %s" % suffix.lstrip("_") if suffix else "")
+        if props.get("ro.virtual_ab.enabled") == "true":
+            slots += ", virtual A/B"
+    else:
+        slots = "not detected"
+    rooting.append(("A/B slots", slots,
                     "affects how TWRP/Magisk are installed (patched boot image vs recovery)"))
+    if props.get("ro.boot.dynamic_partitions") == "true":
+        rooting.append(("Dynamic partitions", "yes",
+                        "system/vendor live inside one 'super' partition - flash them with fastbootd, "
+                        "not plain fastboot. This does NOT mean the phone has A/B slots"))
 
     groups = [("What this device is", identity), ("Rooting-relevant facts", rooting)]
     return {"groups": groups, "props": props, "is_xiaomi": is_xiaomi, "codename": codename,
@@ -676,6 +847,12 @@ def check_device(facts):
         else:
             out.append(finding("device", OK, "Security updates are recent (%s)" % patch, key="patch",
                                tech="ro.build.version.security_patch=%s" % patch))
+    elif unread(facts, "prop:patch"):
+        out.append(finding("device", INFO, "Couldn't read the security patch level",
+                           "The device didn't answer this question, so it isn't known how old its "
+                           "security updates are.", "Run the checkup again.",
+                           "getprop ro.build.version.security_patch failed: %s" % facts["failed"]["prop:patch"],
+                           key="patch"))
     else:
         out.append(finding("device", WARN if sdk and sdk < 23 else INFO,
                            "Security patch level unknown (Android %s)" % (p.get("release") or "?"),
@@ -698,33 +875,76 @@ def check_device(facts):
         out.append(finding("device", BAD, "SELinux protection is OFF (permissive)",
                            "Android's main wall between apps and the system is not enforced. Usually "
                            "caused by rooting or a modified system.", "", "getenforce=Permissive", key="selinux"))
-    # root
-    magisk = [x for x in ("com.topjohnwu.magisk", "eu.chainfire.supersu", "com.koushikdutta.superuser",
-                          "me.weishu.kernelsu") if x in facts["apps"]]
-    if facts["su"] or magisk:
-        out.append(finding("device", WARN, "The device is rooted",
-                           "Apps that get root access can do anything, invisibly - including hiding from "
-                           "this checkup. Fine if you rooted it yourself on purpose.",
-                           "Only grant root to apps you trust completely.",
-                           "su: %s  root apps: %s" % (" ".join(facts["su"]) or "-", " ".join(magisk) or "-"),
-                           key="root"))
+    elif unread(facts, "selinux"):
+        out.append(finding("device", INFO, "Couldn't check SELinux protection",
+                           "The device didn't answer, so it isn't known whether this protection is on.",
+                           "Run the checkup again.", "getenforce failed: %s" % facts["failed"]["selinux"],
+                           key="selinux"))
+    # root - same evidence the snapshot uses (root_signals). A root manager APP is
+    # reported separately and never counts as confirmed root.
+    evidence, complete, managers = root_signals(facts)
+    if evidence:
+        out.append(finding("device", WARN, "Signs of root: an su program is present",
+                           "An su program can be used to request root access. Its presence is a sign of "
+                           "root-related configuration, although this check does not establish that root "
+                           "access currently works. Apps that do get root can do anything, invisibly - "
+                           "including hiding from this checkup. Fine if you rooted it yourself on purpose.",
+                           "Only grant root to apps you trust completely.", "; ".join(evidence), key="root"))
+    elif not complete:
+        out.append(finding("device", INFO, "Couldn't fully check for root",
+                           "The check for root tools didn't finish, so this is NOT an all-clear.",
+                           "Run the checkup again.", "su check failed: %s" % facts["failed"]["su"], key="root"))
+    elif managers:
+        out.append(finding("device", INFO, "No su program found - root not confirmed",
+                           "None of the usual su programs is present. A root manager app IS installed "
+                           "(see below), so root may still be active in a hidden form, or the app may be "
+                           "installed without root.", key="root",
+                           tech="su paths checked: %s" % " ".join(SU_PATHS)))
     else:
-        out.append(finding("device", OK, "No signs of root", key="root"))
-    # bootloader / verified boot
+        out.append(finding("device", OK, "No common signs of root",
+                           "No su program and no known root manager app were found. Root can still be "
+                           "hidden (for example Magisk with its app renamed), so this checks the usual "
+                           "signs only.", key="root",
+                           tech="su paths checked: %s; root manager apps: %s" % (
+                               " ".join(SU_PATHS), " ".join(ROOT_MANAGER_APPS))))
+    if managers:
+        out.append(finding("device", WARN, "Root manager app installed: %s" % ", ".join(managers),
+                           "This kind of app manages root access. Having it installed does NOT confirm "
+                           "the device is rooted - root may be inactive, or this may be a different app "
+                           "using the same name. But it's worth knowing about: if you didn't install it, "
+                           "find out who did.",
+                           "If you don't use root, uninstall it.",
+                           "matched package names: %s" % " ".join(managers), key="root-manager"))
+    # bootloader / verified boot - same interpretation as device info (boot_state)
     vb = p.get("vbstate", "")
-    unlocked = p.get("flash_locked") == "0" or p.get("vbmeta") == "unlocked" or vb in ("orange",)
-    if unlocked:
+    bs = boot_state(vb, p.get("flash_locked"), p.get("vbmeta"))
+    tech = "verifiedbootstate=%s flash.locked=%s vbmeta=%s%s" % (
+        vb or "-", p.get("flash_locked") or "-", p.get("vbmeta") or "-",
+        ("  conflict: " + bs["conflict"]) if bs["conflict"] else "")
+    if bs["state"] == "failed":
+        out.append(finding("device", BAD, "Verified boot FAILED (red)",
+                           "At start-up the system didn't pass its integrity check - it is damaged or was "
+                           "modified. The device may not be trustworthy.",
+                           "Reinstall the official firmware for this exact model before using it for "
+                           "anything sensitive.", tech, key="boot"))
+    elif bs["state"] == "unlocked":
         out.append(finding("device", WARN, "The bootloader is unlocked",
                            "The system can be replaced without wiping data, so someone with the device in "
                            "hand could plant a modified system. Normal on custom-ROM devices.",
-                           tech="verifiedbootstate=%s flash.locked=%s vbmeta=%s"
-                           % (vb or "-", p.get("flash_locked") or "-", p.get("vbmeta") or "-"), key="boot"))
-    elif vb == "green" or p.get("flash_locked") == "1":
-        out.append(finding("device", OK, "Bootloader locked / verified boot OK", key="boot",
-                           tech="verifiedbootstate=%s" % (vb or "-")))
-    elif vb == "yellow":
-        out.append(finding("device", WARN, "Verified boot uses a custom key (yellow)",
-                           "The system was signed by someone other than the maker (custom ROM).", key="boot"))
+                           tech=tech, key="boot"))
+    elif bs["state"] == "custom_key":
+        out.append(finding("device", INFO, "Bootloader locked with a custom key (yellow)",
+                           "The bootloader is locked and the system IS verified at every start - but "
+                           "against a key the owner installed, not the maker's. This is what a custom ROM "
+                           "that was re-locked looks like. Fine if you did that yourself; if you didn't, "
+                           "someone replaced the system.", tech=tech, key="boot"))
+    elif bs["state"] == "locked":
+        out.append(finding("device", OK, "Bootloader locked / verified boot OK", key="boot", tech=tech))
+    elif unread(facts, "prop:vbstate", "prop:flash_locked", "prop:vbmeta") == \
+            ["prop:vbstate", "prop:flash_locked", "prop:vbmeta"]:
+        out.append(finding("device", INFO, "Couldn't check the bootloader",
+                           "The device didn't answer, so it isn't known whether it's locked.",
+                           "Run the checkup again.", tech, key="boot"))
     # ADB over network
     tcp = [x for x in (p.get("adb_tcp"), p.get("adb_tcp2")) if x and x not in ("0", "-1")]
     listen5555 = any(s.get("kind") == "listen" and s.get("local_port") == 5555 and s.get("proto") == "tcp"
@@ -749,6 +969,11 @@ def check_device(facts):
         out.append(finding("device", INFO, "App verification (Play Protect scan of installs) is off",
                            key="verifier", tech="package_verifier_enable=0"))
     # proxy
+    if unread(facts, "setting:http_proxy", "setting:proxy_host"):
+        out.append(finding("device", INFO, "Couldn't check for a network proxy",
+                           "The device didn't answer, so a proxy can't be ruled out.", "Run the checkup again.",
+                           "failed: %s" % ", ".join(unread(facts, "setting:http_proxy", "setting:proxy_host")),
+                           key="proxy-unread"))
     proxy = st.get("http_proxy") or ""
     if (proxy and proxy not in (":0", "0")) or st.get("proxy_host"):
         shown = proxy if proxy and proxy != ":0" else "%s:%s" % (st.get("proxy_host"), st.get("proxy_port"))
@@ -817,7 +1042,15 @@ def check_access(facts, access, launcher, labeler):
             "All traffic goes through the VPN app and its servers. Good if it's yours; spyware sometimes "
             "uses a VPN to watch traffic.", "Settings > Network > VPN.",
             "interfaces: %s" % " ".join(facts["vpn_ifaces"]), key="vpn"))
-    if not out:
+    missing = sorted({ACCESS_INFO[c][0] for c, keys in ACCESS_SOURCES.items() if unread(facts, *keys)})
+    if missing:
+        out.append(finding("access", INFO, "Couldn't check some powerful switches",
+                           "The device didn't answer for: %s. Apps holding those can't be listed, so "
+                           "this section is NOT complete." % ", ".join(missing), "Run the checkup again.",
+                           "failed reads: %s" % ", ".join(sorted({k for ks in ACCESS_SOURCES.values()
+                                                                  for k in unread(facts, *ks)})),
+                           key="access:unread"))
+    elif not out:
         out.append(finding("access", OK, "No app holds any of these powerful switches", key="access:none"))
     return out
 
@@ -904,7 +1137,12 @@ def check_usage(facts, launcher, labeler):
                                      if op in USAGE_OPS and o.get("ago") is not None),
                            pkg=p, key="usage:%s" % p))
     out.sort(key=lambda f: (LEVEL_RANK[f["level"]], f["title"].lower()))
-    if not out:
+    if unread(facts, "appops"):
+        out.append(finding("usage", INFO, "Couldn't read recent camera, microphone and location use",
+                           "The device didn't return its usage history, so this is NOT an all-clear.",
+                           "Run the checkup again.", "dumpsys appops: %s" % facts["failed"]["appops"],
+                           key="usage:unread"))
+    elif not out:
         out.append(finding("usage", OK, "No camera, microphone, location or contacts use recorded "
                            "in the last 7 days", key="usage:none"))
     return out
@@ -938,11 +1176,37 @@ def build_snapshot(serial, facts, access, launcher, identities, prev=None):
                    "perms": sorted(x for x in a.get("granted", []) if x in SENSITIVE_PERMS),
                    "icon": None if launcher is None or a.get("system") else (p in launcher)}
     p = facts["props"]
-    return {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "serial": serial,
-            "device": {"patch": p.get("patch", ""), "release": p.get("release", ""),
-                       "selinux": facts["selinux"], "root": bool(facts["su"]),
-                       "crypto": p.get("crypto", "")},
-            "apps": apps, "access": {k: sorted(v) for k, v in access.items()}}
+    evidence, complete, managers = root_signals(facts)
+    device = {"patch": p.get("patch", ""), "release": p.get("release", ""),
+              "selinux": facts["selinux"],
+              # root = positive evidence only (True), checked and none (False), unknown (None)
+              "root": True if evidence else (False if complete else None),
+              # manager apps tracked separately - comes from the app list, so always known
+              "root_apps": sorted(managers),
+              "crypto": p.get("crypto", "")}
+    # A failed read is not "nothing": keep the previous value, marked unverified, so
+    # the next good read is compared against what was really known (no false
+    # "became rooted" / "was given access" alarms, and no missed changes).
+    pdev, pacc = (prev or {}).get("device", {}), (prev or {}).get("access", {})
+    dev_unverified = []
+    for field, keys in (("patch", ("prop:patch",)), ("release", ("prop:release",)),
+                        ("selinux", ("selinux",)), ("crypto", ("prop:crypto",))):
+        if unread(facts, *keys) and field in pdev:
+            device[field] = pdev[field]
+            dev_unverified.append(field)
+    if device["root"] is None and "root" in pdev:
+        device["root"] = pdev["root"]
+        dev_unverified.append("root")
+    device["unverified"] = dev_unverified
+    acc, acc_unverified = {}, []
+    for k, v in access.items():
+        if unread(facts, *ACCESS_SOURCES.get(k, ())) and k in pacc:
+            acc[k] = list(pacc[k])
+            acc_unverified.append(k)
+        else:
+            acc[k] = sorted(v)
+    return {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "serial": serial, "device": device,
+            "apps": apps, "access": acc, "access_unverified": acc_unverified}
 
 
 def snap_dir(serial):
@@ -1033,8 +1297,14 @@ def compare_snapshots(prev, cur, labeler):
             out.append(finding("changes", INFO if sysapp else WARN, "%s was given: %s" % (lbl(p), name),
                                "Not there at %s." % when, how, pkg=p, key="changes:access:%s:%s" % (cat, p)))
     dp, dc = prev.get("device", {}), cur.get("device", {})
-    if dc.get("root") and not dp.get("root"):
-        out.append(finding("changes", BAD, "The device became rooted since %s" % when, key="changes:root"))
+    if dc.get("root") is True and dp.get("root") is False:   # unknown (None) never counts
+        out.append(finding("changes", BAD, "Signs of root appeared since %s" % when,
+                           "An su program is present now and wasn't at the last check.", key="changes:root"))
+    if "root_apps" in dp:      # older snapshots didn't track manager apps: no baseline, no alarm
+        for x in sorted(set(dc.get("root_apps", [])) - set(dp["root_apps"])):
+            out.append(finding("changes", WARN, "Root manager app installed since %s: %s" % (when, x),
+                               "This doesn't confirm the device is rooted, but if you didn't install it, "
+                               "find out who did.", pkg=x, key="changes:root-app:%s" % x))
     if dp.get("selinux", "").lower() == "enforcing" and dc.get("selinux", "").lower() == "permissive":
         out.append(finding("changes", BAD, "SELinux was switched to permissive since %s" % when,
                            key="changes:selinux"))
@@ -1316,13 +1586,25 @@ def exodus_tracker_names(cfg):
         try:
             d = _http(cfg["exodus_url"].rstrip("/") + "/api/trackers",
                       {"Authorization": "Token " + cfg["exodus_token"]})
-            db = {str(k): {"name": v.get("name", ""), "website": v.get("website", "")}
+            # code/network signatures are kept too: the code inspector uses them
+            # (offline) to tell which SDK a piece of code or an address belongs to
+            db = {str(k): {"name": v.get("name", ""), "website": v.get("website", ""),
+                           "code_signature": v.get("code_signature", "") or "",
+                           "network_signature": v.get("network_signature", "") or ""}
                   for k, v in (d.get("trackers") or {}).items()}
             cached["_db"], cached["_db_time"] = db, time.time()
             save_json(TRACKERS_FILE, cached)
         except Exception:
             pass
         return db
+
+
+def cached_exodus_trackers():
+    """Exodus tracker list as cached by an earlier deep scan - NEVER fetches.
+    Entries saved by older versions lack signatures and are simply skipped by
+    inspector_signatures()."""
+    db = load_json(TRACKERS_FILE, {}).get("_db") or {}
+    return [v for v in db.values() if isinstance(v, dict)]
 
 
 def exodus_report(cfg, pkg, version_code):
@@ -1887,3 +2169,1224 @@ def rooting_entry_stale(entry, info):
     """Back-compat boolean: True when the entry is not an exact firmware match."""
     status, _, _ = rooting_compatibility(entry, info)
     return status != "match"
+
+
+# ==========================================================================
+# APK static inspector - phase 1a: analysis engine
+# ==========================================================================
+#
+# Looks INSIDE an installed app's APK files (base + every split) without ever
+# running them: manifest, DEX code references, resources, assets and native
+# libraries -> network endpoints (with the code that uses them), suspicious
+# code indicators, embedded SDKs, and an honest list of what couldn't be
+# analysed.
+#
+# Process model: the heavy lifting (Androguard) runs in a SEPARATE worker
+# process - "<inspector python> security_audit.py --inspect-worker job.json" -
+# under memory / CPU / file-size limits, in its own process group, killed on
+# timeout or Stop. The GUI process never imports Androguard, so a crash or a
+# hostile APK can't take the app down. Androguard lives in its own virtual
+# environment (it pulls in a large dependency tree). Results are local only:
+# nothing here talks to the network or to an AI.
+
+INSPECT_SCHEMA = 1
+INSPECT_ANDROGUARD = "4.1.4"            # the version this code is tested with
+INSPECT_VENV = os.path.join(os.path.expanduser("~"), ".local", "share", "adb_manager", "inspector-venv")
+INSPECT_PROGRESS = "ADBM-PROGRESS "     # worker -> parent progress line prefix
+
+# what a stage can end as; anything but "done"/"skipped" makes the result incomplete
+STAGE_DONE, STAGE_SKIPPED, STAGE_PARTIAL, STAGE_FAILED, STAGE_TIMEOUT = \
+    "done", "skipped", "partial", "failed", "timeout"
+
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def inspector_limits(apk_bytes, dex_bytes, cfg=None):
+    """Resource caps for one inspection, derived from THIS computer (RAM, CPUs)
+    and the app's size - nothing is tuned to one machine. Overridable through
+    the security settings (inspector_mem_mb, inspector_timeout_s, inspector_mode).
+
+    mode "full" traces every address back to its class+method (Androguard's
+    whole-program analysis: slower, more memory); "quick" reads the code
+    tables only. "auto" picks full when the estimated need fits comfortably."""
+    cfg = cfg or {}
+    try:
+        ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, OSError, AttributeError):
+        ram = 4 << 30
+    cpus = os.cpu_count() or 1
+    mem = _clamp(int(ram * 0.5), 1536 << 20, 16 << 30)
+    if cfg.get("inspector_mem_mb"):
+        mem = int(cfg["inspector_mem_mb"]) << 20
+    # rough: full analysis needs ~350 MB + ~60x the DEX size; quick ~250 MB + ~8x
+    need_full = (350 << 20) + 60 * dex_bytes
+    mode = cfg.get("inspector_mode") or "auto"
+    if mode == "auto":
+        mode = "full" if need_full <= mem * 0.7 else "quick"
+    slow = 2.0 / _clamp(cpus, 1, 2)                    # single-core machines get more time
+    timeout = int(_clamp((180 + 40 * (dex_bytes >> 20) + 4 * (apk_bytes >> 20)) * slow, 180, 3600))
+    if cfg.get("inspector_timeout_s"):
+        timeout = int(cfg["inspector_timeout_s"])
+    return {"mem_bytes": mem, "timeout_s": timeout, "mode": mode, "cpu_s": timeout * 2,
+            "file_bytes": 2 << 30,               # largest file the worker may write
+            "max_entries": 200000,               # zip entries per APK part
+            "max_uncompressed": 4 << 30,         # total uncompressed size per part
+            "max_ratio": 200,                    # per-entry compression ratio (bombs)
+            "max_native_lib": 96 << 20, "max_native_total": 384 << 20,
+            "max_asset_file": 2 << 20, "max_asset_total": 48 << 20,
+            "ram_bytes": ram, "cpus": cpus, "need_full_bytes": need_full}
+
+
+INSPECT_INSTALL_HELP = (
+    "The code inspector needs Androguard %(v)s in its own Python environment:\n\n"
+    "  python3 -m venv %(venv)s\n"
+    "  %(venv)s/bin/pip install androguard==%(v)s\n\n"
+    "If 'python3 -m venv' fails, install your system's venv package first:\n"
+    "  Debian / Ubuntu:  sudo apt install python3-venv\n"
+    "  Fedora:           (included with python3)\n"
+    "  Arch:             (included with python)\n\n"
+    "Optional, for reading imported functions of native libraries: 'readelf'\n"
+    "(package 'binutils' on Debian/Ubuntu, Fedora and Arch).")
+
+
+def _probe_androguard(python, timeout=30):
+    """Version of Androguard importable by that interpreter, or None."""
+    try:
+        p = subprocess.run([python, "-c", "import sys, androguard; "
+                            "print(androguard.__version__); print(sys.version.split()[0])"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                           timeout=timeout, env=_worker_env())
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if p.returncode != 0:
+        return None
+    lines = p.stdout.decode("utf-8", "replace").split()
+    return {"androguard": lines[0], "python": lines[1]} if len(lines) >= 2 else None
+
+
+def inspector_env(cfg=None):
+    """Which tools the inspector can use on this computer. Never installs anything.
+    Returns {"python", "androguard", "python_version", "readelf", "ok", "problems",
+    "help"}; ok means the required part (Androguard) is usable."""
+    import shutil
+    import sys
+    cfg = cfg or {}
+    candidates = [cfg.get("inspector_python"), os.path.join(INSPECT_VENV, "bin", "python"), sys.executable]
+    env = {"python": None, "androguard": None, "python_version": None,
+           "readelf": shutil.which("readelf"), "problems": [], "help": INSPECT_INSTALL_HELP % {
+               "v": INSPECT_ANDROGUARD, "venv": INSPECT_VENV}}
+    for py in [c for c in candidates if c]:
+        if not os.path.exists(py):
+            continue
+        got = _probe_androguard(py)
+        if got:
+            env.update(python=py, androguard=got["androguard"], python_version=got["python"])
+            break
+    if not env["python"]:
+        env["problems"].append("Androguard isn't installed for the inspector")
+    elif env["androguard"] != INSPECT_ANDROGUARD:
+        env["problems"].append("Androguard %s found; this program is tested with %s - results may differ"
+                               % (env["androguard"], INSPECT_ANDROGUARD))
+    if not env["readelf"]:
+        env["problems"].append("readelf not found: native libraries are scanned for addresses, but their "
+                               "imported network functions can't be listed")
+    env["ok"] = bool(env["python"])
+    return env
+
+
+# ---- container safety (pure Python: runs before any parser touches the APK) -
+
+def apk_container_check(path, limits):
+    """Inspect an APK's zip structure WITHOUT extracting it. Returns
+    {"ok": bool, "problems": [(severity, text)], "dex": [...], "native": [...],
+     "assets": [...], "entries": n, "uncompressed": bytes}.
+    severity "fatal" stops analysis of that part (malformed, bomb, too big);
+    "warn" is reported but analysis goes on - nothing is ever written to disk
+    under a name taken from the archive."""
+    import stat as _stat
+    out = {"ok": True, "problems": [], "dex": [], "native": [], "assets": [], "entries": 0,
+           "uncompressed": 0}
+
+    def bad(sev, text):
+        out["problems"].append((sev, text))
+        if sev == "fatal":
+            out["ok"] = False
+    try:
+        zf = zipfile.ZipFile(path)
+    except (zipfile.BadZipFile, OSError, ValueError) as e:
+        bad("fatal", "not a readable APK/zip file (%s)" % (str(e) or type(e).__name__))
+        return out
+    with zf:
+        infos = zf.infolist()
+        out["entries"] = len(infos)
+        if len(infos) > limits["max_entries"]:
+            bad("fatal", "too many files inside (%d)" % len(infos))
+            return out
+        seen = set()
+        for i in infos:
+            n = i.filename
+            if n in seen:
+                bad("warn", "the same name appears twice inside the APK: %r - different tools could read "
+                            "different contents (a known tampering trick)" % n[:200])
+            seen.add(n)
+            parts = n.replace("\\", "/").split("/")
+            if n.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", n) or ".." in parts or "\x00" in n \
+                    or "\\" in n:
+                bad("warn", "unsafe file name inside the APK: %r" % n[:200])
+            if _stat.S_ISLNK(i.external_attr >> 16):
+                bad("warn", "symbolic link inside the APK: %r" % n[:200])
+            if i.flag_bits & 0x1:
+                bad("warn", "encrypted entry inside the APK: %r" % n[:200])
+            out["uncompressed"] += i.file_size
+            if i.compress_size and i.file_size > (1 << 20) and i.file_size / i.compress_size > limits["max_ratio"]:
+                bad("fatal", "an entry expands %dx (%r) - looks like a decompression bomb"
+                    % (i.file_size // max(1, i.compress_size), n[:200]))
+            base = parts[-1]
+            if re.match(r"^classes\d*\.dex$", n):
+                out["dex"].append(n)
+            elif n.startswith("lib/") and base.endswith(".so"):
+                out["native"].append(n)
+            elif n.startswith(("assets/", "res/raw/")):
+                out["assets"].append(n)
+        if out["uncompressed"] > limits["max_uncompressed"]:
+            bad("fatal", "too large when unpacked (%d MB)" % (out["uncompressed"] >> 20))
+    return out
+
+
+def read_member_capped(zf, name, cap):
+    """Read one archive member into memory, refusing to go past `cap` bytes no
+    matter what the header claims. Returns bytes or raises ValueError."""
+    buf, total = [], 0
+    with zf.open(name) as f:
+        while True:
+            chunk = f.read(1 << 16)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > cap:
+                raise ValueError("%s is larger than the %d MB limit" % (name, cap >> 20))
+            buf.append(chunk)
+    return b"".join(buf)
+
+
+# ---- endpoints: extraction and classification -----------------------------
+
+_URL_RE = re.compile(r"\b(?:https?|wss?|ftp)://[^\s\"'<>\\^`{|}]{1,2048}", re.I)
+_IP_RE = re.compile(r"(?<![\d.])((?:\d{1,3}\.){3}\d{1,3})(?::(\d{1,5}))?(?![\d.])")
+# bare IPv6, optionally "[addr]:port". ipaddress decides validity: invalid C++
+# expressions ("std::string", "Foo::Bar::baz", "ns::a::b") are rejected by it,
+# while valid-but-ambiguous ones ("a::b", "dead::beef") are kept and labelled.
+_IP6_RE = re.compile(r"(?<![\w:.\[])(\[)?([0-9A-Fa-f]{0,4}(?::[0-9A-Fa-f]{0,4}){2,7})(?(1)\](?::(\d{1,5}))?)(?![\w:.])")
+_HOST_TLDS = ("com", "net", "org", "io", "co", "app", "dev", "info", "biz", "me", "tv", "cn", "ru", "de",
+              "uk", "fr", "jp", "br", "in", "eu", "us", "xyz", "cloud", "ai", "top", "site", "online",
+              "tech", "pt", "es", "it", "nl", "pl", "kr", "tw", "hk", "sg", "au", "ca", "mx", "tk", "cc",
+              "ws", "pw", "su", "ir", "ly", "link", "live", "club", "pro", "shop", "store")
+_HOST_RE = re.compile(r"(?<![\w.\-/@])((?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+(?:%s))(?::(\d{1,5}))?(?![\w\-.])"
+                      % "|".join(_HOST_TLDS))
+# first labels that mean "Java/Kotlin package name", not a host
+_PKG_ROOTS = {"com", "org", "net", "android", "androidx", "java", "javax", "kotlin", "kotlinx", "dalvik", "io",
+              "de", "uk", "fr", "jp", "cn", "ru", "me", "co", "app", "dev", "info", "us", "eu", "sun", "libcore"}
+_PLACEHOLDER_RE = re.compile(r"%[0-9.$]*[sdxXf]|\{[^}]{0,40}\}|\$\{|<[a-z_]{1,30}>")
+_STD_PORTS = {80, 443, 8080, 8443}
+
+
+def _parse_endpoint(value):
+    """Split a URL into scheme/host/port; None if it isn't one."""
+    try:
+        u = urllib.parse.urlsplit(value)
+        host = (u.hostname or "").lower()
+        port = u.port
+    except ValueError:
+        return None
+    if not host:
+        return None
+    return {"scheme": u.scheme.lower(), "host": host, "port": port}
+
+
+def extract_endpoints(text, package_like=()):
+    """Find network endpoints in one string. Returns a list of
+    {"value", "kind" (url|ip|host), "scheme", "host", "port", "constructed"}.
+    package_like: Java package / class name prefixes present in the app, so that
+    'com.example.foo' style names aren't mistaken for host names."""
+    found, spans = [], []
+    for m in _URL_RE.finditer(text):
+        v = m.group(0).rstrip(").,;:'\"!]")
+        p = _parse_endpoint(v)
+        if not p:
+            continue
+        spans.append(m.span())
+        found.append(dict(p, value=v, kind="url", constructed=bool(_PLACEHOLDER_RE.search(v))
+                          or v.endswith(("/", "=", "?"))))
+
+    def inside(span):
+        return any(a <= span[0] and span[1] <= b for a, b in spans)
+    for m in _IP_RE.finditer(text):
+        if inside(m.span()):
+            continue
+        ip = m.group(1)
+        try:
+            import ipaddress
+            ipaddress.IPv4Address(ip)
+        except ValueError:
+            continue
+        port = int(m.group(2)) if m.group(2) and int(m.group(2)) <= 65535 else None
+        found.append({"value": m.group(0), "kind": "ip", "scheme": "", "host": ip, "port": port,
+                      "constructed": False})
+    for m in _IP6_RE.finditer(text):
+        if inside(m.span()):
+            continue
+        cand = m.group(2)
+        try:
+            import ipaddress
+            ip6 = ipaddress.IPv6Address(cand)
+        except ValueError:
+            continue                      # not a valid address at all
+        if ip6.is_unspecified:
+            continue                      # "::" alone means "no address" - never a destination
+        # Valid IPv6 that has the exact SHAPE of C++ scope text - unbracketed, one
+        # "::" and no single ":", every part a C++ identifier (letter/_ first, then
+        # letters/digits/_): a::b, dead::beef, face::b00c, a1::b2, ::b. Kept, but
+        # marked ambiguous so it isn't treated as a confirmed network destination.
+        # 2001::1 / ::1 aren't ambiguous: a part starting with a digit can't be a
+        # C++ identifier. Brackets ([dead::beef]:4444) are address notation.
+        halves = cand.split("::")
+        ambiguous = (not m.group(1) and len(halves) == 2 and ":" not in halves[0] and ":" not in halves[1]
+                     and all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", h) for h in halves if h))
+        port = int(m.group(3)) if m.group(3) and int(m.group(3)) <= 65535 else None
+        spans.append(m.span())
+        found.append({"value": m.group(0), "kind": "ip", "scheme": "", "host": str(ip6), "port": port,
+                      "constructed": False, "ambiguous": ambiguous})
+    for m in _HOST_RE.finditer(text):
+        if inside(m.span()):
+            continue
+        host = m.group(1)
+        labels = host.split(".")
+        if labels[0] in _PKG_ROOTS or len(labels) < 2 or any(host == p or p.startswith(host + ".")
+                                                             for p in package_like):
+            continue
+        port = int(m.group(2)) if m.group(2) and int(m.group(2)) <= 65535 else None
+        found.append({"value": m.group(0), "kind": "host", "scheme": "", "host": host, "port": port,
+                      "constructed": False})
+    return found
+
+
+def registrable_domain(host):
+    """'api.eu.example.co.uk' -> 'example.co.uk' (simple public-suffix rule)."""
+    labels = host.lower().rstrip(".").split(".")
+    if len(labels) >= 3 and labels[-2] in ("co", "com", "net", "org", "gov", "ac", "edu") and len(labels[-1]) == 2:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+# Fallback table of common SDKs, written for this program from public package
+# and domain names (not copied from any tracker database). Used when no Exodus
+# tracker data is cached. Incomplete by nature - an SDK not listed here is
+# "unknown", never "safe".
+SDK_FALLBACK = [
+    # name, code package prefixes, domains it is known to contact
+    ("Firebase", ("com.google.firebase",), ("firebaseio.com", "firebase.google.com", "firebaseinstallations.googleapis.com",
+                                           "firebaselogging.googleapis.com", "app-measurement.com")),
+    ("Google Mobile Ads", ("com.google.android.gms.ads",), ("doubleclick.net", "googlesyndication.com",
+                                                            "googleadservices.com")),
+    ("Facebook SDK", ("com.facebook",), ("facebook.com", "fbcdn.net", "facebook.net")),
+    ("AppsFlyer", ("com.appsflyer",), ("appsflyer.com", "appsflyersdk.com")),
+    ("Adjust", ("com.adjust.sdk",), ("adjust.com", "adjust.io")),
+    ("Branch", ("io.branch",), ("branch.io", "app.link")),
+    ("OneSignal", ("com.onesignal",), ("onesignal.com",)),
+    ("Sentry", ("io.sentry",), ("sentry.io",)),
+    ("Crashlytics", ("com.crashlytics", "com.google.firebase.crashlytics"), ("crashlytics.com",)),
+    ("Unity Ads", ("com.unity3d.ads", "com.unity3d.services"), ("unityads.unity3d.com", "unity3d.com")),
+    ("AppLovin", ("com.applovin",), ("applovin.com", "applvn.com")),
+    ("Mixpanel", ("com.mixpanel",), ("mixpanel.com",)),
+    ("Amplitude", ("com.amplitude",), ("amplitude.com",)),
+    ("Segment", ("com.segment",), ("segment.io", "segment.com")),
+    ("Braze", ("com.braze", "com.appboy"), ("braze.com", "appboy.com")),
+    ("Microsoft App Center", ("com.microsoft.appcenter",), ("appcenter.ms",)),
+    ("Bugsnag", ("com.bugsnag",), ("bugsnag.com",)),
+]
+_GENERIC_PKG_WORDS = {"com", "org", "net", "android", "app", "apps", "mobile", "client", "free", "pro", "lite",
+                      "main", "application", "google", "gms", "io", "co", "de", "the", "www"}
+
+
+def sdk_owner(dotted_class, signatures):
+    """Which SDK a class belongs to: (name, source) or (None, None).
+    signatures = [(name, [package prefixes], [domains], source)]."""
+    for name, prefixes, _, source in signatures:
+        for pref in prefixes:
+            base = pref.rstrip(".")
+            if dotted_class == base or dotted_class.startswith(base + "."):
+                return name, source
+    return None, None
+
+
+def inspector_signatures(cached_exodus=None):
+    """SDK signatures: cached Exodus tracker data (if the deep scan fetched it)
+    plus the built-in fallback table. Never fetches anything."""
+    sigs = []
+    for t in (cached_exodus or []):
+        prefixes = [p.strip().rstrip("\\.").replace("\\.", ".") for p in (t.get("code_signature") or "").split("|")
+                    if p.strip()]
+        domains = [d.strip().lstrip("\\.").replace("\\.", ".") for d in (t.get("network_signature") or "").split("|")
+                   if d.strip()]
+        if prefixes:
+            sigs.append((t.get("name") or "?", prefixes, domains, "Exodus"))
+    sigs += [(n, list(p), list(d), "built-in list") for n, p, d in SDK_FALLBACK]
+    return sigs
+
+
+def classify_endpoint(ep, ctx):
+    """Classify one endpoint from LOCAL evidence only. ep: {"host", "port",
+    "scheme", "kind", "constructed", "locations": [{"part", "source", "cls"}]}.
+    ctx: {"package", "signatures", "sdks_present": {name}, "bad_hosts": set()}.
+
+    Returns {"classification", "confidence", "evidence": [...], "issues": [...],
+    "owner"}. classification is one of:
+      expected   - supporting evidence ties it to the app or an SDK it contains
+                   ("expected" is not "safe": tracker endpoints are expected too)
+      malicious  - only with explicit evidence (a host in ctx["bad_hosts"])
+      suspicious - with the specific reasons listed
+      unknown    - not enough evidence either way
+    A recognised big-company domain is NOT expected by itself, and an
+    unfamiliar one is NOT suspicious by itself."""
+    import ipaddress
+    host, port = ep["host"], ep.get("port")
+    evidence, issues, reasons, owner = [], [], [], None
+    sources = {loc.get("source") for loc in ep.get("locations", [])}
+    owners = {loc.get("owner") for loc in ep.get("locations", []) if loc.get("owner")}
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    local = bool(ip and (ip.is_loopback or ip.is_private or ip.is_link_local)) or host in ("localhost",)
+    if ep.get("scheme") in ("http", "ws", "ftp") and not local:
+        issues.append("sent without encryption (%s://) - anyone on the network path can read or change it"
+                      % ep["scheme"])
+    if host in ctx.get("bad_hosts", ()):
+        return {"classification": "malicious", "confidence": "high",
+                "evidence": ["listed as malicious in a reputation source you looked up"],
+                "issues": issues, "owner": None}
+    if ip and ip.is_loopback or host == "localhost":
+        return {"classification": "expected", "confidence": "high",
+                "evidence": ["loopback address - traffic never leaves the device"], "issues": [], "owner": None}
+    if ep.get("ambiguous"):
+        return {"classification": "unknown", "confidence": "low",
+                "evidence": ["this is valid IPv6 address syntax (%s), but it reads just as well as ordinary "
+                             "program text, such as a C++ name - not treated as a network destination "
+                             "without more evidence" % host], "issues": [], "owner": None}
+    if ip and (ip.is_link_local or (ip.version == 4 and ip.is_private)):
+        return {"classification": "unknown", "confidence": "low",
+                "evidence": ["a local-network address (router, LAN device) - not on the internet"],
+                "issues": [], "owner": None}
+    if ip and not ip.is_global:
+        return {"classification": "unknown", "confidence": "low",
+                "evidence": ["a private or reserved address range - not a normal public internet destination"],
+                "issues": [], "owner": None}
+    reg = registrable_domain(host) if not ip else ""
+    # evidence for "expected"
+    for name, prefixes, domains, source in ctx.get("signatures", []):
+        if reg and any(registrable_domain(d) == reg or host == d or host.endswith("." + d) for d in domains):
+            if name in ctx.get("sdks_present", set()):
+                owner = name
+                evidence.append("matches the known addresses of %s, whose code is inside this app (%s)"
+                                % (name, source))
+            else:
+                evidence.append("matches the known addresses of %s, but that SDK's code wasn't found here"
+                                % name)
+            break
+    if owners and not owner:
+        owner = sorted(owners)[0]
+        evidence.append("referenced from code that belongs to %s" % owner)
+    pkg_words = {w for w in ctx.get("package", "").lower().split(".") if w not in _GENERIC_PKG_WORDS and len(w) > 2}
+    if reg and reg.split(".")[0] in pkg_words:
+        evidence.append("the domain matches a word in the app's package name (%s) - a hint it belongs to the "
+                        "developer, not proof" % ctx.get("package"))
+    # reasons for "suspicious"
+    if ip and ip.is_global:
+        reasons.append("a raw internet IP address instead of a name%s" % (
+            " (a bare number like this can also be a version number)"
+            if ip.version == 4 and not port and ep.get("kind") != "url" else ""))
+    if port and port not in _STD_PORTS and not local:
+        reasons.append("an unusual port (%d)" % port)
+    if sources and sources <= {"native", "asset"}:
+        reasons.append("found only in %s, not in the app's main code" % " and ".join(sorted(
+            {"native": "native libraries", "asset": "bundled asset files"}[s] for s in sources)))
+    if reasons:
+        cls, conf = "suspicious", "medium" if len(reasons) > 1 else "low"
+    elif owner and any("whose code is inside" in e for e in evidence):
+        cls, conf = "expected", "medium"
+    elif evidence and any(("package name" in e) or ("belongs to" in e) for e in evidence):
+        cls, conf = "expected", "low"
+    else:
+        cls, conf = "unknown", "low"
+    return {"classification": cls, "confidence": conf, "evidence": evidence + reasons,
+            "issues": issues, "owner": owner}
+
+
+def obfuscation_level(class_names):
+    """Share of classes with 1-2 letter simple names (a, b, aB ...): an analysis
+    limitation, not proof of malice (most release apps are minified)."""
+    names = [c.strip("L;").split("/")[-1].split("$")[0] for c in class_names]
+    names = [n for n in names if n]
+    if not names:
+        return 0.0
+    return sum(1 for n in names if len(n) <= 2) / len(names)
+
+
+def summarize_inspection(res):
+    """The one-line verdict. Never says 'clean': an analysis can only say what
+    it found in the parts it could read."""
+    stages = res.get("stages", [])
+    incomplete = [s for s in stages if s["status"] not in (STAGE_DONE, STAGE_SKIPPED)]
+    sus_eps = [e for e in res.get("endpoints", []) if e["classification"] in ("suspicious", "malicious")]
+    sus_ind = [i for i in res.get("indicators", []) if i["severity"] in ("warn", "bad")]
+    unenc = [e for e in res.get("endpoints", []) if e.get("issues")]
+    parts = res.get("parts", [])
+    covered = sum(1 for p in parts if p.get("analysed"))
+    coverage = "%d of %d app part(s) analysed, %s mode" % (covered, len(parts), res.get("mode", "?"))
+    if incomplete or covered < len(parts):
+        head = "Analysis incomplete"
+        level = INFO
+    elif sus_eps or sus_ind:
+        head = "Worth a look: %d suspicious address(es), %d code warning(s)" % (len(sus_eps), len(sus_ind))
+        level = WARN
+    else:
+        head = "No suspicious indicators found in the parts analysed"
+        level = OK
+    extra = []
+    if unenc:
+        extra.append("%d address(es) used without encryption" % len(unenc))
+    if incomplete:
+        extra.append("not finished: " + ", ".join(s["name"] for s in incomplete))
+    return {"level": level, "text": head, "coverage": coverage, "notes": extra}
+
+
+# ---- running the worker ----------------------------------------------------
+
+def _worker_env():
+    keep = {k: os.environ[k] for k in ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR") if k in os.environ}
+    keep["PYTHONNOUSERSITE"] = "1"
+    keep["PYTHONDONTWRITEBYTECODE"] = "1"
+    return keep
+
+
+def _worker_limits(limits):
+    def apply():
+        import resource
+        os.umask(0o077)
+        for res_id, val in ((resource.RLIMIT_AS, limits["mem_bytes"]), (resource.RLIMIT_CPU, limits["cpu_s"]),
+                            (resource.RLIMIT_FSIZE, limits["file_bytes"]), (resource.RLIMIT_CORE, 0)):
+            try:
+                resource.setrlimit(res_id, (val, val))
+            except (ValueError, OSError):
+                pass
+    return apply
+
+
+def run_inspection(job, python, limits, on_progress=None, stop=None, script=None):
+    """Run the worker on `job` and return its result dict.
+
+    job: {"package", "version_code", "parts": [{"name", "kind", "path"}],
+          "signatures", "mode"}. Paths must be private copies.
+    Never raises for worker problems: a crash, a timeout, Stop, bad output or a
+    missing result all come back as a result whose stages say so (and whose
+    summary is therefore "Analysis incomplete" - never a clean result)."""
+    import signal
+    import shutil
+    import tempfile
+    work = tempfile.mkdtemp(prefix="adbm_inspect_")
+    os.chmod(work, 0o700)
+    started = time.time()
+    proc = None
+
+    def failed(status, why, stderr=""):
+        res = {"schema": INSPECT_SCHEMA, "package": job.get("package"), "version_code": job.get("version_code"),
+               "mode": limits.get("mode"), "parts": [{"name": p["name"], "kind": p.get("kind"), "analysed": False}
+                                                     for p in job.get("parts", [])],
+               "stages": [{"id": "worker", "name": "code analysis", "status": status, "detail": why}],
+               "endpoints": [], "indicators": [], "sdks": [], "limitations": [why],
+               "worker_stderr": stderr[-4000:]}
+        res["summary"] = summarize_inspection(res)
+        return res
+    try:
+        jpath = os.path.join(work, "job.json")
+        rpath = os.path.join(work, "result.json")
+        atomic_write_json(jpath, dict(job, mode=limits["mode"], limits=limits, result=rpath,
+                                      scratch=os.path.join(work, "scratch")), private=True)
+        try:
+            proc = subprocess.Popen([python, script or os.path.abspath(__file__), "--inspect-worker", jpath],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                                    cwd=work, env=_worker_env(), start_new_session=True,
+                                    preexec_fn=_worker_limits(limits))
+        except OSError as e:
+            return failed(STAGE_FAILED, "couldn't start the analysis program: %s" % (e.strerror or e))
+        err_chunks = []
+        t_err = threading.Thread(target=lambda: err_chunks.append(proc.stderr.read(1 << 20)), daemon=True)
+        t_err.start()
+        lines = []
+
+        def reader():
+            for raw in proc.stdout:
+                line = raw.decode("utf-8", "replace").rstrip("\n")
+                if line.startswith(INSPECT_PROGRESS) and on_progress:
+                    try:
+                        on_progress(json.loads(line[len(INSPECT_PROGRESS):]))
+                    except (ValueError, TypeError):
+                        pass
+                lines.append(line)
+        t_out = threading.Thread(target=reader, daemon=True)
+        t_out.start()
+        status, why = None, ""
+        while proc.poll() is None:
+            if stop is not None and stop.is_set():
+                status, why = STAGE_FAILED, "stopped by you"
+            elif time.time() - started > limits["timeout_s"]:
+                status, why = STAGE_TIMEOUT, "took longer than %d s and was stopped" % limits["timeout_s"]
+            if status:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                break
+            time.sleep(0.1)
+        proc.wait()
+        t_out.join(5)
+        t_err.join(5)
+        stderr = b"".join(c for c in err_chunks if c).decode("utf-8", "replace")
+        if status:
+            return failed(status, why, stderr)
+        if proc.returncode != 0:
+            why = "the analysis program ended with an error (exit %s)" % proc.returncode
+            if proc.returncode in (-9, -24) or "MemoryError" in stderr:
+                why = "the analysis ran out of its memory or CPU allowance (try quick mode)"
+            return failed(STAGE_FAILED, why, stderr)
+        try:
+            with open(rpath, encoding="utf-8") as f:
+                res = json.load(f)
+        except (OSError, ValueError) as e:
+            return failed(STAGE_FAILED, "the analysis produced no readable result (%s)" % e, stderr)
+        if not isinstance(res, dict) or res.get("schema") != INSPECT_SCHEMA:
+            return failed(STAGE_FAILED, "the analysis result has an unexpected format", stderr)
+        res["summary"] = summarize_inspection(res)
+        res["seconds"] = round(time.time() - started, 1)
+        return res
+    finally:
+        if proc is not None:
+            for pipe in (proc.stdout, proc.stderr):
+                try:
+                    pipe.close()
+                except (OSError, AttributeError):
+                    pass
+        shutil.rmtree(work, ignore_errors=True)
+
+
+# ---- per-identity result cache ---------------------------------------------
+#
+# One saved inspection per EXACT app version: package + versionCode + the
+# SHA-256 of every installed part. A new version, a re-signed copy or a changed
+# split gets a different key, so an old result is never shown as current.
+
+INSPECT_DIR = os.path.join(CONFIG_DIR, "inspections")
+
+
+def inspection_key(pkg, version_code, part_hashes):
+    """Stable key for one exact app build (part order doesn't matter)."""
+    hs = sorted(h for h in part_hashes if h)
+    if not pkg or not hs:
+        return None
+    return "%s|%s|%s" % (pkg, version_code or "", ",".join(hs))
+
+
+def inspection_key_from_identity(pkg, version_code, ident):
+    """Key from a COMPLETE cached deep-scan identity (no device access needed);
+    None if the identity doesn't cover every part."""
+    if not identity_complete(ident):
+        return None
+    return inspection_key(pkg, version_code, [x.get("sha256") for x in identity_parts(ident)])
+
+
+def _inspection_path(key):
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", key.split("|", 1)[0])[:80]
+    return os.path.join(INSPECT_DIR, "%s-%s.json" % (safe, hashlib.sha256(key.encode()).hexdigest()[:20]))
+
+
+def save_inspection(key, res):
+    """Private (0600/0700), atomic. Raises OSError on failure - callers report it."""
+    atomic_write_json(_inspection_path(key), dict(res, key=key), private=True)
+
+
+def load_inspection(key):
+    """The saved result for exactly this build, or None (missing, damaged, other
+    schema, or saved under a different key)."""
+    if not key:
+        return None
+    try:
+        with open(_inspection_path(key), encoding="utf-8") as f:
+            res = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(res, dict) or res.get("schema") != INSPECT_SCHEMA or res.get("key") != key:
+        return None
+    return res
+
+
+def finding_id(kind, item):
+    """Stable id of one finding inside a result (used to file AI answers)."""
+    if kind == "endpoint":
+        return "ep:" + hashlib.sha256(item.get("value", "").encode()).hexdigest()[:16]
+    return "ind:" + item.get("id", "?")
+
+
+_SECRET_KEYS = r"(?:access_?token|refresh_?token|id_?token|token|api_?key|apikey|key|secret|client_?secret|" \
+               r"password|passwd|pwd|pass|auth|authorization|session|sessionid|sid|sig|signature|bearer)"
+# value = an optional auth scheme (Bearer/Basic/...) + a quoted string (whole,
+# spaces included) or a bare token
+_AUTH_SCHEMES = r"(?:bearer|basic|digest|token|negotiate|ntlm)"
+_SECRET_VALUE = r"(?:%s\s+)?(?:\"[^\"]*\"|'[^']*'|[^\s\"'&;,]+)" % _AUTH_SCHEMES
+_SECRET_KV_RE = re.compile(r"(?i)\b(%s)(\s*[=:]\s*)%s" % (_SECRET_KEYS, _SECRET_VALUE))
+# a whole Authorization header value goes - its structure (Digest's username=,
+# nonce=, response= ...) is never parsed field by field
+_AUTH_HEADER_RE = re.compile(r"(?i)\b((?:proxy-)?authorization)(\s*[=:]\s*)[^\r\n]*")
+# a standalone scheme + credential, however short ("Bearer abc", "token x1") -
+# every scheme in _AUTH_SCHEMES (one list, reused), applied AFTER _DIGEST_RE
+_AUTH_SCHEME_RE = re.compile(r"(?i)\b(%s)\s+(?!\[redacted\])\S+" % _AUTH_SCHEMES)
+# structured Digest: "Digest name=..." / "Digest username*=..." -> redacted to end of line
+_DIGEST_RE = re.compile(r"(?i)\b(digest)\s+(?!\[redacted\])[A-Za-z_][A-Za-z0-9_\-]*\*?\s*=[^\r\n]*")
+_URL_START_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9+.\-]*)://(?:[^@/?#]*@)?([A-Za-z0-9.\-]*)")
+_JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]*")
+_LONG_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_\-])[A-Za-z0-9_\-]{32,}(?![A-Za-z0-9_\-])")
+_URL_IN_TEXT_RE = re.compile(r"\b(?:https?|wss?|ftp)://[^\s\"'<>]+", re.I)
+
+
+def _secretish_segment(seg):
+    """A path segment that looks like a key/token rather than a word - judged on
+    its percent-DECODED form too, so %XX-encoding can't hide a token."""
+    decoded = urllib.parse.unquote(seg)
+    if decoded != seg and _secretish_plain(decoded):
+        return True
+    return _secretish_plain(seg)
+
+
+def _secretish_plain(seg):
+    if len(seg) >= 32 and re.fullmatch(r"[A-Za-z0-9_\-=.~+]+", seg):
+        return True
+    if len(seg) >= 16 and re.fullmatch(r"[0-9a-fA-F]+", seg):
+        return True
+    return len(seg) >= 20 and re.search(r"\d", seg) and re.search(r"[A-Za-z]", seg) and \
+        re.fullmatch(r"[A-Za-z0-9_\-]+", seg) and not re.search(r"[aeiou]{2}|[_\-]", seg.lower())
+
+
+def redact_url(value):
+    """Keep scheme, host, port and readable path; drop user:password, the query
+    string, the fragment, and token-looking path segments."""
+    try:
+        u = urllib.parse.urlsplit(value)
+        host = u.hostname or ""
+        port = u.port
+    except ValueError:
+        return _redact_unparseable_url(value)
+    if not u.scheme or not host:
+        return _redact_unparseable_url(value)
+    netloc = ("[%s]" % host if ":" in host else host) + (":%d" % port if port else "")
+    path = "/".join("[redacted]" if _secretish_segment(seg) else seg for seg in u.path.split("/"))
+    out = "%s://%s%s" % (u.scheme, netloc, path)
+    if u.query:
+        out += "?[query removed]"
+    if u.fragment:
+        out += "#[removed]"
+    return out
+
+
+def _redact_unparseable_url(value):
+    """Fail closed: a URL that can't be parsed keeps at most its scheme and a
+    plain host name - user info, port, path, query and fragment all go."""
+    m = _URL_START_RE.match(value or "")
+    if m and m.group(2):
+        return "%s://%s/[rest of an unreadable address removed]" % (m.group(1).lower(), m.group(2).lower())
+    return "[unreadable address removed]"
+
+
+def redact_text(text, urls=True):
+    """Redact URLs (see redact_url), key=value secrets, JWTs and long tokens in free text."""
+    if not isinstance(text, str):
+        return text
+    if urls:
+        def one(m):
+            v = m.group(0)
+            tail = len(v) - len(v.rstrip(").,;:!]"))
+            return redact_url(v[:len(v) - tail]) + v[len(v) - tail:]
+        text = _URL_IN_TEXT_RE.sub(one, text)
+    text = _JWT_RE.sub("[redacted]", text)
+    text = _AUTH_HEADER_RE.sub(lambda m: m.group(1) + m.group(2) + "[redacted]", text)
+    text = _SECRET_KV_RE.sub(lambda m: m.group(1) + m.group(2) + "[redacted]", text)
+    text = _DIGEST_RE.sub(lambda m: m.group(1) + " [redacted]", text)
+    text = _AUTH_SCHEME_RE.sub(lambda m: m.group(1) + " [redacted]", text)   # "Bearer abc" anywhere
+    return _LONG_TOKEN_RE.sub("[redacted]", text)
+
+
+def finding_context(res, kind, item, label=""):
+    """ONLY what the AI may see about one finding: the finding's own evidence and
+    a few code locations - never the app's code, other findings or file paths.
+    Addresses and evidence are redacted (credentials, query strings, fragments,
+    token-like values) - the window shows this exact text before sending."""
+    locs = []
+    for loc in (item.get("locations") or [])[:5]:
+        # these come from the APK itself (names inside it) - redacted like any other text
+        locs.append({k: redact_text(str(loc.get(k))) for k in ("part", "source", "cls", "method", "owner")
+                     if loc.get(k)})
+    base = {"package": res.get("package"), "version_code": res.get("version_code"), "app_label": label,
+            "analysis_mode": res.get("mode"), "kind": kind, "locations": locs}
+    if kind == "endpoint":
+        base.update({k: item.get(k) for k in ("host", "port", "scheme", "classification", "confidence",
+                                               "owner", "constructed")})
+        base["value"] = redact_url(item.get("value", "")) if item.get("kind") == "url" else \
+            redact_text(item.get("value", ""))
+        base["evidence"] = [redact_text(x) for x in item.get("evidence") or []]
+        base["issues"] = [redact_text(x) for x in item.get("issues") or []]
+    else:
+        base.update({k: item.get(k) for k in ("id", "severity", "confidence")})
+        base["title"] = redact_text(item.get("title", ""))
+        base["detail"] = redact_text(item.get("detail", ""))
+    return base
+
+
+# ---- the worker (runs in the inspector's own Python, never in the GUI) -----
+
+API_INDICATORS = [
+    # id, title, severity, [(class, method) any of], plain explanation
+    ("dynamic_code", "Can load extra code while running", "warn",
+     [("Ldalvik/system/DexClassLoader;", "<init>"), ("Ldalvik/system/InMemoryDexClassLoader;", "<init>"),
+      ("Ldalvik/system/PathClassLoader;", "<init>")],
+     "The app can load program code that isn't part of what was installed (e.g. downloaded later). "
+     "Legitimate uses exist (plugins, updates), but code loaded this way was NOT analysed here."),
+    ("exec", "Can run system commands", "warn",
+     [("Ljava/lang/Runtime;", "exec"), ("Ljava/lang/ProcessBuilder;", "start")],
+     "The app can start command-line programs on the device. Some apps do this for diagnostics; "
+     "malware uses it to do things the normal app interface doesn't allow."),
+    ("reflection", "Calls code by name (reflection)", "info",
+     [("Ljava/lang/Class;", "forName"), ("Ljava/lang/reflect/Method;", "invoke")],
+     "Very common in normal apps and libraries. It also means some calls can't be traced statically."),
+    ("js_bridge", "Lets web pages call app code", "info",
+     [("Landroid/webkit/WebView;", "addJavascriptInterface")],
+     "Web content shown inside the app can call into the app. Safe only if the app shows trusted pages."),
+    ("native_load_path", "Loads a native library from a file path", "info",
+     [("Ljava/lang/System;", "load")],
+     "Most apps load bundled libraries by name; loading from a path can mean a library obtained later."),
+]
+NETWORK_APIS = [
+    ("HTTP (java.net)", [("Ljava/net/URL;", "openConnection"), ("Ljava/net/HttpURLConnection;", "*")]),
+    ("raw sockets", [("Ljava/net/Socket;", "<init>"), ("Ljava/net/DatagramSocket;", "<init>"),
+                     ("Ljava/nio/channels/SocketChannel;", "open")]),
+    ("DNS lookups", [("Ljava/net/InetAddress;", "getByName"), ("Ljava/net/InetAddress;", "getAllByName")]),
+    ("TLS / SSL", [("Ljavax/net/ssl/SSLContext;", "init"), ("Ljavax/net/ssl/SSLSocketFactory;", "*")]),
+    ("OkHttp", [("Lokhttp3/OkHttpClient;", "*")]),
+    ("WebSocket", [("Lokhttp3/OkHttpClient;", "newWebSocket"), ("Lokhttp3/WebSocket;", "*")]),
+    ("Apache HTTP", [("Lorg/apache/http/impl/client/DefaultHttpClient;", "*"),
+                     ("Lorg/apache/http/client/HttpClient;", "*")]),
+    ("WebView pages", [("Landroid/webkit/WebView;", "loadUrl")]),
+    ("gRPC", [("Lio/grpc/ManagedChannelBuilder;", "*")]),
+]
+NATIVE_NET_SYMBOLS = {"socket", "connect", "getaddrinfo", "gethostbyname", "gethostbyname2", "sendto", "send",
+                      "recv", "recvfrom", "inet_pton", "inet_addr", "SSL_connect", "SSL_write", "SSL_read",
+                      "curl_easy_perform", "curl_easy_setopt"}
+TEXT_ASSET_EXT = (".json", ".xml", ".txt", ".js", ".html", ".htm", ".properties", ".cfg", ".conf", ".yaml",
+                  ".yml", ".ini", ".csv", ".plist")
+MAX_ENDPOINTS, MAX_LOCATIONS = 5000, 20
+
+
+def _dotted(cls):
+    return (cls or "").strip()[1:-1].replace("/", ".") if (cls or "").startswith("L") else (cls or "")
+
+
+def _api_hit(refs, wanted):
+    return [(c, m) for c, m in wanted if (m == "*" and any(rc == c for rc, _ in refs)) or (c, m) in refs]
+
+
+def _inspect_worker(job_path):
+    """Entry point of the worker process. Writes job["result"]; exit code 0 even
+    when parts failed (that's reported inside the result), non-zero only if the
+    worker itself breaks."""
+    import gc
+    import shutil
+    import xml.etree.ElementTree as ET
+    with open(job_path, encoding="utf-8") as f:
+        job = json.load(f)
+    limits, mode = job["limits"], job["mode"]
+    scratch = job["scratch"]
+    os.makedirs(scratch, mode=0o700, exist_ok=True)
+    try:
+        from loguru import logger
+        logger.remove()
+    except ImportError:
+        pass
+    from androguard.core.apk import APK
+    from androguard.core.dex import DEX
+    from androguard.core.axml import AXMLPrinter
+
+    def progress(stage, msg, **kw):
+        print(INSPECT_PROGRESS + json.dumps(dict(kw, stage=stage, msg=msg)), flush=True)
+
+    signatures = [tuple(x) for x in (job.get("signatures") or [])] or inspector_signatures()
+    package = job.get("package") or ""
+    res = {"schema": INSPECT_SCHEMA, "package": package, "version_code": job.get("version_code"),
+           "mode": mode, "parts": [], "manifest": {}, "endpoints": [], "indicators": [], "sdks": [],
+           "network_apis": [], "limitations": []}
+    stage_state = {k: {"id": k, "name": n, "status": STAGE_SKIPPED, "detail": []} for k, n in (
+        ("container", "checking the APK files"), ("manifest", "reading the manifest"),
+        ("code", "reading the code"), ("resources", "reading resources and bundled files"),
+        ("native", "reading native libraries"), ("classify", "classifying what was found"))}
+
+    def mark(stage, status, detail=None):
+        st = stage_state[stage]
+        order = [STAGE_SKIPPED, STAGE_DONE, STAGE_PARTIAL, STAGE_FAILED]
+        if st["status"] == STAGE_SKIPPED or order.index(status) > order.index(st["status"]):
+            st["status"] = status
+        if detail:
+            st["detail"].append(detail)
+
+    eps = {}                       # key -> endpoint record
+    ind = {}                       # indicator id -> record
+    sdk_hits = {}                  # name -> {"source", "classes", "parts"}
+    net_apis = {}                  # label -> set(parts)
+    all_classes = []
+
+    def add_endpoint(value_rec, loc):
+        key = (value_rec["kind"], value_rec["scheme"], value_rec["host"], value_rec["port"], value_rec["value"])
+        e = eps.get(key)
+        if e is None:
+            if len(eps) >= MAX_ENDPOINTS:
+                return
+            e = eps[key] = dict(value_rec, locations=[])
+        if len(e["locations"]) < MAX_LOCATIONS and loc not in e["locations"]:
+            e["locations"].append(loc)
+
+    def add_indicator(iid, title, sev, text, loc=None, conf="medium"):
+        r = ind.setdefault(iid, {"id": iid, "title": title, "severity": sev, "detail": text,
+                                 "confidence": conf, "locations": []})
+        if loc and len(r["locations"]) < MAX_LOCATIONS and loc not in r["locations"]:
+            r["locations"].append(loc)
+
+    def loc_for(part, source, file=None, cls=None, method=None):
+        d = _dotted(cls) if cls else None
+        owner = sdk_owner(d, signatures)[0] if d else None
+        own = bool(d and package and (d == package or d.startswith(package + ".")))
+        return {"part": part, "source": source, "file": file, "cls": d, "method": method,
+                "owner": owner, "own_code": own}
+
+    def scan_text(part, source, file, text, cls=None, method=None, pkgs=()):
+        for e in extract_endpoints(text, pkgs):
+            add_endpoint(e, loc_for(part, source, file, cls, method))
+
+    for idx, p in enumerate(job["parts"]):
+        name, path = p["name"], p["path"]
+        prec = {"name": name, "kind": p.get("kind"), "analysed": False, "dex": [], "native": [],
+                "problems": []}
+        res["parts"].append(prec)
+        progress("container", "checking %s" % name, part=name)
+        chk = apk_container_check(path, limits)
+        prec["problems"] = ["%s: %s" % s for s in chk["problems"]]
+        prec["dex"], prec["native"] = chk["dex"], chk["native"]
+        if not chk["ok"]:
+            mark("container", STAGE_PARTIAL, "%s: %s" % (name, "; ".join(t for s, t in chk["problems"] if s == "fatal")))
+            continue
+        mark("container", STAGE_DONE)
+        try:
+            apk = APK(path)
+        except Exception as e:      # androguard raises many kinds on malformed input
+            mark("manifest", STAGE_PARTIAL, "%s: Androguard couldn't open it (%s)" % (name, type(e).__name__))
+            apk = None
+
+        def g(fn, *a, default=None):
+            try:
+                return fn(*a)
+            except Exception:
+                return default
+        # -- manifest --
+        if apk is not None:
+            progress("manifest", "reading the manifest of %s" % name, part=name)
+            man = {"package": g(apk.get_package, default=""), "version_code": g(apk.get_androidversion_code),
+                   "target_sdk": g(apk.get_target_sdk_version), "min_sdk": g(apk.get_min_sdk_version),
+                   "permissions": sorted(g(apk.get_permissions, default=[]) or []),
+                   "cleartext": g(apk.get_attribute_value, "application", "usesCleartextTraffic"),
+                   "nsc": g(apk.get_attribute_value, "application", "networkSecurityConfig"),
+                   "debuggable": g(apk.get_attribute_value, "application", "debuggable")}
+            if p.get("kind") == "base" or not res["manifest"]:
+                res["manifest"] = man
+            mark("manifest", STAGE_DONE)
+            if str(man["debuggable"]).lower() == "true":
+                add_indicator("debuggable", "Built in debug mode", "warn",
+                              "Release apps aren't debuggable. A debuggable app on your phone can be "
+                              "inspected and changed by anything with USB debugging access.",
+                              loc_for(name, "manifest"), "high")
+            if str(man["cleartext"]).lower() == "true":
+                add_indicator("cleartext_allowed", "Allows unencrypted connections", "info",
+                              "The manifest allows plain http:// connections, which can be read or changed "
+                              "by anyone on the network path.", loc_for(name, "manifest"), "high")
+            try:
+                ts = int(man["target_sdk"] or 0)
+            except (TypeError, ValueError):
+                ts = 0
+            if p.get("kind") == "base" and 0 < ts < 28 and not man["nsc"] and man["cleartext"] is None:
+                add_indicator("cleartext_default", "Unencrypted connections allowed by default", "info",
+                              "The app targets an Android version older than 9 (API %d), where plain "
+                              "http:// is allowed unless the app forbids it." % ts, loc_for(name, "manifest"),
+                              "high")
+        # -- code --
+        try:
+            zf = zipfile.ZipFile(path)
+        except (zipfile.BadZipFile, OSError) as e:
+            mark("code", STAGE_PARTIAL, "%s: %s" % (name, e))
+            continue
+        with zf:
+            dex_ok = 0
+            pkgs = set()
+            refs = set()
+            strings_by_dex = {}
+            for dn in chk["dex"]:
+                progress("code", "reading %s / %s" % (name, dn), part=name)
+                try:
+                    d = DEX(read_member_capped(zf, dn, limits["max_uncompressed"]))
+                except Exception as e:
+                    mark("code", STAGE_PARTIAL, "%s/%s couldn't be parsed (%s)" % (name, dn, type(e).__name__))
+                    continue
+                dex_ok += 1
+                strings_by_dex[dn] = [s for s in g(d.get_strings, default=[]) or []]
+                for c in g(d.get_classes, default=[]) or []:
+                    cn = g(c.get_name, default="")
+                    all_classes.append(cn)
+                    dc = _dotted(cn)
+                    if "." in dc:
+                        pkgs.add(dc.rsplit(".", 1)[0])
+                    owner, src = sdk_owner(dc, signatures)
+                    if owner:
+                        h = sdk_hits.setdefault(owner, {"name": owner, "source": src, "classes": 0, "parts": []})
+                        h["classes"] += 1
+                        if name not in h["parts"]:
+                            h["parts"].append(name)
+                    for itf in g(c.get_interfaces, default=[]) or []:
+                        if itf in ("Ljavax/net/ssl/X509TrustManager;", "Ljavax/net/ssl/HostnameVerifier;"):
+                            add_indicator("custom_tls", "Has its own certificate-checking code", "warn",
+                                          "Classes here replace Android's normal check of website certificates. "
+                                          "Done wrong, it accepts any certificate and connections can be "
+                                          "intercepted. This static check can't tell whether it's done right.",
+                                          loc_for(name, "dex", dn, cn), "low")
+                mids = g(d.get_methods_id_item, default=None)
+                for m in (getattr(mids, "method_id_items", None) or []):
+                    try:
+                        refs.add((m.get_class_name(), m.get_name()))
+                    except Exception:
+                        pass
+            if chk["dex"] and dex_ok == 0:
+                mark("code", STAGE_FAILED if len(job["parts"]) == 1 else STAGE_PARTIAL,
+                     "%s: none of its code files could be read" % name)
+            elif chk["dex"]:
+                mark("code", STAGE_DONE)
+            prec["analysed"] = dex_ok == len(chk["dex"])
+            # where each string is used (full mode) or just which file (quick mode)
+            traced = set()
+            if mode == "full" and dex_ok:
+                progress("code", "tracing which code uses each address in %s" % name, part=name)
+                try:
+                    from androguard.misc import AnalyzeAPK
+                    _, _, dx = AnalyzeAPK(path)
+                    for sa_ in dx.get_strings():
+                        v = sa_.get_value()
+                        found = extract_endpoints(v, pkgs)
+                        if not found:
+                            continue
+                        traced.add(v)
+                        xs = list(sa_.get_xref_from())
+                        for e in found:
+                            if not xs:
+                                add_endpoint(e, dict(loc_for(name, "dex", None), method="(not used by any code)"))
+                            for cls_a, meth in xs[:MAX_LOCATIONS]:
+                                add_endpoint(e, loc_for(name, "dex", None, cls_a.name, g(lambda: meth.name)))
+                    for iid, title, sev, wanted, text in API_INDICATORS:
+                        for c, mname in _api_hit(refs, wanted):
+                            for ma in g(dx.find_methods, re.escape(c), re.escape(mname), default=[]) or []:
+                                for xr in list(ma.get_xref_from())[:MAX_LOCATIONS]:
+                                    add_indicator(iid, title, sev, text,
+                                                  loc_for(name, "dex", None, xr[0].name, g(lambda: xr[1].name)))
+                    del dx
+                    gc.collect()
+                except MemoryError:
+                    mark("code", STAGE_PARTIAL, "%s: ran out of memory while tracing - addresses shown without "
+                                                "their code location" % name)
+                    gc.collect()
+                except Exception as e:
+                    mark("code", STAGE_PARTIAL, "%s: tracing failed (%s)" % (name, type(e).__name__))
+            for dn, strs in strings_by_dex.items():
+                for v in strs:
+                    if v in traced:
+                        continue
+                    scan_text(name, "dex", dn, v, pkgs=pkgs)
+                    if v in ("su", "/system/xbin/su", "/system/bin/su", "/sbin/su") or "which su" in v:
+                        add_indicator("root_checks", "Looks for root (su)", "info",
+                                      "The app mentions the su program. Banking and game apps often check for "
+                                      "root to refuse running; other apps ask for root to do more.",
+                                      loc_for(name, "dex", dn), "low")
+            for iid, title, sev, wanted, text in API_INDICATORS:
+                if _api_hit(refs, wanted) and iid not in ind:
+                    add_indicator(iid, title, sev, text, loc_for(name, "dex", ", ".join(chk["dex"])),
+                                  "low" if mode == "quick" else "medium")
+            if ("Ljavax/crypto/Cipher;", "getInstance") in refs and ("Landroid/util/Base64;", "decode") in refs:
+                add_indicator("crypto_strings", "Decodes and decrypts data while running", "info",
+                              "The app both decodes and decrypts data. Usually for normal security, but it's "
+                              "also how some apps hide addresses or settings from analysis like this one - "
+                              "anything hidden that way wasn't seen here.", loc_for(name, "dex"), "low")
+            for label, wanted in NETWORK_APIS:
+                if _api_hit(refs, wanted):
+                    net_apis.setdefault(label, set()).add(name)
+            # -- resources, assets, network security config --
+            progress("resources", "reading resources of %s" % name, part=name)
+            try:
+                if apk is not None:
+                    arsc = g(apk.get_android_resources)
+                    sp = getattr(arsc, "stringpool_main", None) if arsc else None
+                    for i in range(int(getattr(sp, "stringCount", 0) or 0)):
+                        scan_text(name, "resource", "resources.arsc", g(sp.getString, i, default="") or "", pkgs=pkgs)
+                    for fn in [f for f in (g(apk.get_files, default=[]) or []) if f.startswith("res/xml/")]:
+                        raw = read_member_capped(zf, fn, limits["max_asset_file"])
+                        try:
+                            xml = AXMLPrinter(raw).get_xml()
+                            root = ET.fromstring(xml)
+                        except Exception:
+                            continue
+                        if root.tag != "network-security-config":
+                            continue
+                        for el in root.iter():
+                            if el.tag == "domain" and el.text:
+                                add_endpoint({"value": el.text.strip(), "kind": "host", "scheme": "",
+                                              "host": el.text.strip().lower(), "port": None, "constructed": False},
+                                             loc_for(name, "resource", fn))
+                            for k, v in el.attrib.items():
+                                if k.endswith("cleartextTrafficPermitted") and v == "true":
+                                    add_indicator("cleartext_allowed", "Allows unencrypted connections", "info",
+                                                  "The network security settings allow plain http:// "
+                                                  "connections.", loc_for(name, "resource", fn), "high")
+                        for anchors in root.iter("trust-anchors"):
+                            parent_debug = any(anchors in list(d_) for d_ in root.iter("debug-overrides"))
+                            for cert in anchors.iter("certificates"):
+                                src = next((v for k, v in cert.attrib.items() if k.endswith("src")), "")
+                                if src == "user" and not parent_debug:
+                                    add_indicator("user_ca", "Trusts certificates added by the user", "warn",
+                                                  "The app accepts certificates installed by the user. That "
+                                                  "lets anyone who can install one (or trick you into it) "
+                                                  "read the app's encrypted traffic.",
+                                                  loc_for(name, "resource", fn), "high")
+                used = 0
+                for an in chk["assets"]:
+                    if not an.lower().endswith(TEXT_ASSET_EXT):
+                        continue
+                    info = zf.getinfo(an)
+                    if info.file_size > limits["max_asset_file"]:
+                        mark("resources", STAGE_PARTIAL, "%s: %s skipped (too large)" % (name, an))
+                        continue
+                    if used + info.file_size > limits["max_asset_total"]:
+                        mark("resources", STAGE_PARTIAL, "%s: some bundled files skipped (size limit)" % name)
+                        break
+                    used += info.file_size
+                    scan_text(name, "asset", an,
+                              read_member_capped(zf, an, limits["max_asset_file"]).decode("utf-8", "replace"),
+                              pkgs=pkgs)
+                mark("resources", STAGE_DONE)
+            except Exception as e:
+                mark("resources", STAGE_PARTIAL, "%s: %s" % (name, type(e).__name__))
+            # -- native libraries --
+            if chk["native"]:
+                progress("native", "reading native libraries of %s" % name, part=name)
+                total = 0
+                readelf = shutil.which("readelf")
+                if not readelf:
+                    mark("native", STAGE_PARTIAL, "readelf isn't installed: imported functions not listed")
+                for ln_ in chk["native"]:
+                    info = zf.getinfo(ln_)
+                    if info.file_size > limits["max_native_lib"] or total + info.file_size > limits["max_native_total"]:
+                        mark("native", STAGE_PARTIAL, "%s: %s skipped (size limit)" % (name, ln_))
+                        continue
+                    total += info.file_size
+                    try:
+                        blob = read_member_capped(zf, ln_, limits["max_native_lib"])
+                    except ValueError as e:
+                        mark("native", STAGE_PARTIAL, str(e))
+                        continue
+                    for m in re.finditer(rb"[\x20-\x7e]{6,2048}", blob):
+                        s_ = m.group(0).decode("ascii")
+                        if "." in s_ or "://" in s_ or s_.count(":") >= 2:   # ":" pairs: IPv6
+                            scan_text(name, "native", ln_, s_, pkgs=pkgs)
+                    if readelf:
+                        tmp = os.path.join(scratch, "lib%03d.so" % idx)   # never a name from the archive
+                        with open(tmp, "wb") as f:
+                            f.write(blob)
+                        try:
+                            out = subprocess.run([readelf, "--dyn-syms", "-W", tmp], stdout=subprocess.PIPE,
+                                                 stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                                                 timeout=60).stdout.decode("utf-8", "replace")
+                            # columns: Num Value Size Type Bind Vis Ndx Name [(version)]
+                            und = set()
+                            for ln in out.splitlines():
+                                cols = ln.split()
+                                if len(cols) >= 8 and cols[6] == "UND":
+                                    und.add(cols[7].split("@")[0])
+                            net = sorted(und & NATIVE_NET_SYMBOLS)
+                            if net:
+                                add_indicator("native_network", "Native code does its own networking", "info",
+                                              "A native library calls network functions directly (%s). That's "
+                                              "normal for games and media apps, but native code is harder to "
+                                              "inspect - addresses built there may not be visible here."
+                                              % ", ".join(net[:8]), loc_for(name, "native", ln_), "high")
+                                mark("native", STAGE_DONE)
+                        except subprocess.TimeoutExpired:
+                            mark("native", STAGE_PARTIAL, "%s: readelf timed out" % ln_)
+                        finally:
+                            try:
+                                os.remove(tmp)
+                            except OSError:
+                                pass
+                    mark("native", STAGE_DONE)
+        if apk is not None:
+            del apk
+        gc.collect()
+
+    # -- classify --
+    progress("classify", "classifying %d addresses" % len(eps))
+    present = set(sdk_hits)
+    ctx = {"package": package, "signatures": signatures, "sdks_present": present,
+           "bad_hosts": set(job.get("bad_hosts") or [])}
+    for e in eps.values():
+        e.update(classify_endpoint(e, ctx))
+        if e.get("constructed"):
+            e["evidence"].append("the address contains blanks that are filled in while the app runs (%s)"
+                                 % e["value"][:80])
+    res["endpoints"] = sorted(eps.values(), key=lambda e: (
+        {"malicious": 0, "suspicious": 1, "unknown": 2, "expected": 3}[e["classification"]], e["host"]))
+    obf = obfuscation_level(all_classes)
+    if obf > 0.3:
+        res["limitations"].append("%d%% of the code has shortened names (obfuscation): who owns a piece of "
+                                  "code can be missed or wrong" % int(obf * 100))
+        add_indicator("obfuscated", "Code names are scrambled (obfuscation)", "info",
+                      "Most release apps shorten names to save space; it also makes analysis harder. "
+                      "This is a limitation of the analysis, not proof of anything.", conf="medium")
+    if mode == "quick":
+        res["limitations"].append("quick mode: addresses are listed with the code FILE they're in, not the exact "
+                                  "class and method that uses them")
+    res["limitations"].append("only what's written inside the app was analysed: addresses the app downloads, "
+                              "builds or decrypts while running can't be seen this way")
+    res["indicators"] = sorted(ind.values(), key=lambda i: ({"bad": 0, "warn": 1, "info": 2}[i["severity"]],
+                                                           i["title"]))
+    res["sdks"] = sorted(sdk_hits.values(), key=lambda s: s["name"].lower())
+    res["network_apis"] = [{"api": k, "parts": sorted(v)} for k, v in sorted(net_apis.items())]
+    res["obfuscation"] = round(obf, 3)
+    mark("classify", STAGE_DONE)
+    res["stages"] = [dict(s, detail="; ".join(s["detail"])) for s in stage_state.values()]
+    atomic_write_json(job["result"], res, private=True)
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) == 3 and sys.argv[1] == "--inspect-worker":
+        sys.exit(_inspect_worker(sys.argv[2]))
+    sys.stderr.write("security_audit.py is part of ADB Manager - run adb_manager.py\n")
+    sys.exit(2)

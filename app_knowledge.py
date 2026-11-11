@@ -556,9 +556,17 @@ def lookup(package):
         name, risk, what, if_off = entry
         return {"name": name, "risk": risk, "what": what, "if_off": if_off, "exact": True}
     for prefix, risk, what, if_off in PREFIX_RULES:
-        if package == prefix or package.startswith(prefix):
+        if prefix_matches(package, prefix):
             return {"name": None, "risk": risk, "what": what, "if_off": if_off, "exact": False}
     return None
+
+
+def prefix_matches(package, prefix):
+    """Namespace-aware prefix match: 'com.android.networkstack' matches itself and
+    'com.android.networkstack.tethering', but NOT 'com.android.networkstackhelper'.
+    Works the same whether or not the rule is written with a trailing dot."""
+    base = prefix.rstrip(".")
+    return package == base or package.startswith(base + ".")
 
 
 def guess(package, system, from_store=None, hidden=None):

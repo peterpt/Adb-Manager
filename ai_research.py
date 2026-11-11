@@ -16,13 +16,11 @@ Needs the official SDKs:  pip install anthropic openai
 import json
 import os
 import re
-import threading
 import time
 
 CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
                           "adb_manager")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "ai_config.json")
-ROOT_DB_FILE = os.path.join(CONFIG_DIR, "root_research_db.json")
 
 PROVIDERS = {
     "anthropic": {"label": "Anthropic (Claude)", "env": "ANTHROPIC_API_KEY",
@@ -196,7 +194,7 @@ def _ask_anthropic(cfg, system, prompt, timeout):
     max_searches = int((cfg.get("anthropic") or {}).get("max_searches", 5) or 5)
     tools = [{"type": "web_search_20250305", "name": "web_search", "max_uses": max_searches}]
     messages = [{"role": "user", "content": prompt}]
-    usage = {"input_tokens": 0, "output_tokens": 0, "searches": 0}
+    usage = {"input_tokens": 0, "output_tokens": 0, "searches": 0, "urls": []}
     texts = []
     try:
         for _ in range(4):  # long searches can come back as 'pause_turn' - continue them
@@ -208,6 +206,7 @@ def _ask_anthropic(cfg, system, prompt, timeout):
             stu = getattr(u, "server_tool_use", None)
             usage["searches"] += (getattr(stu, "web_search_requests", 0) or 0) if stu else 0
             texts = [b.text for b in resp.content if getattr(b, "type", "") == "text"]
+            usage["urls"] += _anthropic_result_urls(resp.content)
             if resp.stop_reason == "pause_turn":
                 messages.append({"role": "assistant", "content": resp.content})
                 continue
@@ -254,8 +253,50 @@ def _ask_openai(cfg, system, prompt, timeout):
     usage = {"input_tokens": getattr(u, "input_tokens", 0) or 0 if u else 0,
              "output_tokens": getattr(u, "output_tokens", 0) or 0 if u else 0,
              "searches": sum(1 for it in (getattr(resp, "output", None) or [])
-                             if getattr(it, "type", "") == "web_search_call")}
+                             if getattr(it, "type", "") == "web_search_call"),
+             "urls": _openai_result_urls(getattr(resp, "output", None) or [])}
     return getattr(resp, "output_text", "") or "", usage
+
+
+def _anthropic_result_urls(content):
+    """URLs the web search tool actually returned (web_search_tool_result blocks)."""
+    urls = []
+    for b in content or []:
+        if getattr(b, "type", "") == "web_search_tool_result":
+            for r in (getattr(b, "content", None) or []):
+                u = getattr(r, "url", None) if not isinstance(r, dict) else r.get("url")
+                if u:
+                    urls.append(u)
+    return urls
+
+
+def _openai_result_urls(output):
+    """URLs OpenAI's answer cites from its web search (url_citation annotations)."""
+    urls = []
+    for it in output or []:
+        if getattr(it, "type", "") != "message":
+            continue
+        for c in (getattr(it, "content", None) or []):
+            for a in (getattr(c, "annotations", None) or []):
+                kind = getattr(a, "type", None) if not isinstance(a, dict) else a.get("type")
+                u = getattr(a, "url", None) if not isinstance(a, dict) else a.get("url")
+                if kind == "url_citation" and u:
+                    urls.append(u)
+    return urls
+
+
+def _url_norm(u):
+    """Compare URLs safely: scheme and host are case-insensitive, the path and
+    query are NOT (servers can treat /Page and /page differently), and a
+    trailing slash is kept (it can be a different resource)."""
+    import urllib.parse
+    u = (u or "").strip()
+    try:
+        p = urllib.parse.urlsplit(u)
+    except ValueError:
+        return u
+    netloc = p.netloc.lower() if "@" not in p.netloc else p.netloc.split("@", 1)[1].lower()
+    return urllib.parse.urlunsplit((p.scheme.lower(), netloc, p.path, p.query, ""))
 
 
 def _short(e, limit=300):
@@ -483,92 +524,104 @@ def research_rooting(provider, cfg, info, timeout=240):
 
 
 # --------------------------------------------------------------------------
-# rooting research database: one saved AI answer per device model (codename)
+# explaining ONE finding of the APK code inspector (only on an explicit click)
 # --------------------------------------------------------------------------
 
-_root_db_lock = threading.Lock()
-ROOT_INFO_PROPS = ("ro.product.model", "ro.product.manufacturer", "ro.product.brand", "ro.board.platform",
-                   "ro.product.board", "ro.build.version.release", "ro.build.version.sdk",
-                   "ro.mi.os.version.incremental", "ro.build.version.incremental", "ro.build.display.id",
-                   "ro.boot.arb_version")
+FINDING_SYSTEM_PROMPT = """\
+You explain ONE finding from a static (not running) analysis of an Android app to the person who \
+owns the phone. They are not a security expert: use plain words.
+
+You get only that finding's evidence: an address the app's code contains, or a code behaviour, \
+where in the app it was found, and the analyser's own classification and reasons. You do NOT get \
+the app's code. Query strings, credentials and token-like values were removed before sending - \
+"[redacted]" marks where.
+
+Use web search to check facts that matter - who operates a domain or IP address, what an SDK or \
+library is, whether the behaviour is common in apps like this. Keep facts you found separate \
+from your own inference, and say so when something can't be determined. Do not treat a domain \
+as harmless just because it belongs to a big company, and do not call it malicious just \
+because it's unfamiliar. Static analysis can't see what the app actually sends.
+
+Reply with ONLY a JSON object, no other text:
+{
+  "summary": "one or two plain sentences: what this is",
+  "who_runs_it": "who operates the address / which library this code belongs to, or 'unknown'",
+  "assessment": "likely_normal" | "unclear" | "concerning",
+  "why": "the reasons for that assessment, mentioning evidence and uncertainty",
+  "what_to_do": "a practical next step for the phone owner",
+  "sources": [{"title": "...", "url": "https://..."}]
+}"""
 
 
-def root_info_for_db(info):
-    """The part of device_info() needed to ask the AI again later, without the phone."""
-    return {"codename": info.get("codename", ""), "marketname": info.get("marketname", ""),
-            "miui": info.get("miui", ""), "bootloader": info.get("bootloader", ""),
-            "arb": bool(info.get("arb")), "is_xiaomi": bool(info.get("is_xiaomi")),
-            "props": {k: v for k, v in (info.get("props") or {}).items() if k in ROOT_INFO_PROPS}}
+def build_finding_request(ctx):
+    """The user message for one finding. ctx comes from security_audit.finding_context()."""
+    lines = ["App: %s (%s), version code %s" % (ctx.get("app_label") or ctx.get("package"),
+                                                ctx.get("package"), ctx.get("version_code") or "?"),
+             "Analysis mode: %s" % (ctx.get("analysis_mode") or "?"), ""]
+    if ctx.get("kind") == "endpoint":
+        lines += ["Finding: a network address written inside the app",
+                  "Address: %s" % ctx.get("value"),
+                  "Host: %s%s" % (ctx.get("host"), (" port %s" % ctx["port"]) if ctx.get("port") else ""),
+                  "The analyser classified it as: %s (confidence %s)" % (ctx.get("classification"),
+                                                                       ctx.get("confidence")),
+                  "Analyser's evidence: %s" % ("; ".join(ctx.get("evidence") or []) or "none"),
+                  "Issues: %s" % ("; ".join(ctx.get("issues") or []) or "none"),
+                  "Library that owns the code using it: %s" % (ctx.get("owner") or "not identified"),
+                  "Completed at run time: %s" % ("yes" if ctx.get("constructed") else "no")]
+    else:
+        lines += ["Finding: a code behaviour",
+                  "What: %s (severity %s, confidence %s)" % (ctx.get("title"), ctx.get("severity"),
+                                                             ctx.get("confidence")),
+                  "Analyser's explanation: %s" % (ctx.get("detail") or "")]
+    if ctx.get("locations"):
+        lines += ["", "Where it was found:"]
+        for loc in ctx["locations"]:
+            lines.append("- " + ", ".join("%s=%s" % (k, v) for k, v in loc.items()))
+    lines += ["", "Explain this finding as instructed, as JSON only."]
+    return "\n".join(lines)
 
 
-def info_build(info):
-    p = info.get("props") or {}
-    return (p.get("ro.mi.os.version.incremental") or p.get("ro.build.version.incremental")
-            or p.get("ro.build.display.id") or "")
+def normalize_finding(data):
+    if not isinstance(data, dict):
+        raise ValueError("expected a JSON object")
+    def s(k):
+        v = data.get(k)
+        return v.strip() if isinstance(v, str) else ""
+    a = s("assessment").lower()
+    if a not in ("likely_normal", "unclear", "concerning"):
+        a = "unclear"
+    srcs = []
+    for x in data.get("sources") or []:
+        if isinstance(x, dict) and str(x.get("url", "")).startswith(("https://", "http://")):
+            srcs.append({"title": str(x.get("title") or x["url"])[:200], "url": str(x["url"])[:500]})
+    return {"summary": s("summary"), "who_runs_it": s("who_runs_it") or "unknown", "assessment": a,
+            "why": s("why"), "what_to_do": s("what_to_do"), "sources": srcs[:8]}
 
 
-def root_db_load():
-    with _root_db_lock:
+def explain_finding(provider, cfg, ctx, timeout=180):
+    """Ask ONE provider about ONE inspector finding. Never raises."""
+    res = {"provider": provider, "model": model_of(cfg, provider),
+           "when": time.strftime("%Y-%m-%d %H:%M"), "error": "", "raw": "", "usage": {}}
+    try:
+        ask = _ask_anthropic if provider == "anthropic" else _ask_openai
+        text, usage = ask(cfg, FINDING_SYSTEM_PROMPT, build_finding_request(ctx), timeout)
+        res["usage"] = usage
+        res["searches"] = int(usage.get("searches") or 0)
         try:
-            with open(ROOT_DB_FILE, encoding="utf-8") as f:
-                db = json.load(f)
-            return db if isinstance(db, dict) else {}
-        except (OSError, ValueError):
-            return {}
-
-
-def _root_db_save(db):
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    tmp = ROOT_DB_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(db, f, indent=1, ensure_ascii=False)
-    os.replace(tmp, ROOT_DB_FILE)
-
-
-def root_db_get(codename):
-    return root_db_load().get((codename or "").lower())
-
-
-def root_db_put(info, res):
-    """Store a research result for this model. A failed attempt never replaces a good
-    saved answer - it is recorded as last_error instead. Returns the stored entry."""
-    key = (info.get("codename") or "").lower()
-    if not key:
-        return None
-    with _root_db_lock:
-        try:
-            with open(ROOT_DB_FILE, encoding="utf-8") as f:
-                db = json.load(f)
-            if not isinstance(db, dict):
-                db = {}
-        except (OSError, ValueError):
-            db = {}
-        old = db.get(key)
-        if res.get("answer"):
-            entry = {"info": root_info_for_db(info), "result": res,
-                     "updated": time.strftime("%Y-%m-%d %H:%M"), "updated_ts": time.time()}
-        elif isinstance(old, dict) and (old.get("result") or {}).get("answer"):
-            entry = dict(old)
-            entry["last_error"] = res.get("error") or "no answer"
-            entry["last_error_when"] = time.strftime("%Y-%m-%d %H:%M")
-        else:
-            entry = {"info": root_info_for_db(info), "result": res,
-                     "updated": time.strftime("%Y-%m-%d %H:%M"), "updated_ts": time.time()}
-        db[key] = entry
-        _root_db_save(db)
-        return entry
-
-
-def root_db_delete(codenames):
-    with _root_db_lock:
-        try:
-            with open(ROOT_DB_FILE, encoding="utf-8") as f:
-                db = json.load(f)
-        except (OSError, ValueError):
-            return
-        for c in codenames:
-            db.pop((c or "").lower(), None)
-        _root_db_save(db)
+            res["answer"] = normalize_finding(extract_json(text))
+            # provenance only: does a listed source match a page the search tool
+            # really returned? (A match doesn't prove the page supports the claim.)
+            got = {_url_norm(u) for u in usage.get("urls") or []}
+            for src in res["answer"]["sources"]:
+                src["matched"] = _url_norm(src["url"]) in got
+        except ValueError as e:
+            res["error"] = "the AI's reply wasn't valid JSON (%s)" % e
+            res["raw"] = (text or "")[:4000]
+    except AIError as e:
+        res["error"] = str(e)
+    except Exception as e:
+        res["error"] = explain_error(e)
+    return res
 
 
 def research(provider, cfg, app, props, timeout=240):
