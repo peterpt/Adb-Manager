@@ -163,6 +163,8 @@ pip install anthropic openai
 - [Exodus Privacy](https://exodus-privacy.eu.org/): API token
 
 **Code inspector**: Androguard 4.1.4 in its own Python environment (it brings a large set of dependencies, so it's kept away from your system Python). Needs Python 3.9 or newer:
+<img width="1024" height="768" alt="image" src="https://github.com/user-attachments/assets/83bf0625-5360-4358-9537-4268dc7e5975" />
+
 ```
 python3 -m venv ~/.local/share/adb_manager/inspector-venv
 ~/.local/share/adb_manager/inspector-venv/bin/pip install androguard==4.1.4
