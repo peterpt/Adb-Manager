@@ -11,7 +11,8 @@ It works through Android's own debugging bridge (`adb`). **No root is needed**, 
 ## What it does
 
 ### 📁 Files
-<img width="1024" height="768" alt="image" src="https://github.com/user-attachments/assets/88162887-0a0a-44c3-a6be-24aa3d6e83b2" />
+<img width="1024" height="741" alt="image" src="https://github.com/user-attachments/assets/d9130fee-0530-4c77-b840-c7bc3955aa01" />
+
 
 A two-pane file manager: your computer on the left, the device on the right.
 
@@ -21,7 +22,8 @@ A two-pane file manager: your computer on the left, the device on the right.
 - Keys: `F5` copy to the other side · `F7` new folder · `F2` rename · `Del` delete · `Backspace` parent folder · `Ctrl+H` hidden files · `Ctrl+R` refresh
 
 ### 📱 Apps
-<img width="1024" height="768" alt="image" src="https://github.com/user-attachments/assets/e88cf57c-6400-4f6e-ab13-6375bf28bb71" />
+<img width="1024" height="741" alt="image" src="https://github.com/user-attachments/assets/e032b605-7677-4e5b-b7b4-6885e9089684" />
+
 
 Every installed package, grouped (Google / Android / phone maker / apps you installed), with sub-packages nested under their parent. For each app it tells you, in plain words:
 
@@ -54,6 +56,8 @@ Save which apps are turned off, removed for your user and restricted in the back
 Every change the app makes on any phone is written down: when, which phone, which app, what was done, and the outcome in plain words (verified on the phone / done / not confirmed / failed / refused…). The list is read-only and kept in `history.jsonl` (rotated at 4 MB).
 
 #### Permissions (**Permissions…**)
+<img width="950" height="468" alt="image" src="https://github.com/user-attachments/assets/2cdf951b-96ff-45fd-877f-718f991475d5" />
+
 A read-only overview of which apps hold which permissions, for the phone's current Android user, grouped as you know them from Settings (Location, Camera, Microphone, Contacts, SMS, Files…). Android treats three kinds differently, so they're shown apart:
 
 - **Asked at run time** (camera, location…): allowed / not allowed, with Android's flags explained ("fixed by the system", "you chose 'don't ask again'", "granted by Android's default policy"…)
@@ -63,6 +67,8 @@ A read-only overview of which apps hold which permissions, for the phone's curre
 On Android 5 and older, everything is granted at install, and the window says so.
 
 ### 🚀 Autorun
+<img width="1024" height="741" alt="image" src="https://github.com/user-attachments/assets/54492b4c-939c-42ec-80d9-8b7af9dafe97" />
+
 What can start by itself: apps that start when the phone boots, and how each start-up receiver is set (as the app ships it / switched on / switched off). For one app at a time you can:
 
 - **Switch off one start-up receiver**, or put it back exactly as it was
@@ -70,11 +76,13 @@ What can start by itself: apps that start when the phone boots, and how each sta
 - **Turn the whole app off**, or on again
 - optionally use root (`su`) for receivers Android won't let `adb` change
 - **Open shell**: a terminal with `adb shell` on the device
+<img width="1023" height="736" alt="image" src="https://github.com/user-attachments/assets/e9cf5706-7e87-4278-af71-4968aa45c8cc" />
 
 Before any change, the app's original state is saved to disk, and after it the phone is read back, so "done" always means "seen on the phone". If Android refuses a change, you're told why.
 
 ### 🌐 Network
-<img width="1024" height="768" alt="image" src="https://github.com/user-attachments/assets/520e5ee4-0a7f-48ac-93f8-f5e486c4a0d3" />
+<img width="1024" height="741" alt="image" src="https://github.com/user-attachments/assets/4aa65cab-7e6c-4f3b-b575-e627f83c4a8f" />
+
 
 What is happening on the device's network right now, read from Android's own tables (`/proc/net`) and matched to the app that owns each connection. No root needed.
 
@@ -85,7 +93,8 @@ What is happening on the device's network right now, read from Android's own tab
 - UDP is handled correctly: short-lived client sockets (DNS lookups, fast web traffic) are shown as "temporary", not as open ports
 
 ### 🛡️ Security
-<img width="1024" height="768" alt="image" src="https://github.com/user-attachments/assets/ef06221a-8310-49f2-a65c-463048f01e11" />
+<img width="1024" height="741" alt="image" src="https://github.com/user-attachments/assets/ed7970aa-f84c-4f45-b03b-810a713408ab" />
+
 
 A checkup of the things malware depends on, each result explained with what it means and what to do.
 
@@ -106,6 +115,8 @@ A checkup of the things malware depends on, each result explained with what it m
 - **Timeline…**: every saved checkup of the phone, newest first, each compared with the one before it. What a checkup couldn't read is listed with it, so "nothing found" is never mistaken for "nothing changed".
 - **Device info**: model, chip, Android build, A/B slots, dynamic partitions and more
 - **Rooting information**:
+  <img width="950" height="681" alt="image" src="https://github.com/user-attachments/assets/56c4b13e-5f4e-41d4-b744-fb90825c486f" />
+
   - per-device guidance based on what the device itself reports;
   - optional AI research, with a local database of results.
   - It's advice only: the app never roots, unlocks or flashes.
@@ -113,6 +124,8 @@ A checkup of the things malware depends on, each result explained with what it m
 **Honest by design.** If the phone doesn't answer a question, the app says **"Couldn't check …"**. It never turns a failed check into an all-clear. A good result reads "no common signs", never "clean", because some things (like hidden root) can't be ruled out from outside.
 
 #### Known security issues (**Known security issues…**, in Device info)
+<img width="950" height="683" alt="image" src="https://github.com/user-attachments/assets/4c5bd396-b9b5-4d95-ad8e-bff0da36ee3b" />
+
 Information only: which publicly known Android security issues may affect this phone, and which are covered by its security patch.
 
 - **Android security bulletins**: downloaded when you press the button (the official bulletin data, about 10 MB, published through OSV) and matched against the phone's Android version and patch level. Each issue says why: "covered by your patch level", "your patch is older than the fix", "not for your Android version", or "can't be told".
