@@ -11,9 +11,7 @@ It works through Android's own debugging bridge (`adb`). **No root is needed**, 
 ## What it does
 
 ### 📁 Files
-<img width="1024" height="741" alt="image" src="https://github.com/user-attachments/assets/d9130fee-0530-4c77-b840-c7bc3955aa01" />
-
-
+<img width="1024" height="741" alt="image" src="https://github.com/user-attachments/assets/c18a5f57-a59e-4364-980e-a7c48b03aecf" />
 A two-pane file manager: your computer on the left, the device on the right.
 
 - Copy both ways, create folders, rename, delete
