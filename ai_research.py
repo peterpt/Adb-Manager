@@ -59,8 +59,9 @@ def load_config():
             saved = json.load(f)
         if isinstance(saved, dict):
             for k, v in saved.items():
-                if isinstance(v, dict) and isinstance(cfg.get(k), dict):
-                    cfg[k].update(v)
+                if isinstance(cfg.get(k), dict):
+                    if isinstance(v, dict):
+                        cfg[k].update(v)     # a non-dict for a provider section is ignored, never crashes
                 else:
                     cfg[k] = v
     except (OSError, ValueError):
@@ -195,7 +196,7 @@ def _ask_anthropic(cfg, system, prompt, timeout):
     tools = [{"type": "web_search_20250305", "name": "web_search", "max_uses": max_searches}]
     messages = [{"role": "user", "content": prompt}]
     usage = {"input_tokens": 0, "output_tokens": 0, "searches": 0, "urls": []}
-    texts = []
+    texts, stop = [], None
     try:
         for _ in range(4):  # long searches can come back as 'pause_turn' - continue them
             resp = client.messages.create(model=model_of(cfg, "anthropic"), max_tokens=4000,
@@ -207,7 +208,8 @@ def _ask_anthropic(cfg, system, prompt, timeout):
             usage["searches"] += (getattr(stu, "web_search_requests", 0) or 0) if stu else 0
             texts = [b.text for b in resp.content if getattr(b, "type", "") == "text"]
             usage["urls"] += _anthropic_result_urls(resp.content)
-            if resp.stop_reason == "pause_turn":
+            stop = getattr(resp, "stop_reason", None)
+            if stop == "pause_turn":
                 messages.append({"role": "assistant", "content": resp.content})
                 continue
             break
@@ -224,7 +226,21 @@ def _ask_anthropic(cfg, system, prompt, timeout):
         raise AIError("can't reach Anthropic: %s" % explain_error(e))
     except anthropic.APIError as e:
         raise AIError("Anthropic error: %s" % explain_error(e))
-    return "".join(texts), usage
+    usage["stop_reason"] = str(stop or "")
+    text = "".join(texts)
+    if stop == "refusal":
+        raise AIError("the model declined to answer this request (Anthropic's safety rules - this can "
+                      "happen when the subject involves security exploits). Try the other AI provider, "
+                      "or use the official sources.")
+    if stop == "pause_turn":
+        raise AIError("the AI's web search didn't finish in time - try again, or lower 'max searches' "
+                      "in AI settings")
+    if not text.strip():
+        raise AIError("the AI sent back no text (stop reason: %s)" % (stop or "none given"))
+    if stop == "max_tokens" and "}" not in text[text.find("{"):]:
+        raise AIError("the AI's answer was cut off before it was complete (it hit the length limit) - "
+                      "try again")
+    return text, usage
 
 
 def _ask_openai(cfg, system, prompt, timeout):
@@ -255,7 +271,13 @@ def _ask_openai(cfg, system, prompt, timeout):
              "searches": sum(1 for it in (getattr(resp, "output", None) or [])
                              if getattr(it, "type", "") == "web_search_call"),
              "urls": _openai_result_urls(getattr(resp, "output", None) or [])}
-    return getattr(resp, "output_text", "") or "", usage
+    text = getattr(resp, "output_text", "") or ""
+    if not text.strip():
+        status = getattr(resp, "status", None)
+        inc = getattr(getattr(resp, "incomplete_details", None), "reason", None)
+        raise AIError("OpenAI sent back no text (status: %s%s)" % (status or "none given",
+                                                                   ", reason: %s" % inc if inc else ""))
+    return text, usage
 
 
 def _anthropic_result_urls(content):
@@ -377,10 +399,16 @@ def explain_error(e):
 def extract_json(text):
     """Find the JSON object in the AI's reply, tolerating ```json fences or chatter."""
     t = re.sub(r"```(?:json)?", "", text or "").strip()
-    start, end = t.find("{"), t.rfind("}")
-    if start < 0 or end <= start:
-        raise ValueError("no JSON object in the reply")
-    return json.loads(t[start:end + 1])
+    dec, pos, first_err = json.JSONDecoder(), t.find("{"), None
+    while pos >= 0:
+        try:
+            obj, _ = dec.raw_decode(t, pos)
+            if isinstance(obj, dict):
+                return obj
+        except ValueError as e:
+            first_err = first_err or e
+        pos = t.find("{", pos + 1)
+    raise ValueError("no JSON object in the reply" + (" (%s)" % first_err if first_err else ""))
 
 
 def _s(v):

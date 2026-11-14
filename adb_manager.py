@@ -417,7 +417,10 @@ def parse_pm_list(text):
 def pm_list(serial, flags=""):
     rc, out, err = adb_shell(serial, ("pm list packages " + flags).strip(), timeout=120)
     res = parse_pm_list(out)
-    if not res and (rc != 0 or err.strip()):
+    # A real empty list prints nothing. Before Android 7 adb always reports rc=0 and pm
+    # prints its errors ("Unknown option: --user", ...) on stdout, so any output that
+    # isn't a package line means the command failed - never "no such package".
+    if not res and (rc != 0 or err.strip() or out.strip()):
         raise AdbError(last_line(err, out) or "pm list packages failed (rc=%d)" % rc)
     return res
 
@@ -730,8 +733,8 @@ def scan_packages(serial):
         if system is not None:
             is_sys = pkg in system
         else:
-            is_sys = "SYSTEM" in flags.split() or path.startswith(("/system", "/product",
-                                                                   "/vendor", "/apex"))
+            is_sys = "SYSTEM" in flags.split() or path.startswith(("/system/", "/product/", "/vendor/",
+                                                                   "/system_ext/", "/odm/", "/oem/", "/apex/"))
         if pkg in removed:
             is_sys = True if system is None or not path.startswith("/data/") else is_sys
         if disabled is not None:
@@ -860,7 +863,13 @@ def save_apk_copy(serial, pkg, version, dest_root, cancel):
         return False, "the device didn't say where the app's file is"
     tag = re.sub(r"[^A-Za-z0-9._-]+", "_", "%s-%s" % (pkg, version or "unknown"))
     try:
-        os.makedirs(dest_root, exist_ok=True)
+        ours = os.path.abspath(dest_root).startswith(os.path.abspath(BACKUP_DIR) + os.sep)
+        if ours:                                             # the app's own backups: private
+            sa.ensure_dir(BACKUP_DIR, private=True)
+            os.makedirs(dest_root, mode=0o700, exist_ok=True)
+            os.chmod(dest_root, 0o700)                       # also an older, existing folder
+        else:                                                # a folder the user picked: left as it is
+            os.makedirs(dest_root, exist_ok=True)
         if len(remote) == 1:
             dest = os.path.join(dest_root, tag + ".apk")
         else:
@@ -1361,8 +1370,9 @@ def log_action(serial, verb, pkg, ok, msg, outcome=None, user=None, target="", s
     history.append(HISTORY_FILE, history.make_event(serial, verb, pkg, outcome or ("done" if ok else "failed"),
                                                     msg, user=user, target=target, source=source))
     try:
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        with open(ACTIONS_LOG, "a", encoding="utf-8") as f:
+        sa.ensure_dir(CONFIG_DIR, private=True)
+        with open(os.open(ACTIONS_LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600), "a", encoding="utf-8") as f:
+            os.fchmod(f.fileno(), 0o600)                            # also an older, existing log
             f.write("%s  %s  %-8s %s  %s  %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), serial,
                                                     verb, pkg, "OK" if ok else "FAILED", msg))
     except OSError:
@@ -1410,6 +1420,28 @@ def journal_end(op_id):
     """The operation returned (whatever its outcome): it's no longer pending."""
     if op_id and op_id != NOOP:
         pending_store().delete(op_id)
+
+
+def journal_finish(serial, op_id, ok):
+    """End a pending record after a command that has no read-back of its own. A clear
+    success ends it. Otherwise the phone is read back first: if its state can't be read
+    (e.g. the cable came out mid-command), the record stays pending and the next scan
+    settles it. Records with nothing to read back (removed updates) just end.
+    Returns False only when the record was kept."""
+    if not op_id or op_id == NOOP or ok:
+        journal_end(op_id)
+        return True
+    rec = pending_store().get(op_id)
+    if not isinstance(rec, dict) or rec.get("desired") is None:
+        journal_end(op_id)
+        return True
+    if read_op_state(serial, rec) is None:
+        return False
+    journal_end(op_id)
+    return True
+
+
+KEPT_MSG = " - the phone couldn't be read afterwards, so this will be checked on the next scan"
 
 
 def journal_close(op_id, res):
@@ -1608,6 +1640,25 @@ def unpack_bundle(path, abis, workdir):
         z = zipfile.ZipFile(path)
     except zipfile.BadZipFile:
         raise ValueError("not a valid bundle (or an encrypted .apkm - those need APKMirror's own installer)")
+    try:
+        return _unpack_bundle(z, abis, workdir)
+    finally:
+        z.close()
+
+
+PKG_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$")
+
+
+def safe_obb_path(remote):
+    """True only for a plain relative path under Android/obb/ (no '..', no absolute path)."""
+    if not isinstance(remote, str) or "\\" in remote or remote.startswith("/"):
+        return False
+    parts = remote.split("/")
+    return (len(parts) >= 3 and parts[0] == "Android" and parts[1] == "obb"
+            and all(x not in ("", ".", "..") for x in parts))
+
+
+def _unpack_bundle(z, abis, workdir):
     names = z.namelist()
     package = ""
     install_paths = {}
@@ -1644,15 +1695,16 @@ def unpack_bundle(path, abis, workdir):
     for i, n in enumerate(names):
         if n.lower().endswith(".obb"):
             remote = install_paths.get(n, n)
-            if not remote.startswith("Android/obb/"):
-                if not package:
+            if not safe_obb_path(remote):
+                if not package or not PKG_NAME_RE.match(package):
                     continue
-                remote = "Android/obb/%s/%s" % (package, os.path.basename(n))
+                remote = "Android/obb/%s/%s" % (package, posixpath.basename(n.replace("\\", "/")))
+                if not safe_obb_path(remote):
+                    continue
             dest = os.path.join(workdir, "obb%02d_%s" % (i, os.path.basename(n)))
             with z.open(n) as src, open(dest, "wb") as dst:
                 shutil.copyfileobj(src, dst)
             obbs.append((dest, "/sdcard/" + remote))
-    z.close()
     return apks, obbs, package, skipped
 
 
@@ -2384,8 +2436,20 @@ class AppsTab(ttk.Frame):
                   self.install_btn, self.uninstall_btn, self.restore_btn):
             b.state(["disabled"])
         self.stop_btn.pack(side="left", padx=4)
-        threading.Thread(target=fn, args=args, daemon=True).start()
+        self._job_token = token = getattr(self, "_job_token", 0) + 1
+
+        def guarded():
+            try:
+                fn(*args)
+            except Exception as e:                       # a bug or an unexpected error: free the tab
+                self.post(self._job_crashed, token, name, "%s: %s" % (type(e).__name__, e))
+        threading.Thread(target=guarded, daemon=True).start()
         return True
+
+    def _job_crashed(self, token, name, err):
+        if token == getattr(self, "_job_token", None) and self.job:
+            self.end_job()
+        self.app.error("Something went wrong while %s (%s) - the buttons are usable again" % (name, err))
 
     def end_job(self):
         self.job = None
@@ -2583,8 +2647,10 @@ class AppsTab(ttk.Frame):
                     try:
                         parts = read_label_parts(serial, snapshot[p]["path"], work, "a%d" % i, meter)
                         items.append({"id": p, "manifest": parts["manifest"], "arsc": parts["arsc"]})
-                    except (AdbError, sa.LabelError, OSError) as e:
+                    except sa.LabelError as e:          # the APK itself can't be read: remember it
                         fails[p] = {"label": None, "match": None, "error": str(e)[:200]}
+                    except (AdbError, OSError):
+                        pass                             # connection/disk trouble: try again next time
                 if stop.is_set():
                     return named, ""
                 results = dict(fails)
@@ -3123,7 +3189,11 @@ class AppsTab(ttk.Frame):
                 if ok and obbs:
                     for local, remote in obbs:
                         self.post(self.app.info, head + " - copying game data ...")
-                        adb_shell(serial, "mkdir -p " + shlex.quote(posixpath.dirname(remote)))
+                        try:
+                            adb_shell(serial, "mkdir -p " + shlex.quote(posixpath.dirname(remote)))
+                        except AdbError as e:
+                            notes.append("game data copy failed: %s" % e)
+                            break
                         prc, pmsg = adb_transfer([ADB, "-s", serial, "push", local, remote],
                                                  on_pct, self.stop)
                         if prc != 0:
@@ -3222,7 +3292,8 @@ class AppsTab(ttk.Frame):
                 results.append((p, True, ALREADY_MSG))
                 continue
             ok, msg = pm_uninstall(serial, p, mode, opts.get("keep_data", False))
-            journal_end(op)
+            if not journal_finish(serial, op, ok):
+                msg += KEPT_MSG
             log_action(serial, "uninstall-" + mode, p, ok, msg + (note if ok else ""))
             results.append((p, ok, msg + (note if ok else "")))
         self.post(self._uninstall_done, serial, results)
@@ -3273,7 +3344,8 @@ class AppsTab(ttk.Frame):
                 results.append((p, True, ALREADY_MSG))
                 continue
             ok, msg = pm_restore(serial, p)
-            journal_end(op)
+            if not journal_finish(serial, op, ok):
+                msg += KEPT_MSG
             log_action(serial, "restore", p, ok, msg)
             results.append((p, ok, msg))
         self.post(self._restore_done, serial, results)
@@ -3742,7 +3814,8 @@ class AppsTab(ttk.Frame):
                 results.append((p, True, ALREADY_MSG))
                 continue
             ok, msg = pm_set_enabled(serial, p, enable, use_root)
-            journal_end(op)
+            if not journal_finish(serial, op, ok):
+                msg += KEPT_MSG
             log_action(serial, "enable" if enable else "disable", p, ok, msg)
             results.append((p, ok, msg))
         try:
@@ -4196,8 +4269,11 @@ class ProfileWindow(tk.Toplevel):
             if op == NOOP:
                 return "changed", ALREADY_MSG
             ok, msg = pm_uninstall(serial, pkg, "user")
-            journal_end(op)
-            after = profile_removed_state(serial, pkg)
+            after = profile_removed_state(serial, pkg)              # read back BEFORE closing the record
+            if after is None:
+                msg += KEPT_MSG                                      # state unknown: next scan settles it
+            else:
+                journal_end(op)
             log_action(serial, "remove-for-user", pkg, after is True, msg, user=0, source="profile",
                        outcome="verified" if after is True else "unverified" if ok else "failed")
             if after is True:
@@ -4420,6 +4496,12 @@ class PermissionsWindow(tk.Toplevel):
 
     def _work(self, serial, sdk):
         try:
+            if sdk is None:                    # the Apps tab hasn't read it yet: ask the phone
+                try:
+                    rc0, o0, _ = adb_shell(serial, "getprop ro.build.version.sdk", timeout=15)
+                    sdk = int(o0.strip()) if o0.strip().isdigit() else None
+                except AdbError:
+                    sdk = None
             user, src = current_user(serial)
             verified = src in ("detected", "single-user")
             rc, out, err = adb_shell(serial, "dumpsys package packages", timeout=240)
@@ -4796,10 +4878,10 @@ class NetworkTab(ttk.Frame):
     def _worker(self, serial, apps_map, need_map, quiet):
         try:
             socks, errors = read_sockets(serial)
-        except AdbError as e:
+            umap = apps_map if apps_map is not None else (uid_packages(serial) if need_map else None)
+        except Exception as e:                       # AdbError or anything unexpected: never stay busy
             self.app.q.put(("call", self._failed, str(e)))
             return
-        umap = apps_map if apps_map is not None else (uid_packages(serial) if need_map else None)
         self.app.q.put(("call", self._done, serial, socks, errors, umap, quiet))
 
     def _failed(self, msg):
@@ -4929,9 +5011,11 @@ class NetworkTab(ttk.Frame):
         if sig not in self.logged or alert:
             self.logged.add(sig)
             try:
-                os.makedirs(NET_LOG_DIR, exist_ok=True)
+                sa.ensure_dir(NET_LOG_DIR, private=True)
                 fresh = not os.path.exists(self.log_path())
-                with open(self.log_path(), "a", newline="", encoding="utf-8") as f:
+                with open(os.open(self.log_path(), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600),
+                          "a", newline="", encoding="utf-8") as f:
+                    os.fchmod(f.fileno(), 0o600)                    # also an older, existing log
                     wr = csv.writer(f)
                     if fresh:
                         wr.writerow(["time", "app", "packages", "remote_ip", "remote_name", "port",
@@ -5363,6 +5447,12 @@ def current_user(serial):
         ids = set()
     if ids == {0}:
         return 0, "single-user"
+    try:                                     # multi-user arrived in Android 4.2 (SDK 17)
+        rc, out, err = adb_shell(serial, "getprop ro.build.version.sdk", timeout=15)
+        if out.strip().isdigit() and 0 < int(out.strip()) < 17:
+            return 0, "single-user"
+    except AdbError:
+        pass
     return 0, "unverified"
 
 
@@ -5767,7 +5857,10 @@ def find_terminal():
             if path:
                 known = next((t for t in TERMINALS if t[0] == os.path.basename(path)), None)
                 flag, style = (known[1], known[2]) if known else ("-e", "argv")
-                return path, flag, style, words[1:]
+                extra = words[1:]
+                if extra and flag and extra[-1] == flag:
+                    extra = extra[:-1]               # "xterm -e": the flag is added once, by us
+                return path, flag, style, extra
     for name, flag, style in TERMINALS:
         path = _sh.which(name)
         if path:
@@ -5785,6 +5878,24 @@ def shell_command(term, serial):
     if style == "string":
         return [path] + extra + [flag, " ".join(shlex.quote(x) for x in inner)]
     return [path] + extra + ([flag] if flag else []) + inner
+
+
+def safe_open_url(url):
+    """Open a link in the browser only if it's a plain http(s) web address - never file://,
+    custom app handlers or anything else (links can come from AI answers or downloaded data).
+    Returns True if it was handed to the browser."""
+    u = (url or "").strip() if isinstance(url, str) else ""
+    try:
+        parts = urllib.parse.urlsplit(u)
+    except ValueError:
+        return False
+    if parts.scheme.lower() not in ("http", "https") or not parts.netloc or any(c in u for c in "\r\n\t "):
+        return False
+    try:
+        webbrowser.open(u)
+    except Exception:
+        return False
+    return True
 
 
 def manual_shell_hint(serial):
@@ -6107,7 +6218,10 @@ class AutorunTab(ttk.Frame):
         never offers to restore a change that never happened."""
         if self._save_record(key, saved):
             return True
-        self.saved.put(key, previous)        # in-memory rollback (disk may still fail; that's fine)
+        if previous is None:                 # in-memory rollback (disk may still fail; that's fine)
+            self.saved.delete(key)
+        else:
+            self.saved.put(key, previous)
         return False
 
     def _act_run(self, kind, ctx):
@@ -6562,9 +6676,9 @@ class SecurityTab(ttk.Frame):
         if verified and "appops" not in facts["failed"] and facts.get("appops_raw", "").strip():
             sdk = _int_or_none((facts.get("props") or {}).get("sdk")) or _int_or_none(self.app.apps_tab.props.get("sdk"))
             if sdk:                  # unknown Android version: the ops can't be chosen -> unread (None), not empty
-                targets = {p: _int_or_none(a.get("target_sdk")) for p, a in apps.items()}
+                tsdk = {p: _int_or_none(a.get("target_sdk")) for p, a in apps.items()}
                 bg = pf.background_from_appops(facts["appops_raw"], user,
-                                               lambda p: background_ops(sdk, targets.get(p)) if p in targets else None)
+                                               lambda p: background_ops(sdk, tsdk.get(p)) if p in tsdk else None)
         snap = sa.build_snapshot(serial, facts, access, launcher, idcache, prev=prev_snap,
                                  boot=boot if verified else None, bg=bg, user=user if verified else None)
         found += sa.compare_snapshots(prev_snap, snap, label)
@@ -6853,10 +6967,7 @@ class DeviceInfoWindow(tk.Toplevel):
         _ = start
 
     def open_url(self, url):
-        try:
-            webbrowser.open(url)
-        except Exception:
-            pass
+        safe_open_url(url)
 
     def research_rooting(self):
         if self.ai_busy:
@@ -7297,7 +7408,7 @@ class KnownIssuesWindow(tk.Toplevel):
         for i, u in enumerate(links):
             tag = "u%d" % i
             w(u + "\n", ("link", tag))
-            t.tag_bind(tag, "<Button-1>", lambda e, u=u: webbrowser.open(u))
+            t.tag_bind(tag, "<Button-1>", lambda e, u=u: safe_open_url(u))
         t.configure(state="disabled")
 
     # ---- network (only on a click) -------------------------------------------
@@ -7321,7 +7432,10 @@ class KnownIssuesWindow(tk.Toplevel):
         self.set_busy(True)
 
         def work():
-            res = sa.refresh_cve_data(self.stop, lambda m: self.post(self._status, m))
+            try:
+                res = sa.refresh_cve_data(self.stop, lambda m: self.post(self._status, m))
+            except Exception as e:                   # never leave the window stuck busy
+                res = {"ok": False, "message": "unexpected error (%s: %s)" % (type(e).__name__, e)}
             self.post(self._downloaded, res)
         threading.Thread(target=work, daemon=True).start()
 
@@ -7547,7 +7661,9 @@ class RootingDBWindow(tk.Toplevel):
                             "props": {"ro.product.manufacturer": ident.get("maker", ""),
                                       "ro.product.model": ident.get("model", ""),
                                       "ro.board.platform": ident.get("platform", "") or entry.get("soc", ""),
-                                      "ro.product.board": entry.get("chip", ""),
+                                      "ro.product.board": ident.get("board", ""),
+                                      "ro.soc.model": ident.get("soc_model", ""),
+                                      "ro.soc.manufacturer": ident.get("soc_manufacturer", ""),
                                       "ro.miui.region": entry.get("region", ""),
                                       "ro.build.version.release": entry.get("researched_release", ""),
                                       "ro.build.version.sdk": entry.get("researched_sdk", ""),
@@ -9610,10 +9726,11 @@ class App:
              [("Claude Opus 5.5 (Anthropic)", None, " - primary code builder and implementation")]),
             ("Architecture & security review",
              [("ChatGPT, GPT-6 (OpenAI)", None,
-               " - architecture guidance, independent code review and security analysis")]),
+               " - architecture guidance, independent code review and security analysis"),
+              ("Gemini 3.1 Pro (Google)", None, " - second independent code reviewer")]),
             ("Testing",
-             [("Automated test suite", None, " (written by Claude, reviewed by ChatGPT), with results "
-                                             "documented per development round"),
+             [("Automated test suite", None, " (written by Claude, reviewed by ChatGPT and Gemini), with "
+                                             "results documented per development round"),
               ("Real-device testing", None, " - Pedro")]),
         ]
         for title, lines in sections:
@@ -9635,7 +9752,8 @@ class App:
         ttk.Separator(frm).pack(fill="x", pady=12)
         ttk.Label(frm, text="Gemini (Google) was deliberately excluded from package research: "
                   "because Android and most of the inspected packages are Google's own, a Google "
-                  "model would have a structural conflict of interest assessing them.",
+                  "model would have a structural conflict of interest assessing them. Reviewing this "
+                  "app's code doesn't involve judging Google's packages.",
                   foreground="#555555", wraplength=460, justify="left").pack(anchor="w")
         ttk.Label(frm, text="Built through human creativity and collaboration between AI systems. Technology "
                   "is most powerful when used responsibly, transparently and for the benefit of people.",
@@ -9647,7 +9765,7 @@ class App:
 
     def _open_url(self, url):
         try:
-            webbrowser.open(url)
+            safe_open_url(url)
         except Exception:
             pass
 

@@ -3262,6 +3262,7 @@ class AboutWindowTests(unittest.TestCase):
                      "Claude Opus 5.5 (Anthropic)", " - primary code builder and implementation",
                      "ChatGPT, GPT-6 (OpenAI)",
                      " - architecture guidance, independent code review and security analysis",
+                     "Gemini 3.1 Pro (Google)", " - second independent code reviewer",
                      "Automated test suite", "Real-device testing", " - Pedro"):
             self.assertIn(want, texts)
         self.assertTrue(any("Gemini" in t for t in texts))              # the exclusion note stays
@@ -9089,6 +9090,24 @@ class Journal50bTests(JournalBase, ProfileWindowTests):
         self.assertIn("couldn't be read", post.call_args[0][3][0][2])
         self.assertFalse([c for c in ph.log if "pm enable" in c])
 
+    def test_profile_success_without_readback_keeps_the_record(self):
+        ph = self.phone()
+        real = ph.__call__
+        state = {"gone": False}
+
+        def drop_after_uninstall(serial, cmd, timeout=30):
+            if state["gone"] and cmd.startswith("pm list"):
+                raise am.AdbError("device offline")               # cable pulled right after the command
+            r = real(serial, cmd, timeout)
+            if cmd.startswith("pm uninstall"):
+                state["gone"] = True
+            return r
+        with mock.patch.object(am, "adb_shell", side_effect=drop_after_uninstall):
+            out, msg = self.win.apply_one(self.SYS, "removed", self.f)
+        self.assertEqual(out, "unverified")
+        self.assertIn("next scan", msg)
+        self.assertEqual([r["what"] for r in self.on_disk().values()], ["remove-for-user"])
+
     for _n in [n for n in dir(ProfileWindowTests) if n.startswith("test_")]:
         locals()[_n] = None
     del _n
@@ -9098,6 +9117,7 @@ class Journal50bTests(JournalBase, ProfileWindowTests):
 # ==========================================================================
 # Milestone 4 - read-only permission inventory (fixture: REAL Redmi output for VLC)
 # ==========================================================================
+
 
 import perm_inventory as pi   # noqa: E402
 
@@ -9705,6 +9725,511 @@ class TimelineWindowTests(unittest.TestCase):
             w = am.TimelineWindow(self.root, self.app, "EMPTY")
             self.assertIn("No saved checks", w.head.cget("text"))
             w.destroy()
+
+
+
+# ==========================================================================
+# Windows fit ONE monitor (two screens side by side used to count as one)
+# ==========================================================================
+
+XRANDR_TWO = ("Monitors: 2\n 0: +*HDMI-1 1920/531x1080/299+0+0  HDMI-1\n"
+              " 1: +DP-1 1280/338x1024/270+1920+0  DP-1\n")
+
+
+class MonitorTests(unittest.TestCase):
+    def test_parse_xrandr(self):
+        self.assertEqual(am.parse_xrandr_monitors(XRANDR_TWO), [(0, 0, 1920, 1080), (1920, 0, 1280, 1024)])
+        self.assertEqual(am.parse_xrandr_monitors(" 0: +*eDP-1 1366/309x768/174+0-200  eDP-1"), [(0, -200, 1366, 768)])
+        self.assertEqual(am.parse_xrandr_monitors("garbage\n"), [])
+
+    def test_pick_monitor(self):
+        mons = am.parse_xrandr_monitors(XRANDR_TWO)
+        self.assertEqual(am.pick_monitor(mons, 100, 100, 3200, 1080), (0, 0, 1920, 1080))
+        self.assertEqual(am.pick_monitor(mons, 2500, 500, 3200, 1080), (1920, 0, 1280, 1024))
+        self.assertEqual(am.pick_monitor(mons, 2500, 1060, 3200, 1080), (1920, 0, 1280, 1024))   # nearest
+        # no list: a 3840x1080 'screen' is two 1920 monitors, never one huge one
+        self.assertEqual(am.pick_monitor([], 2500, 10, 3840, 1080), (1920, 0, 1920, 1080))
+        self.assertEqual(am.pick_monitor([], 10, 10, 1920, 1080), (0, 0, 1920, 1080))
+
+    def test_fit_rect_stays_on_the_monitor(self):
+        w, h, x, y, mw, mh = am.fit_rect(5000, 3000, (1920, 0, 1280, 1024), anchor=(3100, 900))
+        self.assertEqual((w, h), (int(1280 * 0.92), int(1024 * 0.88)))
+        self.assertTrue(1920 <= x and x + w <= 3200 and 0 <= y and y + h <= 1024)
+        w, h, x, y, mw, mh = am.fit_rect(600, 400, (0, 0, 1920, 1080), anchor=(960, 540))
+        self.assertEqual((w, h), (600, 400))                       # small windows keep their size
+
+
+@unittest.skipUnless(os.environ.get("DISPLAY"), "needs a display (run under xvfb-run)")
+class WindowFitTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.root = tk.Tk()
+        cls.root.geometry("800x600+0+0")
+        args = mock.Mock(serial=None, local=TMP_HOME, remote="/sdcard")
+        with mock.patch.object(am.App, "scan_devices", lambda self, *a, **k: None):
+            cls.app = am.App(cls.root, args)
+
+    @classmethod
+    def tearDownClass(cls):
+        destroy_root(cls.root)
+
+    def settle(self, win):
+        for _ in range(30):
+            self.root.update()
+            time.sleep(0.01)
+
+    def test_a_window_with_long_text_never_exceeds_the_monitor(self):
+        # Pedro's real setup: two 1024x768 monitors side by side; the app on the left one
+        with mock.patch.object(am, "_MONITORS", [(0, 0, 1024, 768), (1024, 0, 1024, 768)]):
+            win = tk.Toplevel(self.root)
+            win.minsize(3000, 2000)                                  # even a silly minimum can't push it out
+            ttk.Label(win, text="word " * 400).pack(fill="x")
+            self.settle(win)
+            self.assertTrue(win._fitted)
+            self.assertLessEqual(win.winfo_width(), int(1024 * 0.92))
+            self.assertLessEqual(win.winfo_height(), int(768 * 0.88))
+            self.assertLessEqual(win.winfo_x() + win.winfo_width(), 1024)       # stays on the left screen
+            self.assertEqual(int(win.maxsize()[0]), 1024)                       # can't be stretched past it
+            self.assertLessEqual(int(win.minsize()[0]), int(1024 * 0.92))
+            win.destroy()
+
+    def test_known_issues_window_fits(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        with mock.patch.object(am, "_MONITORS", [(0, 0, 1024, 700)]), \
+                mock.patch.object(sa, "CVE_DATA_FILE", os.path.join(tmp, "cve.json")), \
+                mock.patch.object(sa, "CIRCL_CACHE_FILE", os.path.join(tmp, "circl.json")):
+            w = am.KnownIssuesWindow(self.root, {"props": dict(REDMI)}, self.app)
+            self.settle(w)
+            self.assertLessEqual(w.winfo_width(), int(1024 * 0.92))
+            self.assertLessEqual(w.winfo_x() + w.winfo_width(), 1024)
+            w.destroy()
+
+    def test_monitor_listing_failure_falls_back_safely(self):
+        with mock.patch.object(am, "_MONITORS", None), \
+                mock.patch.object(am.subprocess, "run", side_effect=OSError("no xrandr")):
+            self.assertEqual(am.list_monitors(), [])
+        am._MONITORS = None
+
+
+# ---- round 54: independent (Gemini) review fixes ------------------------------------
+
+class PmListOldAdbTests(unittest.TestCase):
+    """Before Android 7 adb always says rc=0 and pm prints errors on stdout."""
+    def test_error_on_stdout_is_a_failure_not_an_empty_list(self):
+        with mock.patch.object(am, "adb_shell", return_value=(0, "Unknown option: --user\n", "")):
+            with self.assertRaises(am.AdbError):
+                am.pm_list("S", "--user 0 com.a")
+            self.assertIsNone(am.profile_removed_state("S", "com.a"))      # can't tell, never "removed"
+
+    def test_really_empty_list_is_empty(self):
+        with mock.patch.object(am, "adb_shell", return_value=(0, "", "")):
+            self.assertEqual(am.pm_list("S", "--user 0 com.a"), {})
+
+
+class JournalFinishTests(JournalBase, unittest.TestCase):
+    def test_success_ends_the_record(self):
+        op = am.journal_begin("S", 0, "com.a", "app-off", "on", "off", source="apps")
+        self.assertTrue(am.journal_finish("S", op, True))
+        self.assertEqual(self.on_disk(), {})
+
+    def test_failure_with_unreadable_phone_keeps_the_record(self):
+        op = am.journal_begin("S", 0, "com.a", "app-off", "on", "off", source="apps")
+        with mock.patch.object(am, "read_op_state", return_value=None):
+            self.assertFalse(am.journal_finish("S", op, False))           # e.g. cable pulled mid-command
+        self.assertIn(op, self.on_disk())                                  # next scan settles it
+
+    def test_failure_with_readable_phone_ends_the_record(self):
+        op = am.journal_begin("S", 0, "com.a", "app-off", "on", "off", source="apps")
+        with mock.patch.object(am, "read_op_state", return_value="on"):
+            self.assertTrue(am.journal_finish("S", op, False))
+        self.assertEqual(self.on_disk(), {})
+
+    def test_nothing_to_read_back_just_ends(self):
+        op = am.journal_begin("S", 0, "com.a", "uninstall-updates", None, None, source="apps")
+        with mock.patch.object(am, "read_op_state", return_value=None):
+            self.assertTrue(am.journal_finish("S", op, False))
+        self.assertEqual(self.on_disk(), {})
+
+
+class JobGuardTests(unittest.TestCase):
+    """An unexpected error in an Apps-tab job must free the buttons again."""
+    def fake_tab(self):
+        class F:
+            pass
+        f = F()
+        f.job, f.stop, f.app, f.stop_btn = None, threading.Event(), mock.MagicMock(), mock.MagicMock()
+        for b in ("scan_btn", "off_btn", "on_btn", "undo_btn", "look_btn", "lookall_btn", "ask_btn",
+                  "compare_btn", "install_btn", "uninstall_btn", "restore_btn"):
+            setattr(f, b, mock.MagicMock())
+        f.posted = []
+        f.post = lambda fn, *a: f.posted.append((fn, a))
+        f.end_job = mock.MagicMock(side_effect=lambda: setattr(f, "job", None))
+        f._job_crashed = lambda *a: am.AppsTab._job_crashed(f, *a)
+        return f
+
+    def run_job(self, f, fn):
+        self.assertTrue(am.AppsTab.start_job(f, "testing", fn))
+        for _ in range(200):
+            if f.posted:
+                break
+            time.sleep(0.01)
+
+    def test_crash_frees_the_tab(self):
+        f = self.fake_tab()
+
+        def boom():
+            raise RuntimeError("unexpected")
+        self.run_job(f, boom)
+        self.assertEqual(len(f.posted), 1)
+        fn, args = f.posted[0]
+        fn(*args)
+        f.end_job.assert_called_once()
+        self.assertIn("unexpected", f.app.error.call_args[0][0])
+
+    def test_old_crash_report_doesnt_end_a_newer_job(self):
+        f = self.fake_tab()
+        self.run_job(f, lambda: (_ for _ in ()).throw(ValueError("x")))
+        fn, args = f.posted[0]
+        f.job, f._job_token = "a newer job", f._job_token + 1                # a new job started meanwhile
+        fn(*args)
+        f.end_job.assert_not_called()
+
+
+class BundleObbPathTests(unittest.TestCase):
+    def make(self, install_path, package="com.game"):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        p = os.path.join(d, "g.xapk")
+        with _zipfile.ZipFile(p, "w") as z:
+            z.writestr("manifest.json", json.dumps({"package_name": package, "expansions": [
+                {"file": "main.obb", "install_path": install_path}]}))
+            z.writestr("com.game.apk", b"apk")
+            z.writestr("main.obb", b"obb")
+        return p, d
+
+    def remotes(self, install_path, package="com.game"):
+        p, d = self.make(install_path, package)
+        work = os.path.join(d, "w")
+        os.mkdir(work)
+        return [r for _, r in am.unpack_bundle(p, ["arm64-v8a"], work)[1]]
+
+    def test_normal_path_kept(self):
+        self.assertEqual(self.remotes("Android/obb/com.game/main.obb"), ["/sdcard/Android/obb/com.game/main.obb"])
+
+    def test_escape_attempt_is_put_back_in_the_game_folder(self):
+        self.assertEqual(self.remotes("Android/obb/../../DCIM/evil.obb"), ["/sdcard/Android/obb/com.game/main.obb"])
+        self.assertEqual(self.remotes("/sdcard/Download/evil.obb"), ["/sdcard/Android/obb/com.game/main.obb"])
+
+    def test_bad_package_name_means_no_game_data(self):
+        self.assertEqual(self.remotes("Android/obb/../x.obb", package="../../DCIM"), [])
+
+    def test_safe_obb_path(self):
+        self.assertTrue(am.safe_obb_path("Android/obb/com.a/main.1.com.a.obb"))
+        for bad in ("Android/obb/../x", "Android/obb//x", "/Android/obb/a/b", "Android/obb/a/./b", "Android/data/a/b",
+                    "Android/obb/a\\..\\b", "Android/obb"):
+            self.assertFalse(am.safe_obb_path(bad), bad)
+
+
+class AutorunRollbackTests(unittest.TestCase):
+    def test_no_previous_record_is_removed_not_saved_as_null(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+
+        class F:
+            pass
+        f = F()
+        f.saved = am.JsonStore(os.path.join(d, "autorun_saved.json"))
+        f.saved.put("other", {"x": 1})
+        f.saved.put("k", {"new": 1})                       # what the failed save had put in memory
+        f._save_record = lambda key, saved: False
+        self.assertFalse(am.AutorunTab._persist_before_change(f, "k", {"new": 1}, None))
+        self.assertNotIn("k", f.saved.keys())
+        self.assertNotIn("k", json.loads(read(f.saved.path)))   # never "k": null on disk
+
+
+class TerminalFlagTests(unittest.TestCase):
+    def test_flag_inside_terminal_variable_is_not_doubled(self):
+        with mock.patch.dict(os.environ, {"TERMINAL": "xterm -e"}), \
+                mock.patch("shutil.which", side_effect=lambda n: "/usr/bin/" + n if n == "xterm" else None):
+            t = am.find_terminal()
+        self.assertEqual(t, ("/usr/bin/xterm", "-e", "argv", []))
+        self.assertEqual(am.shell_command(t, "SER").count("-e"), 1)
+
+
+class OldAndroidUserTests(unittest.TestCase):
+    def answers(self, sdk):
+        def sh(serial, cmd, timeout=None):
+            if cmd.startswith("getprop"):
+                return 0, sdk + "\n", ""
+            return 0, "Error: unknown command\n", ""        # no am get-current-user / pm list users
+        return sh
+
+    def test_before_multi_user_the_user_is_certain(self):
+        with mock.patch.object(am, "adb_shell", side_effect=self.answers("15")):
+            self.assertEqual(am.current_user("S"), (0, "single-user"))
+
+    def test_newer_android_still_unverified(self):
+        with mock.patch.object(am, "adb_shell", side_effect=self.answers("19")):
+            self.assertEqual(am.current_user("S"), (0, "unverified"))
+
+
+class PrivateLogTests(unittest.TestCase):
+    def test_actions_log_is_private(self):
+        try:
+            os.remove(am.ACTIONS_LOG)
+        except OSError:
+            pass
+        am.log_action("S", "test", "com.a", True, "ok")
+        self.assertEqual(mode(am.ACTIONS_LOG), 0o600)
+        self.assertEqual(mode(am.CONFIG_DIR), 0o700)
+
+
+class AccessUnknownAppTests(unittest.TestCase):
+    def test_app_missing_from_the_list_is_not_called_a_system_app(self):
+        facts = facts_from()
+        f = [x for x in sa.check_access(facts, {"accessibility": ["com.ghost"]}, set(), None)
+             if x.get("pkg") == "com.ghost"]
+        self.assertEqual(len(f), 1)
+        self.assertEqual(f[0]["level"], sa.WARN)
+        self.assertNotIn("It's a system app", f[0]["detail"])
+        self.assertIn("couldn't be checked", f[0]["detail"])
+
+
+class SnapshotFirstAccessReadTests(unittest.TestCase):
+    def test_first_check_with_unreadable_access_doesnt_alarm_later(self):
+        acc = {"overlay": [], "usage": [], "install": []}
+        s1 = sa.build_snapshot("S", snapfacts(failed={"appops": "timeout"}), acc, None, {})
+        self.assertNotIn("overlay", s1["access"])                       # unknown, not "nobody has it"
+        s2 = sa.build_snapshot("S", snapfacts(), {"overlay": ["com.user.a"], "usage": [], "install": []},
+                               None, {}, prev=s1)
+        self.assertEqual([f for f in sa.compare_snapshots(s1, s2, None) if f["key"].startswith("changes:access")], [])
+        s3 = sa.build_snapshot("S", snapfacts(), {"overlay": ["com.user.a", "com.sys.b"], "usage": [], "install": []},
+                               None, {}, prev=s2)
+        self.assertEqual([f["key"] for f in sa.compare_snapshots(s2, s3, None) if f["key"].startswith("changes:access")],
+                         ["changes:access:overlay:com.sys.b"])            # real changes still reported
+
+
+def make_axml_two_labels():
+    """<application tools:label="Wrong" android:label="Right">, no resource map (name lookup)."""
+    strings = ["label", "application", "manifest", "Wrong", "Right", "http://schemas.android.com/tools",
+               "http://schemas.android.com/apk/res/android"]
+    sp = _pool(strings)
+
+    def elem(name_idx, attrs):
+        ext = _st.pack("<IIHHHHHH", 0xFFFFFFFF, name_idx, 20, 20, len(attrs), 0, 0, 0)
+        body = _st.pack("<II", 1, 0xFFFFFFFF) + ext + b"".join(attrs)
+        return _st.pack("<HHI", 0x0102, 16, 8 + len(body)) + body
+    attrs = [_st.pack("<IIIHBBI", 5, 0, 3, 8, 0, 0x03, 3),     # tools:label="Wrong"
+             _st.pack("<IIIHBBI", 6, 0, 4, 8, 0, 0x03, 4)]     # android:label="Right"
+    body = sp + elem(2, []) + elem(1, attrs)
+    return _st.pack("<HHI", 0x0003, 8, 8 + len(body)) + body
+
+
+class LabelNamespaceTests(unittest.TestCase):
+    def test_only_androids_label_counts(self):
+        self.assertEqual(sa.axml_app_label(make_axml_two_labels()), ("literal", "Right"))
+
+
+class RootingDbDamagedTests(unittest.TestCase):
+    def test_unreadable_db_is_kept_before_it_can_be_overwritten(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "rooting_db.json")
+        with open(path, "w") as f:
+            f.write('{"schema": 2, "entries": {"a|b": {"x": 1}')         # cut off
+        with mock.patch.object(sa, "ROOTING_DB_FILE", path):
+            self.assertEqual(sa.load_rooting_db(), {})
+        kept = [n for n in os.listdir(d) if n.startswith("rooting_db.json.damaged-")]
+        self.assertEqual(len(kept), 1)
+        self.assertIn('"a|b"', read(os.path.join(d, kept[0])))
+        self.assertEqual(mode(os.path.join(d, kept[0])), 0o600)
+
+
+
+class SafeLinkTests(unittest.TestCase):
+    def test_only_web_links_open(self):
+        with mock.patch.object(am.webbrowser, "open") as op:
+            self.assertTrue(am.safe_open_url("https://source.android.com/security/bulletin"))
+            for bad in ("file:///etc/passwd", "javascript:alert(1)", "intent://x#Intent;end", "smb://host/x",
+                        "https://", "http://a b", None, 5, ""):
+                self.assertFalse(am.safe_open_url(bad), bad)
+        self.assertEqual(op.call_count, 1)
+
+
+class ChipFamilySunTests(unittest.TestCase):
+    def test_allwinner_is_not_qualcomm(self):
+        self.assertEqual(cv.chip_family({"ro.board.platform": "sun50iw9"}), "other")
+        self.assertEqual(cv.chip_family({"ro.board.platform": "sun8i"}), "other")
+
+    def test_qualcomm_sun_platform_still_qualcomm(self):
+        self.assertEqual(cv.chip_family({"ro.board.platform": "sun"}), "qualcomm")
+
+
+class CveVersionsDamagedTests(unittest.TestCase):
+    def test_wrong_type_versions_marked_damaged(self):
+        rec = {"id": "A-1", "aliases": ["CVE-2024-0001"], "affected": [
+            {"package": {"ecosystem": "Android", "name": ":linux_kernel:"}, "versions": 15}]}
+        self.assertIn("versions", cv.compact_record(rec)["damaged"])
+        rec["affected"][0]["versions"] = ["15"]
+        self.assertNotIn("versions", cv.compact_record(rec)["damaged"])
+
+
+class AiConfigRobustTests(unittest.TestCase):
+    def test_non_dict_provider_section_ignored(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        p = os.path.join(d, "ai_config.json")
+        with open(p, "w") as f:
+            json.dump({"anthropic": "bad", "openai": 5}, f)
+        with mock.patch.object(ai, "CONFIG_FILE", p):
+            cfg = ai.load_config()
+        self.assertIsInstance(cfg["anthropic"], dict)
+        ai.api_key(cfg, "anthropic")                                   # no crash
+
+    def test_json_found_despite_braces_in_chatter(self):
+        self.assertEqual(ai.extract_json('Here {is} my answer: {"a": 1} hope it helps }'), {"a": 1})
+        with self.assertRaises(ValueError):
+            ai.extract_json("no json {here")
+
+
+class CryptoUnreadTests(unittest.TestCase):
+    def test_unreadable_encryption_is_reported(self):
+        facts = snapfacts(failed={"prop:crypto": "timeout"})
+        facts["props"]["crypto"] = ""
+        f = [x for x in sa.check_device(facts) if x["key"] == "crypto"]
+        self.assertEqual(len(f), 1)
+        self.assertIn("Couldn't check", f[0]["title"])
+
+
+
+class Gemini54cTests(unittest.TestCase):
+    def test_damaged_versions_never_covered_by_patch(self):
+        raw = json.loads(json.dumps(OSV_FIXTURE["kernel"]))
+        raw["affected"][0]["versions"] = 5
+        r = cv.compact_record(raw)
+        f = cv.assess_record(r, cv.device_facts(dev_props(spl="2027-01-01")), None, SUPPORT)
+        self.assertEqual(f["state"], cv.UNKNOWN)
+
+    def test_unknown_app_gets_no_installer_or_icon_claims(self):
+        facts = facts_from()
+        f = [x for x in sa.check_access(facts, {"accessibility": ["com.ghost"]}, set(), None)
+             if x.get("pkg") == "com.ghost"][0]
+        self.assertNotIn("Also:", f["detail"])
+
+    def damaged_copies(self, d):
+        return [n for n in os.listdir(d) if ".damaged-" in n]
+
+    def test_non_object_rooting_db_is_kept_once(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "rooting_db.json")
+        with open(path, "w") as f:
+            f.write("[1, 2]")                                        # valid JSON, wrong shape
+        with mock.patch.object(sa, "ROOTING_DB_FILE", path):
+            sa.load_rooting_db()
+            with mock.patch.object(sa.time, "strftime", return_value="20990101-000000"):
+                sa.load_rooting_db()                                 # later, same damage: no 2nd copy
+        self.assertEqual(len(self.damaged_copies(d)), 1)
+        with open(path, "w") as f:
+            f.write("{}")
+        with mock.patch.object(sa, "ROOTING_DB_FILE", path):
+            sa.load_rooting_db()                                     # readable and empty: nothing kept
+        self.assertEqual(len(self.damaged_copies(d)), 1)
+
+    def test_apk_copy_never_changes_a_folder_the_user_picked(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        os.chmod(d, 0o755)                                           # e.g. ~/Downloads
+        with mock.patch.object(am, "pm_paths", return_value=["/data/app/x/base.apk"]), \
+                mock.patch.object(am, "adb_transfer", return_value=(0, "")):
+            am.save_apk_copy("S", "com.a", "1", d, threading.Event())
+        self.assertEqual(mode(d), 0o755)
+
+    def test_unreadable_damaged_entry_doesnt_stop_the_check(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "rooting_db.json")
+        with open(path, "w") as f:
+            f.write("[1]")
+        os.mkdir(path + ".damaged-00000000-000000")                  # an entry that can't be read
+        with open(path + ".damaged-00000000-000001", "w") as f:
+            f.write("[1]")                                           # the same damage, already kept
+        order = ["rooting_db.json", "rooting_db.json.damaged-00000000-000000", "rooting_db.json.damaged-00000000-000001"]
+        with mock.patch.object(sa, "ROOTING_DB_FILE", path), \
+                mock.patch.object(sa.os, "listdir", return_value=order):    # unreadable one listed first
+            sa.load_rooting_db()
+        self.assertEqual(len(self.damaged_copies(d)), 2)             # nothing new
+
+    def test_existing_public_actions_log_made_private(self):
+        sa.ensure_dir(am.CONFIG_DIR, private=True)
+        with open(am.ACTIONS_LOG, "a"):
+            pass
+        os.chmod(am.ACTIONS_LOG, 0o644)
+        am.log_action("S", "test", "com.a", True, "ok")
+        self.assertEqual(mode(am.ACTIONS_LOG), 0o600)
+
+
+
+class AnthropicEmptyReplyTests(unittest.TestCase):
+    """Why a reply had no usable text must be said, not shown as 'no JSON'."""
+    def fake(self, *responses):
+        import types
+        mod = types.ModuleType("anthropic")
+        for n in ("AuthenticationError", "PermissionDeniedError", "NotFoundError", "RateLimitError",
+                  "APIConnectionError", "APIError"):
+            setattr(mod, n, type(n, (Exception,), {}))
+        seq = list(responses)
+
+        class Client:
+            def __init__(self, **kw):
+                self.messages = types.SimpleNamespace(create=lambda **kw: seq.pop(0))
+        mod.Anthropic = Client
+        return mock.patch.dict(sys.modules, {"anthropic": mod})
+
+    def resp(self, stop, *texts):
+        import types
+        blocks = [types.SimpleNamespace(type="text", text=t) for t in texts]
+        return types.SimpleNamespace(stop_reason=stop, content=blocks,
+                                     usage=types.SimpleNamespace(input_tokens=1, output_tokens=1,
+                                                                 server_tool_use=None))
+
+    def ask(self, *responses):
+        cfg = {"anthropic": {"api_key": "k", "model": "m"}}
+        with self.fake(*responses):
+            return ai._ask_anthropic(cfg, "sys", "prompt", 10)
+
+    def test_refusal_is_named(self):
+        with self.assertRaises(ai.AIError) as c:
+            self.ask(self.resp("refusal"))
+        self.assertIn("declined", str(c.exception))
+
+    def test_empty_reply_gives_the_stop_reason(self):
+        with self.assertRaises(ai.AIError) as c:
+            self.ask(self.resp("end_turn"))
+        self.assertIn("no text (stop reason: end_turn)", str(c.exception))
+
+    def test_unfinished_search_is_named(self):
+        with self.assertRaises(ai.AIError) as c:
+            self.ask(*[self.resp("pause_turn", "searching...") for _ in range(4)])
+        self.assertIn("didn't finish", str(c.exception))
+
+    def test_cut_off_answer_is_named(self):
+        with self.assertRaises(ai.AIError) as c:
+            self.ask(self.resp("max_tokens", 'Here: {"a": 1, "b": '))
+        self.assertIn("cut off", str(c.exception))
+
+    def test_normal_answer_passes(self):
+        text, usage = self.ask(self.resp("pause_turn", "x"), self.resp("end_turn", '{"a": 1}'))
+        self.assertEqual(text, '{"a": 1}')
+        self.assertEqual(usage["stop_reason"], "end_turn")
+
+    def test_rooting_research_shows_the_reason(self):
+        with self.fake(self.resp("refusal")):
+            res = ai.research_rooting("anthropic", {"anthropic": {"api_key": "k", "model": "m"}},
+                                      {"props": {}, "codename": "serenity"})
+        self.assertIn("declined", res["error"])
+        self.assertNotIn("JSON", res["error"])
 
 
 if __name__ == "__main__":

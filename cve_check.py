@@ -108,6 +108,8 @@ def compact_record(rec):
         if pkg.get("ecosystem") != "Android":
             continue
         es = aff.get("ecosystem_specific") if isinstance(aff.get("ecosystem_specific"), dict) else {}
+        if "versions" in aff and not isinstance(aff["versions"], list) and "versions" not in damaged:
+            damaged.append("versions")
         affected.append({"pkg": str(pkg.get("name", ""))[:120], "labels": _strs(aff.get("versions")),
                          "spl": _entry_spl(aff), "severity": str(es.get("severity", ""))[:20],
                          "types": _strs(es.get("types"), 8, 20)})
@@ -140,8 +142,12 @@ def chip_family(props):
                                                          "ro.soc.model")).lower()
     tokens = [t for t in re.split(r"[^a-z0-9]+", text) if t]
     # every recognised signal counts - the maker property doesn't overrule the platform
-    qc = bool(maker) and maker.startswith(_QCOM_MAKERS) or any(t.startswith(_QCOM_PREFIX) for t in tokens)
-    other = bool(maker) and maker.startswith(_NOT_QCOM_MAKERS) or any(t.startswith(_NOT_QCOM_PREFIX) for t in tokens)
+    # Qualcomm's 'sun' platform is the exact word; Allwinner uses sun8i, sun50iw9 ... (= not Qualcomm)
+    allwinner = any(re.match(r"^sun\d", t) for t in tokens)
+    qc = bool(maker) and maker.startswith(_QCOM_MAKERS) or any(
+        t.startswith(_QCOM_PREFIX) and not (t.startswith("sun") and t != "sun") for t in tokens)
+    other_tok = allwinner or any(t.startswith(_NOT_QCOM_PREFIX) for t in tokens)
+    other = bool(maker) and maker.startswith(_NOT_QCOM_MAKERS) or other_tok
     if qc != other:
         return "qualcomm" if qc else "other"
     return None                                               # nothing recognised, or signals disagree
@@ -281,7 +287,7 @@ def assess_record(rec, dev, kev=None, support=None):
                             "chip/vendor part with no maker named in the data; your patch %s is older than "
                             "the fix (%s), but whether it applies to your phone can't be told", COVERED_WHY)
         parts.append((st, why, e["spl"], "low", None))
-    if "affected" in damaged:      # part of the record is unreadable: whatever was read can't clear it
+    if "affected" in damaged or "versions" in damaged:   # part unreadable: whatever was read can't clear it
         parts.append((UNKNOWN, "part of the bulletin data for this issue was damaged, so it can't be assessed",
                       None, "low", None))
     if not parts:

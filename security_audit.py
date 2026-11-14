@@ -878,6 +878,11 @@ def check_device(facts):
                            "Anyone who gets the device can read its data by connecting it to a computer.",
                            "Settings > Security > Encrypt tablet/phone (needs a screen lock, takes about "
                            "an hour, keep it charging).", "ro.crypto.state=unencrypted", key="crypto"))
+    elif unread(facts, "prop:crypto"):
+        out.append(finding("device", INFO, "Couldn't check storage encryption",
+                           "The device didn't answer this question, so it isn't known whether its storage "
+                           "is encrypted.", "Run the checkup again.",
+                           "getprop ro.crypto.state failed: %s" % facts["failed"]["prop:crypto"], key="crypto"))
     # SELinux
     se = facts["selinux"]
     if se.lower() == "enforcing":
@@ -1023,15 +1028,18 @@ def check_access(facts, access, launcher, labeler):
         name, what, how = ACCESS_INFO[cat]
         for p in pkgs:
             a = apps.get(p, {})
-            system = a.get("system", True if not a else False)
+            unknown = not a                          # not in the app list: unknown, never assumed system
+            system = bool(a.get("system", False))
             inst_text, inst_kind = installer_text(a.get("installer", ""))
-            hidden = (not system) and launcher is not None and p not in launcher
+            hidden = (not system) and not unknown and launcher is not None and p not in launcher
             flags = []
-            if not system and inst_kind != "store":
+            if not system and not unknown and inst_kind != "store":
                 flags.append(inst_text)
             if hidden:
                 flags.append("it has no icon in the app drawer")
-            if system:
+            if unknown:
+                level = WARN
+            elif system:
                 level = INFO
             elif flags and cat in ("accessibility", "admin", "notifications", "sms", "overlay"):
                 level = BAD
@@ -1042,7 +1050,10 @@ def check_access(facts, access, launcher, labeler):
             detail = what
             if flags:
                 detail += "\n\nAlso: " + "; ".join(flags) + "."
-            if system:
+            if unknown:
+                detail += ("\n\nThis app wasn't in the app list read from the phone (for example it belongs "
+                           "to another user or work profile), so whether it's a system app couldn't be checked.")
+            elif system:
                 detail += "\n\nIt's a system app, which is normal for this kind of access."
             out.append(finding("access", level, "%s: %s" % (name, label_of(apps, labeler, p)), detail,
                                how, "category=%s package=%s installer=%s" % (cat, p, a.get("installer", "-")),
@@ -1350,9 +1361,11 @@ def build_snapshot(serial, facts, access, launcher, identities, prev=None, boot=
     device["unverified"] = dev_unverified
     acc, acc_unverified = {}, []
     for k, v in access.items():
-        if unread(facts, *ACCESS_SOURCES.get(k, ())) and k in pacc:
-            acc[k] = list(pacc[k])
-            acc_unverified.append(k)
+        if unread(facts, *ACCESS_SOURCES.get(k, ())):
+            if k in pacc:
+                acc[k] = list(pacc[k])
+                acc_unverified.append(k)
+            # else: never read and nothing known before -> left out (unknown), never saved as "none"
         else:
             acc[k] = sorted(v)
     # start at boot (from the checkup's boot detection) and background restriction (per
@@ -1488,6 +1501,8 @@ def compare_snapshots(prev, cur, labeler):
         out.append(finding("changes", INFO, "%d app(s) updated since %s" % (len(updated), when),
                            "\n".join("\u2022 " + u for u in updated[:60]), key="changes:updated"))
     for cat, (name, _, how) in ACCESS_INFO.items():
+        if cat not in prev.get("access", {}):
+            continue                                 # no baseline for this kind of access: nothing to compare
         before = set(prev.get("access", {}).get(cat, []))
         for p in sorted(set(cur.get("access", {}).get(cat, [])) - before):
             sysapp = ca.get(p, {}).get("sys", False)
@@ -1596,7 +1611,7 @@ def certs_from_signing_block(path):
             return []
         block_size = struct.unpack_from("<Q", footer, 0)[0]
         start = cd_offset - block_size - 8
-        if start < 0:
+        if start < 0 or block_size < 24:           # forged size: never read "the rest of the file"
             return []
         f.seek(start + 8)
         pairs = f.read(block_size - 24)
@@ -2475,6 +2490,41 @@ def _backup_once():
         pass
 
 
+def _keep_damaged(path):
+    """A saved file exists but can't be read as JSON: copy it aside once (0600) so the
+    next save can't silently destroy it. Best effort."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return                                       # can't even read it: nothing to copy
+    try:
+        if not data.strip() or isinstance(json.loads(data.decode("utf-8")), dict):
+            return                                   # empty, or a readable object: nothing to keep
+    except (ValueError, UnicodeDecodeError):
+        pass                                         # not JSON / not a JSON object: keep a copy
+    folder, base = os.path.split(path)
+    try:
+        names = os.listdir(folder or ".")
+    except OSError:
+        names = []
+    for n in names:                                  # the same damaged content is kept only once
+        if n.startswith(base + ".damaged-"):
+            try:
+                with open(os.path.join(folder, n), "rb") as f:
+                    if f.read() == data:
+                        return
+            except OSError:
+                continue                             # unreadable entry: check the others
+    try:
+        dest = "%s.damaged-%s" % (path, time.strftime("%Y%m%d-%H%M%S"))
+        fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+    except OSError:
+        pass
+
+
 def load_rooting_db():
     """Return the entries map {key: entry}, migrating older formats once.
 
@@ -2486,6 +2536,8 @@ def load_rooting_db():
         one-time 0600 .bak of the pre-migration file is left beside it."""
     _rooting_db_future[0] = False
     raw = load_json(ROOTING_DB_FILE, {})
+    if not raw and os.path.exists(ROOTING_DB_FILE):
+        _keep_damaged(ROOTING_DB_FILE)               # unreadable: keep a copy before anything overwrites it
     if not isinstance(raw, dict) or not raw:
         return {}
     schema = raw.get("schema")
@@ -4061,6 +4113,7 @@ LABEL_MAX_ARSC_OUT = 24 << 20    # inflated resources.arsc
 LABEL_MAX_LEN = 200              # longest label kept
 LABEL_MATCHES = ("literal", "exact", "language", "default", "other")
 ANDROID_LABEL_ATTR = 0x01010001  # android:label
+ANDROID_NS_URI = "http://schemas.android.com/apk/res/android"
 
 
 class LabelError(ValueError):
@@ -4230,12 +4283,12 @@ def axml_app_label(b, max_chunks=200000):
                     raise LabelError("bad attributes")
                 for k in range(acount):
                     a = ext + astart + k * asize
-                    an, raw = _u32(b, a + 4), _u32(b, a + 8)
+                    ns, an, raw = _u32(b, a), _u32(b, a + 4), _u32(b, a + 8)
                     dtype, data = b[a + 15], _u32(b, a + 16)
                     is_label = (an < len(resmap) and resmap[an] == ANDROID_LABEL_ATTR)
-                    if not is_label and an != 0xFFFFFFFF:
-                        try:
-                            is_label = strings(an) == "label"
+                    if not is_label and an != 0xFFFFFFFF and ns != 0xFFFFFFFF and not (an < len(resmap) and resmap[an]):
+                        try:                         # by name only for android:label (not tools:/app:label)
+                            is_label = strings(an) == "label" and strings(ns) == ANDROID_NS_URI
                         except LabelError:
                             is_label = False
                     if not is_label:
