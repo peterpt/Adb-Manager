@@ -94,7 +94,11 @@ from tkinter import filedialog, font as tkfont, messagebox, simpledialog, ttk
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import app_knowledge as kb  # noqa: E402
-import ai_research as ai  # noqa: E402
+import ai_research as ai
+import profiles as pf
+import cve_check as cv
+import history
+import perm_inventory as pi  # noqa: E402
 import security_audit as sa  # noqa: E402
 
 ADB = os.environ.get("ADB") or shutil.which("adb") or "adb"
@@ -496,6 +500,136 @@ def device_props(serial):
         except AdbError:
             props[key] = ""
     return props
+
+
+# ---- app names from the phone (see security_audit "App names") ----------------
+
+APK_PATH_RE = re.compile(r"^/[A-Za-z0-9._/~+=,@-]+\.apk$")
+LABELS_FILE_NAME = "app_labels.json"
+
+
+class ShortReadError(AdbError):
+    """A read that returned fewer bytes than asked; .received says how many arrived."""
+
+    def __init__(self, msg, received):
+        AdbError.__init__(self, msg)
+        self.received = received
+
+
+def remote_read(serial, path, offset, length, timeout=30):
+    """Read exactly [offset, offset+length) of a file on the device with dd over
+    exec-out (binary-safe). The path must look like an APK path - it's never
+    interpolated unquoted, and odd paths are refused outright. A short read raises
+    AdbError: callers never work on partial data."""
+    if not APK_PATH_RE.match(path or ""):
+        raise AdbError("refusing unusual path %r" % (path or "")[:80])
+    if offset < 0 or length <= 0:
+        return b""
+    bs = 4096
+    first, last = offset // bs, (offset + length + bs - 1) // bs
+    cmd = "dd if=%s bs=%d skip=%d count=%d 2>/dev/null" % (shlex.quote(path), bs, first, last - first)
+    try:
+        p = subprocess.run([ADB, "-s", serial, "exec-out", cmd], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, timeout=timeout)
+    except FileNotFoundError:
+        raise AdbError("adb not found")
+    except subprocess.TimeoutExpired:
+        raise AdbError("reading %s timed out" % path)
+    if p.returncode != 0:
+        raise AdbError("couldn't read %s" % path)
+    start = offset - first * bs
+    data = p.stdout[start:start + length]
+    if len(data) != length:
+        # count only bytes that belong to the requested range - dd's block-aligned
+        # output can include bytes before the offset and after the range
+        raise ShortReadError("short read from %s (%d of %d bytes)" % (path, len(data), length), len(data))
+    return data
+
+
+def remote_size(serial, path):
+    if not APK_PATH_RE.match(path or ""):
+        raise AdbError("refusing unusual path")
+    rc, out, err = adb_shell(serial, "stat -c %s " + shlex.quote(path), timeout=15)
+    if rc != 0 or not out.strip().isdigit():
+        raise AdbError("couldn't get the size of %s" % path)
+    return int(out.strip())
+
+
+def read_label_parts(serial, path, workdir, tag, meter=None):
+    """Copy ONLY the manifest and (if usable) resources.arsc of one base.apk into
+    `workdir`, using exact byte ranges - never the whole APK. Every byte read is
+    added to meter["used"] as it arrives, so failed apps count toward the budget
+    too. Returns {"manifest": {...}, "arsc": {...}|None}. Raises AdbError or
+    sa.LabelError (unusable APK layout)."""
+    meter = meter if meter is not None else {"used": 0}
+
+    def rd(off, n):
+        try:
+            data = remote_read(serial, path, off, n)
+        except ShortReadError as e:
+            meter["used"] += e.received              # what did arrive still counts
+            raise
+        meter["used"] += len(data)
+        return data
+    size = remote_size(serial, path)
+    tail_len = min(size, 65535 + 22)
+    tail = rd(size - tail_len, tail_len)
+    cd_off, cd_size, count = sa.zip_find_cd(tail, size)
+    entries = sa.zip_find_entries(rd(cd_off, cd_size), cd_off, count)
+    if "AndroidManifest.xml" not in entries:
+        raise sa.LabelError("no manifest")
+    out = {"manifest": None, "arsc": None}
+    for name, key, cap in (("AndroidManifest.xml", "manifest", sa.LABEL_MAX_MANIFEST),
+                           ("resources.arsc", "arsc", sa.LABEL_MAX_ARSC)):
+        if name not in entries:
+            continue
+        method, csize, usize, lho = entries[name]
+        if csize > cap:
+            if key == "manifest":
+                raise sa.LabelError("manifest too large")
+            continue                                      # oversized table: fall back
+        lh = rd(lho, min(30 + 1024, cd_off - lho))
+        start = sa.zip_data_offset(lh, lho, name, csize, cd_off)
+        data = rd(start, csize) if csize else b""
+        fp = os.path.join(workdir, "%s.%s" % (tag, key))
+        with open(fp, "wb") as f:
+            f.write(data)
+        out[key] = {"path": fp, "method": method, "size": usize}
+    return out
+
+
+def label_budget_mb(cfg):
+    """app_labels_max_mb parsed safely and clamped to 1..2048 (default 200)."""
+    try:
+        v = int(float(cfg.get("app_labels_max_mb", 200)))
+    except (TypeError, ValueError, OverflowError):
+        v = 200
+    return max(1, min(2048, v))
+
+
+def device_locale(serial):
+    """{"lang", "region", "script"} of the device UI, best effort ({} if unknown)."""
+    for prop in ("persist.sys.locale", "ro.product.locale"):
+        try:
+            rc, out, err = adb_shell(serial, "getprop " + prop, timeout=15)
+        except AdbError:
+            continue
+        v = out.strip()
+        if v:
+            parts = re.split(r"[-_]", v)
+            loc = {"lang": parts[0].lower(), "region": "", "script": ""}
+            for x in parts[1:]:
+                if len(x) == 4 and x.isalpha():
+                    loc["script"] = x.title()
+                elif len(x) in (2, 3):
+                    loc["region"] = x.upper()
+            return loc
+    try:
+        lang = adb_shell(serial, "getprop persist.sys.language", timeout=15)[1].strip()
+        country = adb_shell(serial, "getprop persist.sys.country", timeout=15)[1].strip()
+    except AdbError:
+        return {}
+    return {"lang": lang.lower(), "region": country.upper(), "script": ""} if lang else {}
 
 
 def pkg_from_component(text):
@@ -938,9 +1072,12 @@ def lookup_online(pkg, use_web=True):
 CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
                           "adb_manager")
 CACHE_FILE = os.path.join(CONFIG_DIR, "app_info_cache.json")
+LABELS_FILE = os.path.join(CONFIG_DIR, LABELS_FILE_NAME)
 TURNED_OFF_FILE = os.path.join(CONFIG_DIR, "turned_off.json")
 BACKUP_DIR = os.path.join(CONFIG_DIR, "apk_backups")
 ACTIONS_LOG = os.path.join(CONFIG_DIR, "actions.log")
+HISTORY_FILE = os.path.join(CONFIG_DIR, "history.jsonl")
+PENDING_FILE = os.path.join(CONFIG_DIR, "pending_ops.json")
 AI_CACHE_FILE = os.path.join(CONFIG_DIR, "ai_research.json")
 
 
@@ -1157,6 +1294,8 @@ class JsonStore:
     def _apply(data, op):
         if op[0] == "put":
             data[op[1]] = copy.deepcopy(op[2])
+        elif op[0] == "del":
+            data.pop(op[1], None)
         else:
             _, key, fn, default = op
             data[key] = copy.deepcopy(fn(copy.deepcopy(data.get(key, default))))
@@ -1165,6 +1304,14 @@ class JsonStore:
         """Replace one key and save. Returns True only if it is safely on disk."""
         with self.lock:
             op = ("put", key, copy.deepcopy(value))
+            self._apply(self.data, op)
+            self._pending.append(op)
+            return self._save()
+
+    def delete(self, key):
+        """Remove one key and save. Returns True only if it is safely on disk."""
+        with self.lock:
+            op = ("del", key)
             self._apply(self.data, op)
             self._pending.append(op)
             return self._save()
@@ -1208,7 +1355,11 @@ class JsonStore:
                     pass
 
 
-def log_action(serial, verb, pkg, ok, msg):
+def log_action(serial, verb, pkg, ok, msg, outcome=None, user=None, target="", source="apps"):
+    """Record one change: in the append-only history (what the History window shows)
+    and, as before, one line in actions.log. Never raises."""
+    history.append(HISTORY_FILE, history.make_event(serial, verb, pkg, outcome or ("done" if ok else "failed"),
+                                                    msg, user=user, target=target, source=source))
     try:
         os.makedirs(CONFIG_DIR, exist_ok=True)
         with open(ACTIONS_LOG, "a", encoding="utf-8") as f:
@@ -1216,6 +1367,153 @@ def log_action(serial, verb, pkg, ok, msg):
                                                     verb, pkg, "OK" if ok else "FAILED", msg))
     except OSError:
         pass
+
+
+# --------------------------------------------------------------------------
+# Pending-operation journal: every phone change is recorded BEFORE it's sent and
+# cleared after it returns. A record left behind (crash, timeout, error) is later
+# settled ONLY by reading the phone - never by sending the command again and never
+# by undoing anything - and only for the same phone and Android user.
+# --------------------------------------------------------------------------
+
+_pending_stores = {}
+_pending_lock = threading.Lock()
+NOOP = "noop"
+
+
+def pending_store():
+    with _pending_lock:
+        st = _pending_stores.get(PENDING_FILE)
+        if st is None:
+            st = _pending_stores[PENDING_FILE] = JsonStore(PENDING_FILE)
+        return st
+
+
+def journal_begin(serial, user, pkg, what, original, desired, target="", source=""):
+    """Record an operation as pending. Returns its id, NOOP when the phone already has
+    the desired state (nothing worth recording), or False when the record couldn't be
+    saved - then the caller must NOT change the phone."""
+    if original is not None and original == desired:
+        return NOOP
+    op_id = "%d-%d-%s" % (time.time_ns(), os.getpid(), threading.get_ident())
+    rec = {"serial": str(serial), "user": user if isinstance(user, int) else None, "pkg": pkg, "what": what,
+           "target": target or "", "original": original, "desired": desired, "source": source,
+           "started": time.strftime("%Y-%m-%d %H:%M:%S")}
+    st = pending_store()
+    if st.put(op_id, rec):
+        return op_id
+    st.delete(op_id)                       # roll back the unsaved record (it must never appear later)
+    return False
+
+
+def journal_end(op_id):
+    """The operation returned (whatever its outcome): it's no longer pending."""
+    if op_id and op_id != NOOP:
+        pending_store().delete(op_id)
+
+
+def journal_close(op_id, res):
+    """Close an operation whose result came with a read-back: only when the outcome is
+    actually known (verified / refused / unsupported, or the phone's state could be read
+    afterwards). If the connection dropped and nothing could be read, it stays pending
+    and is settled by read-back on the next scan."""
+    obs = [res.get(k) for k in ("state", "pkg_state") if k in res]
+    rb = res.get("readback")
+    if isinstance(rb, dict):
+        obs += list(rb.values())
+    unknown = not obs or any(v in (None, "UNKNOWN") for v in obs)
+    if res.get("outcome") in ("verified", "refused", "unsupported") or not unknown:
+        journal_end(op_id)
+    return res
+
+
+ALREADY_MSG = "already in that state - nothing was sent"
+
+
+def journal_refusal(what):
+    return {"outcome": "failed", "message": "the record of this change couldn't be saved to disk first, so "
+                                            "nothing was changed on the phone (%s)" % what}
+
+
+def pending_for(serial):
+    st = pending_store()
+    return {k: v for k, v in ((k, st.get(k)) for k in st.keys()) if isinstance(v, dict) and v.get("serial") == serial}
+
+
+def read_op_state(serial, rec):
+    """The phone's CURRENT state for what a pending record changed, or None."""
+    what, pkg, user = rec.get("what"), rec.get("pkg", ""), rec.get("user")
+    if not isinstance(user, int) or isinstance(user, bool):
+        return None                                     # unknown user: never assumed to be user 0
+    try:
+        if what in ("app-off", "app-on"):
+            ps = (receiver_states(serial, user, {pkg}).get(pkg) or {}).get("pkg_state")
+            return "off" if ps in (2, 3, 4) else "on" if ps in (0, 1) else None
+        if what in ("remove-for-user", "restore"):
+            st = profile_removed_state(serial, pkg)
+            return None if st is None else ("removed" if st else "installed")
+        if what == "uninstall-full":
+            # the INSTALLED list for that user - '-u' also lists packages that are gone but still known
+            return "installed" if pkg in set(pm_list(serial, "--user %d %s" % (user, shlex.quote(pkg)))) else "absent"
+        if what in ("receiver-off", "receiver-back"):
+            st = receiver_states(serial, user, {pkg}).get(pkg)
+            word = receiver_state_word(rec.get("target", ""), st)
+            return None if word == "UNKNOWN" else word
+        if what in ("bg-restrict", "bg-allow"):
+            want = rec.get("desired") if isinstance(rec.get("desired"), dict) else {}
+            return read_background_modes(serial, appops_prefix(serial), pkg, user, sorted(want)) if want else None
+    except (AdbError, OSError, ValueError):
+        return None
+    return None                                         # e.g. 'removed updates': can't be read back
+
+
+def settle(rec, observed):
+    """Read-back-only resolution of one pending record."""
+    if observed is not None and observed == rec.get("desired"):
+        return "verified"
+    if observed is not None and observed == rec.get("original"):
+        return "not_applied"
+    return "uncertain"
+
+
+def reconcile_pending(serial, user, user_verified):
+    """Settle this phone's leftover records by reading it. Returns [(rec, outcome)], where
+    outcome is verified / not_applied / uncertain / user_unverified (the phone's current
+    user couldn't be established) / unknown_user (the record has no user) / other_user.
+    Only records for the verified, matching user are read; the rest stay untouched until
+    the user decides."""
+    out = []
+    for op_id, rec in sorted(pending_for(serial).items()):
+        ru = rec.get("user")
+        if not user_verified:
+            out.append((dict(rec, id=op_id), "user_unverified"))
+            continue
+        if not isinstance(ru, int) or isinstance(ru, bool):
+            out.append((dict(rec, id=op_id), "unknown_user"))
+            continue
+        if ru != user:
+            out.append((dict(rec, id=op_id), "other_user"))
+            continue
+        outcome = settle(rec, read_op_state(serial, rec))
+        if outcome != "uncertain":
+            log_action(serial, rec.get("what"), rec.get("pkg"), outcome == "verified",
+                       "found after an interruption (started %s)" % rec.get("started", "?"),
+                       outcome=outcome, user=rec.get("user"), target=rec.get("target", ""), source="recovery")
+            journal_end(op_id)
+        out.append((dict(rec, id=op_id), outcome))
+    return out
+
+
+def forget_pending(op_ids):
+    """The user decided: these uncertain records are logged as uncertain and dropped."""
+    st = pending_store()
+    for op_id in op_ids:
+        rec = st.get(op_id)
+        if isinstance(rec, dict):
+            log_action(rec.get("serial"), rec.get("what"), rec.get("pkg"), False,
+                       "couldn't be confirmed after an interruption; dismissed by the user",
+                       outcome="uncertain", user=rec.get("user"), target=rec.get("target", ""), source="recovery")
+        st.delete(op_id)
 
 
 # --------------------------------------------------------------------------
@@ -1784,6 +2082,31 @@ SHOW_CHOICES = ["All apps", "Only ON", "Only OFF", "Only removed", "Only Google"
                 "Only installed by me", "Not looked up yet", "No built-in notes",
                 "Checked by AI", "AIs disagree"]
 
+def source_check_note(answer):
+    """(text, tag) said once above an AI answer's sources, or None."""
+    sc = answer.get("source_check") if isinstance(answer, dict) else None
+    if not isinstance(sc, dict):
+        return ("Older answer: it wasn't recorded which sources came from a real web search.\n", "dim")
+    if not sc.get("searches"):
+        return ("No web search was done for this answer: it's based on the AI's own knowledge, which "
+                "may be out of date, and its sources may be written from memory.\n", "warn")
+    return None
+
+
+def source_mark(answer, url):
+    """Short note after one source address: where it came from, if that was recorded."""
+    sc = answer.get("source_check") if isinstance(answer, dict) else None
+    if isinstance(sc, dict) and not sc.get("searches"):
+        return ""                 # no search was done: the warning above says so; nothing to attribute
+    urls = sc.get("urls") if isinstance(sc, dict) and isinstance(sc.get("urls"), dict) else None
+    hit = urls.get(url) if urls is not None else None
+    if hit is True:
+        return "  (found by the AI's web search - shows where it came from, not that it backs the answer)"
+    if hit is False:
+        return "  (NOT among the pages the AI's search returned - may be from memory)"
+    return ""                                      # not recorded (or damaged): say nothing
+
+
 AI_VERDICT_TEXT = {"safe": "\u2705 safe to turn off", "careful": "\u26a0 be careful",
                    "keep_on": "\u26d4 keep it on", "unknown": "? doesn't know"}
 AI_VERDICT_TAG = {"safe": "safe", "careful": "caution", "keep_on": "critical", "unknown": "dim"}
@@ -1804,8 +2127,13 @@ class AppsTab(ttk.Frame):
         self.cache = JsonStore(CACHE_FILE)
         self.turned_off = JsonStore(TURNED_OFF_FILE)
         self.ai_cache = JsonStore(AI_CACHE_FILE)
+        self.labels = JsonStore(LABELS_FILE)       # real app names read from the phone
+        self.label_gen = 0                         # bumps on every device change / rescan
+        self.label_stop = threading.Event()
+        self.label_locale = {}
+        self.read_names = tk.BooleanVar(value=bool(sa.load_sec_config().get("app_labels_enabled", True)))
         self._store_warned = set()   # stores whose save failure we already showed
-        self.after(800, self._report_store_problems)
+        # (store problems are reported by App once every tab - Autorun included - exists)
         self.job = None              # name of the running background job
         self.stop = threading.Event()
         self.fetching = set()        # packages being looked up right now
@@ -1833,6 +2161,12 @@ class AppsTab(ttk.Frame):
         self.restore_btn.pack(side="left", padx=4)
         self.inspect_btn = ttk.Button(top, text="Inspect code\u2026", command=self.inspect_selected)
         self.inspect_btn.pack(side="left", padx=4)
+        self.profile_btn = ttk.Button(top, text="Profiles\u2026", command=self.open_profiles)
+        self.profile_btn.pack(side="left")
+        self.history_btn = ttk.Button(top, text="History\u2026", command=self.open_history)
+        self.history_btn.pack(side="left", padx=4)
+        self.perms_btn = ttk.Button(top, text="Permissions\u2026", command=self.open_permissions)
+        self.perms_btn.pack(side="left")
         self._inspect_wins = {}
         ttk.Label(top, text="  Search:").pack(side="left")
         ent = ttk.Entry(top, textvariable=self.search_var, width=20)
@@ -1938,6 +2272,8 @@ class AppsTab(ttk.Frame):
         row2.pack(fill="x", pady=(4, 0))
         ttk.Checkbutton(row2, text="Search the web when an app isn't on Google Play",
                         variable=self.use_web).pack(side="left")
+        ttk.Checkbutton(row2, text="Read app names from the phone", variable=self.read_names,
+                        command=self._read_names_toggled).pack(side="left", padx=(8, 0))
         ttk.Checkbutton(row2, text="Use root (su) if the device refuses",
                         variable=self.use_root).pack(side="left", padx=12)
         ttk.Checkbutton(row2, text="Show technical details", variable=self.show_tech,
@@ -1950,6 +2286,7 @@ class AppsTab(ttk.Frame):
     def set_device(self, serial):
         if serial == self.serial:
             return
+        self.stop_label_reader()             # results for the old device are dropped
         self.serial = serial
         self.apps, self.parent_of, self.kids = {}, {}, {}
         self.scanned_serial = None
@@ -1963,6 +2300,78 @@ class AppsTab(ttk.Frame):
             self.scan()
 
     # ---- background jobs -------------------------------------------------
+
+    # ---- unfinished operations (read-back only) ----------------------------
+
+    def _reconcile_work(self, serial):
+        try:
+            user, src = current_user(serial)
+            res = reconcile_pending(serial, user, src in ("detected", "single-user"))
+        except Exception as e:                       # never let this break a scan
+            res = [({"what": "?", "pkg": "?"}, "error: %s" % e)]
+        self.post(self._reconciled, serial, res)
+
+    def _reconciled(self, serial, results):
+        if not results:
+            return
+        # an Apps-tab OFF confirmed only now still belongs in the 'turn back ON' list
+        offs = tuple(r["pkg"] for r, o in results if o == "verified" and r.get("what") == "app-off"
+                     and r.get("source") == "apps")
+        if offs:
+            stamp = time.strftime("%Y-%m-%d %H:%M")
+
+            def add(mine, offs=offs, stamp=stamp):
+                mine = mine if isinstance(mine, dict) else {}
+                for p in offs:
+                    mine[p] = stamp
+                return mine
+            self._store_saved(self.turned_off, self.turned_off.update(serial, add, {}),
+                              "the list of apps this program turned off (used for Undo)")
+        words = {"verified": "it did happen", "not_applied": "it didn't happen",
+                 "uncertain": "couldn't be confirmed",
+                 "other_user": "belongs to another Android user - left alone",
+                 "unknown_user": "it isn't known which Android user it was for - left alone",
+                 "user_unverified": "this phone's current Android user couldn't be established - left alone"}
+        lines = ["\u2022 %s - %s: %s" % (self.label(r.get("pkg", "?")) if r.get("pkg") in self.apps else r.get("pkg"),
+                                          HISTORY_WHAT.get(r.get("what"), r.get("what")), words.get(o, o))
+                 for r, o in results]
+        unsure = [r["id"] for r, o in results if o in ("uncertain", "unknown_user") and r.get("id")]
+        text = ("The last time, %d change(s) on this phone were interrupted before the app could finish. "
+                "The phone was only READ to see what happened - nothing was sent again or undone:\n\n%s"
+                % (len(results), "\n".join(lines[:20])))
+        if unsure:
+            if messagebox.askyesno("Interrupted changes", text + "\n\n%d couldn't be confirmed. Check those apps "
+                                   "yourself. Forget them now?\n(No = ask again next time)" % len(unsure),
+                                   parent=self.app.root):
+                forget_pending(unsure)
+        else:
+            messagebox.showinfo("Interrupted changes", text, parent=self.app.root)
+        # no re-scan: the scan that triggered this has just read the phone's real state
+
+    def open_permissions(self):
+        if not self.serial:
+            self.app.error("No device connected - pick one at the top")
+            return
+        win = getattr(self, "_perm_win", None)
+        if win is not None and win.winfo_exists():
+            win.lift()
+            return
+        self._perm_win = PermissionsWindow(self.app.root, self.app)
+
+    def open_history(self):
+        win = getattr(self, "_history_win", None)
+        if win is not None and win.winfo_exists():
+            win.refresh()
+            win.lift()
+            return
+        self._history_win = HistoryWindow(self.app.root, self.app)
+
+    def open_profiles(self):
+        win = getattr(self, "_profile_win", None)
+        if win is not None and win.winfo_exists():
+            win.lift()
+            return
+        self._profile_win = ProfileWindow(self.app.root, self.app)
 
     def start_job(self, name, fn, *args):
         if self.job:
@@ -2019,7 +2428,13 @@ class AppsTab(ttk.Frame):
         self.scanned_serial = serial
         self.build_family()
         self.populate()
+        self.start_label_reader()            # names fill in afterwards; the list is already shown
+        ar = getattr(self.app, "autorun_tab", None)
+        if ar is not None and ar.data is not None:
+            ar.populate()                    # system/user classification is now known
         self.render(self.shown_pkg if self.shown_pkg in self.apps else None)
+        if pending_for(serial):
+            threading.Thread(target=self._reconcile_work, args=(serial,), daemon=True).start()
         off = sum(1 for a in self.apps.values() if a["disabled"])
         self.app.info("Found %d apps (%d turned off). Click one to see what it does."
                       % (len(self.apps), off))
@@ -2068,14 +2483,157 @@ class AppsTab(ttk.Frame):
     # ---- describing apps -------------------------------------------------
 
     def label(self, pkg):
-        k = kb.lookup(pkg)
-        if k and k.get("name"):
-            return k["name"]
+        """Display name only - every action keeps using the package id.
+        Priority: name read from the app's own APK (what Android shows) -> Google Play
+        name (if already looked up) -> curated built-in name -> the package id.
+        A name is never made up from the package id."""
+        got = self.apk_label(pkg)
+        if got:
+            return got
         info = self.cache.get(pkg) or {}
         play = info.get("play") or {}
         if play.get("found") and play.get("name"):
             return play["name"]
+        k = kb.lookup(pkg)
+        if k and k.get("name"):
+            return k["name"]
         return pkg
+
+    def apk_label(self, pkg):
+        e = self.labels.get(pkg)
+        a = self.apps.get(pkg)
+        if a and self.label_entry_valid(e, a, self.label_locale):
+            return e.get("label")
+        return None
+
+    @staticmethod
+    def label_entry_valid(e, a, locale):
+        """A saved name is reused only for the same version, install time, APK path
+        and phone language. (Practical invalidation signals - not proof the file is
+        byte-identical.)"""
+        return (isinstance(e, dict) and e.get("version_code") == str(a.get("version_code") or "")
+                and e.get("last_update") == str(a.get("last_update") or "")
+                and e.get("apk_path") == a.get("path") and e.get("locale") == locale)
+
+    # ---- reading app names in the background ------------------------------
+
+    def _read_names_toggled(self):
+        cfg = sa.load_sec_config()
+        cfg["app_labels_enabled"] = bool(self.read_names.get())
+        try:
+            sa.save_sec_config(cfg)
+        except Exception:
+            pass
+        if self.read_names.get() and self.apps:
+            self.start_label_reader()
+        else:
+            self.stop_label_reader()
+
+    def stop_label_reader(self):
+        self.label_stop.set()
+        self.label_gen += 1
+
+    def start_label_reader(self):
+        """Fill in real names after the list is shown. One reader per connection;
+        results from an older one are ignored (label_gen + serial check)."""
+        self.stop_label_reader()
+        if not self.read_names.get() or not self.serial or self.scanned_serial != self.serial:
+            return
+        self.label_stop = stop = threading.Event()
+        gen, serial = self.label_gen, self.serial
+        # last known phone language: saved names show at once, before getprop answers
+        self.label_locale = self.labels.get("__locale__:" + serial) or {}
+        snapshot = {p: {"path": a.get("path"), "system": a["system"], "version_code": str(a.get("version_code") or ""),
+                        "last_update": str(a.get("last_update") or "")}
+                    for p, a in self.apps.items() if not a.get("removed") and APK_PATH_RE.match(a.get("path") or "")}
+        budget = label_budget_mb(sa.load_sec_config()) << 20
+        self._label_thread = threading.Thread(target=self._label_worker_thread,
+                                              args=(gen, serial, snapshot, budget, stop), daemon=True)
+        self._label_thread.start()
+
+    def _label_worker_thread(self, gen, serial, snapshot, budget, stop):
+        """Thread entry point: whatever happens inside, exactly one completion (or
+        error) message is posted, so the reader can never die silently."""
+        try:
+            named, note = self._label_worker_run(gen, serial, snapshot, budget, stop)
+        except Exception as e:
+            named, note = 0, "stopped by an unexpected problem (%s: %s)" % (type(e).__name__, str(e)[:120])
+        self.post(self._labels_finished, gen, serial, named, note)
+
+    def _label_worker_run(self, gen, serial, snapshot, budget, stop):
+        locale = device_locale(serial)
+        self.post(self._label_locale_ready, gen, serial, locale)
+        done, named, meter = set(), 0, {"used": 0}
+        while not stop.is_set():
+            todo = [p for p in snapshot if p not in done and not self.label_entry_valid(
+                self.labels.get(p), snapshot[p], locale)]
+            if not todo:
+                break
+            shown = self.shown_pkg                                      # selected app first
+            todo.sort(key=lambda p: (p != shown, snapshot[p]["system"], p))  # then mine, then system
+            batch = todo[:8]
+            work = tempfile.mkdtemp(prefix="adbm_names_")
+            os.chmod(work, 0o700)
+            try:
+                items, fails = [], {}
+                for i, p in enumerate(batch):
+                    if stop.is_set() or meter["used"] >= budget:
+                        break
+                    done.add(p)
+                    try:
+                        parts = read_label_parts(serial, snapshot[p]["path"], work, "a%d" % i, meter)
+                        items.append({"id": p, "manifest": parts["manifest"], "arsc": parts["arsc"]})
+                    except (AdbError, sa.LabelError, OSError) as e:
+                        fails[p] = {"label": None, "match": None, "error": str(e)[:200]}
+                if stop.is_set():
+                    return named, ""
+                results = dict(fails)
+                if items:
+                    results.update(sa.run_label_worker(items, locale))
+                named += sum(1 for r in results.values() if r.get("label"))
+                if results:
+                    self.post(self._labels_ready, gen, serial, locale,
+                              {p: dict(r, **snapshot[p]) for p, r in results.items()})
+            finally:
+                shutil.rmtree(work, ignore_errors=True)
+            if meter["used"] >= budget:
+                return named, ("stopped at the %d MB limit for this connection - the rest continue next time"
+                               % (budget >> 20))
+        return named, ""
+
+    def _label_locale_ready(self, gen, serial, locale):
+        if gen != self.label_gen or serial != self.serial:
+            return
+        changed = locale != self.label_locale
+        self.label_locale = locale
+        if changed:
+            self.labels.put("__locale__:" + serial, locale)
+            for p in list(self.apps):
+                self.refresh_row(p)
+
+    def _labels_ready(self, gen, serial, locale, results):
+        """GUI thread. Ignores anything from an older connection or a changed app."""
+        if gen != self.label_gen or serial != self.serial:
+            return
+        for p, r in results.items():
+            a = self.apps.get(p)
+            if not a or a.get("path") != r.get("path") or str(a.get("version_code") or "") != r["version_code"] \
+                    or str(a.get("last_update") or "") != r["last_update"]:
+                continue                                           # app changed meanwhile
+            entry = {"label": r.get("label"), "match": r.get("match"), "error": r.get("error", ""),
+                     "version_code": r["version_code"], "last_update": r["last_update"],
+                     "apk_path": r["path"], "locale": locale, "source": "apk",
+                     "read": time.strftime("%Y-%m-%d %H:%M")}
+            self.labels.put(p, entry)
+            self.refresh_row(p)
+            if self.shown_pkg == p:
+                self.render(p)
+
+    def _labels_finished(self, gen, serial, named, note):
+        if gen != self.label_gen or serial != self.serial:
+            return
+        if named or note:
+            self.app.info("App names read from the phone: %d%s" % (named, (" - " + note) if note else ""))
 
     @staticmethod
     def origin_state(a):
@@ -2653,7 +3211,18 @@ class AppsTab(ttk.Frame):
                 mode = "updates"
             else:
                 mode = "user"
+            what, orig, want = {"full": ("uninstall-full", "installed", "absent"),
+                                "user": ("remove-for-user", "installed", "removed"),
+                                "updates": ("uninstall-updates", None, None)}[mode]
+            op = journal_begin(serial, 0, p, what, orig, want, source="apps")
+            if op is False:
+                results.append((p, False, journal_refusal(p)["message"]))
+                continue
+            if op == NOOP:
+                results.append((p, True, ALREADY_MSG))
+                continue
             ok, msg = pm_uninstall(serial, p, mode, opts.get("keep_data", False))
+            journal_end(op)
             log_action(serial, "uninstall-" + mode, p, ok, msg + (note if ok else ""))
             results.append((p, ok, msg + (note if ok else "")))
         self.post(self._uninstall_done, serial, results)
@@ -2696,7 +3265,15 @@ class AppsTab(ttk.Frame):
             if self.stop.is_set():
                 break
             self.post(self.app.info, "Restoring %d/%d: %s ..." % (i + 1, len(pkgs), p))
+            op = journal_begin(serial, 0, p, "restore", "removed", "installed", source="apps")
+            if op is False:
+                results.append((p, False, journal_refusal(p)["message"]))
+                continue
+            if op == NOOP:
+                results.append((p, True, ALREADY_MSG))
+                continue
             ok, msg = pm_restore(serial, p)
+            journal_end(op)
             log_action(serial, "restore", p, ok, msg)
             results.append((p, ok, msg))
         self.post(self._restore_done, serial, results)
@@ -2869,7 +3446,11 @@ class AppsTab(ttk.Frame):
 
     def _report_store_problems(self):
         """Tell the user once if a saved-data file was damaged or unreadable at start."""
-        for st in (self.cache, self.turned_off, self.ai_cache):
+        stores = [self.cache, self.turned_off, self.ai_cache, self.labels]
+        ar = getattr(self.app, "autorun_tab", None)
+        if ar is not None:
+            stores.append(ar.saved)
+        for st in stores:
             if st.load_problem:
                 self.app.error("Saved data problem: " + st.load_problem)
 
@@ -2943,6 +3524,10 @@ class AppsTab(ttk.Frame):
                 w("No answer: %s\n" % (r.get("error") or "unknown problem"), "warn")
                 continue
             a = r["answer"]
+            note = source_check_note(a)
+            has_sources = a["sources"] or any(f["source"] for f in a["independent_findings"])
+            if note and (has_sources or note[1] == "warn"):
+                w(*note)
             w("AI says: ", "b")
             w(AI_VERDICT_TEXT[a["verdict"]], AI_VERDICT_TAG[a["verdict"]])
             w("   (how sure: %s)\n" % a["confidence"])
@@ -2957,7 +3542,7 @@ class AppsTab(ttk.Frame):
                     w("\u2022 [%s] " % BACKING_TEXT[f["backing"]], "bk_" + f["backing"])
                     w(f["finding"] + "\n")
                     if f["source"]:
-                        w("    " + f["source"] + "\n", "dim")
+                        w("    " + f["source"] + source_mark(a, f["source"]) + "\n", "dim")
             w("Data it collects or sends: ", "b")
             w(a["data_collection"] + "\n")
             if a["disagreements"] and a["disagreements"].lower().strip(". ") != "none found":
@@ -2970,7 +3555,7 @@ class AppsTab(ttk.Frame):
             if extra:
                 w("Other sources:\n", "b")
                 for s in extra[:8]:
-                    w("    " + s + "\n", "dim")
+                    w("    " + s + source_mark(a, s) + "\n", "dim")
             if r.get("last_error"):
                 w("(Asking again failed, so this is the older answer: %s)\n" % r["last_error"], "dim")
         w("\n")
@@ -3140,7 +3725,24 @@ class AppsTab(ttk.Frame):
             if self.stop.is_set():
                 break
             self.post(self.app.info, "Turning %s %d/%d: %s" % (verb, i + 1, len(pkgs), p))
+            try:
+                ps = (receiver_states(serial, 0, {p}).get(p) or {}).get("pkg_state")
+            except Exception:
+                ps = None
+            now = "off" if ps in (2, 3, 4) else "on" if ps in (0, 1) else None
+            if now is None:                              # never record an assumed original
+                results.append((p, False, "its current state couldn't be read, so nothing was changed"))
+                continue
+            op = journal_begin(serial, 0, p, "app-on" if enable else "app-off", now,
+                               "on" if enable else "off", source="apps")
+            if op is False:
+                results.append((p, False, journal_refusal(p)["message"]))
+                continue
+            if op == NOOP:
+                results.append((p, True, ALREADY_MSG))
+                continue
             ok, msg = pm_set_enabled(serial, p, enable, use_root)
+            journal_end(op)
             log_action(serial, "enable" if enable else "disable", p, ok, msg)
             results.append((p, ok, msg))
         try:
@@ -3157,7 +3759,7 @@ class AppsTab(ttk.Frame):
         # needs is frozen NOW: which packages changed, and the timestamp. It must
         # not read self.apps or the clock when it runs.
         stamp = time.strftime("%Y-%m-%d %H:%M")
-        changed = tuple(p for p, ok, msg in results if ok and p in self.apps)
+        changed = tuple(p for p, ok, msg in results if ok and msg != ALREADY_MSG and p in self.apps)
 
         def apply(mine, changed=changed, stamp=stamp, enable=bool(enable)):
             mine = mine if isinstance(mine, dict) else {}
@@ -3190,6 +3792,844 @@ class AppsTab(ttk.Frame):
                                      parent=self.app.root)
         else:
             self.app.info("Done: %d app(s) turned %s" % (len(good), verb))
+
+
+# --------------------------------------------------------------------------
+# Debloat profiles (v1): save this phone's OFF / removed / background state, and
+# apply someone's profile one reviewed action at a time through the app's existing
+# verified operations (Autorun's whole-app OFF and background restriction, with
+# their write-ahead records; the Apps tab's remove-for-user).
+# --------------------------------------------------------------------------
+
+def profile_removed_state(serial, pkg):
+    """True = removed for the main user (known to Android, not installed), False =
+    installed, None = can't tell. Decided from BOTH package lists, never one alone."""
+    try:
+        installed = set(pm_list(serial, "--user 0 " + shlex.quote(pkg)))
+        known = set(pm_list(serial, "-u " + shlex.quote(pkg)))
+    except AdbError:
+        return None
+    if pkg in installed:
+        return False
+    return True if pkg in known else None
+
+
+def profile_removal_check(serial, pkg):
+    """Fresh, right-before-removal check that 'Remove for user' can be undone:
+    still installed for the main user, listed by Android as a SYSTEM package, factory
+    copy still on the phone, and the restore command available. -> (True|False|None, why).
+    Anything that can't be read gives None (= don't remove)."""
+    try:
+        rc, out, err = adb_shell(serial, "pm list packages -f -s --user 0 " + shlex.quote(pkg), timeout=60)
+        rc2, sdk_out, _ = adb_shell(serial, "getprop ro.build.version.sdk", timeout=15)
+    except AdbError:
+        return None, "the phone couldn't be asked"
+    if rc != 0 or query_error(out + err):
+        return None, "the system-app list couldn't be read"
+    path = None
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("package:") and "=" in line:
+            p_, name = line[len("package:"):].rsplit("=", 1)
+            if name == pkg:
+                path = p_
+    if path is None:
+        return False, "it's not (or no longer) an installed system app"
+    sdk = _int_or_none(sdk_out) if rc2 == 0 else None
+    if not sdk:
+        return None, "the Android version couldn't be read"
+    # a system package whose file is under /data is an updated preinstalled app:
+    # its factory copy is still in the system partition
+    return pf.restorable({"system": True, "path": path, "updated_system": path.startswith("/data/")}, sdk)
+
+
+def profile_background_state(serial, pref, pkg, user, sdk, target_sdk):
+    """True = restricted (every op 'ignore'), False = not, None = unknown/unsupported -
+    the same ops and reads as the Autorun tab."""
+    if not pref:
+        return None
+    ops = background_ops(sdk, target_sdk)
+    if not ops:
+        return None
+    modes = read_background_modes(serial, pref, pkg, user, ops)
+    if modes is None:
+        return None
+    return all(v == "ignore" for v in modes.values())
+
+
+def _int_or_none(v):
+    try:
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+PROFILE_OUTCOME = {"verified": "✅ done - checked on the phone", "unverified": "⚠ sent, but not confirmed",
+                   "refused": "⛔ the phone refused", "failed": "⛔ failed",
+                   "unsupported": "⛔ not possible here", "changed": "↻ changed since the review - skipped",
+                   "skipped": "– skipped (couldn't re-read it)", "stopped": "– not done (stopped)",
+                   "already": "– already that way"}
+
+
+class ProfileWindow(tk.Toplevel):
+    COLS = ("off", "removed", "background", "risk", "signer")
+
+    def __init__(self, master, app):
+        super().__init__(master)
+        self.app, self.at = app, app.apps_tab
+        self.title("Debloat profiles")
+        self.transient(master)
+        self.minsize(640, 420)
+        self.doc = self.rows = None
+        self.ctx = None                       # serial / user / sdk the review was made for
+        self.ticked = set()                   # (pkg, action)
+        self.results = {}
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill="both", expand=True)
+        intro = ttk.Label(frm, justify="left", foreground="#555555", text=(
+            "A profile records which apps are turned OFF, removed for the user, or kept from running in the "
+            "background on a phone. Open one to compare it with THIS phone: you tick each change yourself, every "
+            "change is checked again just before it's made and verified afterwards. Nothing happens on its own."))
+        intro.pack(fill="x")
+        intro.bind("<Configure>", lambda e: intro.configure(wraplength=max(200, e.width - 4)))
+        row = ttk.Frame(frm)
+        row.pack(fill="x", pady=(8, 4))
+        self.save_btn = ttk.Button(row, text="Save this phone's profile…", command=self.export)
+        self.save_btn.pack(side="left")
+        self.open_btn = ttk.Button(row, text="Open a profile…", command=self.import_)
+        self.open_btn.pack(side="left", padx=6)
+        self.head = ttk.Label(frm, text="", font=("TkDefaultFont", 10, "bold"))
+        self.head.pack(fill="x")
+        mid = ttk.Frame(frm)
+        mid.pack(fill="both", expand=True, pady=(4, 0))
+        self.tree = ttk.Treeview(mid, columns=self.COLS, selectmode="browse")
+        for c, t, wdt in (("#0", "App", 210), ("off", "Turn OFF", 150), ("removed", "Remove for user", 140),
+                          ("background", "Restrict background", 160), ("risk", "Risk here", 90),
+                          ("signer", "Same app?", 100)):
+            self.tree.heading(c, text=t)
+            self.tree.column(c, width=wdt, stretch=c == "#0")
+        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.tree.bind("<Button-1>", self.on_click)
+        self.tree.bind("<<TreeviewSelect>>", self.on_select)
+        self.note = ttk.Label(frm, text="Click a ☐ / ☑ box to choose that change.", foreground="#555555",
+                              justify="left")
+        self.note.pack(fill="x", pady=(4, 0))
+        self.note.bind("<Configure>", lambda e: self.note.configure(wraplength=max(200, e.width - 4)))
+        bot = ttk.Frame(frm)
+        bot.pack(fill="x", pady=(6, 0))
+        self.summary = ttk.Label(bot, text="")
+        self.summary.pack(side="left")
+        ttk.Button(bot, text="Close", command=self.destroy).pack(side="right")
+        self.apply_btn = ttk.Button(bot, text="Apply the ticked changes", command=self.apply)
+        self.apply_btn.pack(side="right", padx=6)
+        self.apply_btn.state(["disabled"])
+
+    # ---- shared checks ----------------------------------------------------
+
+    def ready(self):
+        at = self.at
+        if not at.serial:
+            self.app.error("No device connected - pick one at the top")
+            return False
+        if at.scanned_serial != at.serial or not at.apps:
+            messagebox.showinfo("Scan first", "Scan the apps on this phone first (Apps tab > Scan apps).", parent=self)
+            return False
+        if at.job:
+            self.app.info("Busy: %s - wait for it to finish or press Stop" % at.job)
+            return False
+        return True
+
+    @staticmethod
+    def user_problem(user, source):
+        if source not in ("detected", "single-user"):
+            return ("the phone's current Android user couldn't be established, so a change might hit the wrong "
+                    "user")
+        if user != 0:
+            return "this version of profiles only supports the phone's main user (you're using user %d)" % user
+        return None
+
+    # ---- export -------------------------------------------------------------
+
+    def export(self):
+        if not self.ready():
+            return
+        at = self.at
+        name = re.sub(r"[^A-Za-z0-9._-]+", "_", "%s_%s" % (at.props.get("model") or "phone",
+                                                           time.strftime("%Y%m%d"))) + ".adbprofile.json"
+        path = filedialog.asksaveasfilename(parent=self, title="Save this phone's profile",
+                                            initialfile=name, defaultextension=".json",
+                                            filetypes=[("ADB Manager profile", "*.json"), ("All files", "*")])
+        if not path:
+            return
+        apps = copy.deepcopy(at.apps)
+        props = dict(at.props)
+        at.start_job("saving a profile", self._export_work, at.serial, path, apps, props)
+
+    def _export_work(self, serial, path, apps, props):
+        try:
+            user, src = current_user(serial)
+            problem = self.user_problem(user, src)
+            if problem:
+                return self.at.post(self._export_done, None, "Nothing was saved: " + problem, [])
+            sdk = _int_or_none(props.get("sdk")) or 0
+            notes = []
+            try:
+                rc, out, err = adb_shell(serial, "dumpsys appops", timeout=120)
+            except AdbError:
+                rc, out = 1, ""
+            if rc != 0 or not out.strip():
+                bg = {}
+                notes.append("the background settings couldn't be read, so none were saved")
+            else:
+                bg = pf.background_from_appops(
+                    out, user, lambda p: background_ops(sdk, _int_or_none((apps.get(p) or {}).get("target_sdk")))
+                    if p in apps else None)
+            doc = pf.build_profile(apps, props, user, bg, sa.load_json(sa.IDENTITY_FILE, {}), sa.identity_key)
+            pf.dump_profile(doc)                                   # validated before it's written
+            sa.atomic_write_json(path, doc, private=True, folder_private=False)
+            self.at.post(self._export_done, doc, path, notes)
+        except (OSError, pf.ProfileError) as e:
+            self.at.post(self._export_done, None, "Nothing was saved: %s" % e, [])
+        except Exception as e:                                       # always report back
+            self.at.post(self._export_done, None, "Nothing was saved: %s: %s" % (type(e).__name__, e), [])
+
+    def _export_done(self, doc, msg, notes):
+        self.at.end_job()
+        if doc is None:
+            self.app.error(msg)
+            if self.winfo_exists():
+                messagebox.showwarning("Profile not saved", msg, parent=self)
+            return
+        n = {a: sum(1 for e in doc["apps"].values() if a in e["actions"]) for a in pf.ACTIONS}
+        text = ("Saved %d app(s): %d turned OFF, %d removed for the user, %d with background restricted.\n\n%s\n\n"
+                "The file lists your installed apps' names, so it's saved readable only by you."
+                % (len(doc["apps"]), n["off"], n["removed"], n["background"], msg))
+        if notes:
+            text += "\n\nNote: " + "; ".join(notes) + "."
+        self.app.info("Profile saved: %s" % msg)
+        if self.winfo_exists():
+            messagebox.showinfo("Profile saved", text, parent=self)
+
+    # ---- import + review ------------------------------------------------------
+
+    def import_(self):
+        if not self.ready():
+            return
+        path = filedialog.askopenfilename(parent=self, title="Open a profile",
+                                          filetypes=[("ADB Manager profile", "*.json"), ("All files", "*")])
+        if not path:
+            return
+        try:
+            with open(path, "rb") as f:
+                data = f.read(pf.MAX_BYTES + 1)
+            doc = pf.load_profile(data)
+        except (OSError, pf.ProfileError) as e:
+            messagebox.showerror("Can't use this profile", str(e), parent=self)
+            return
+        at = self.at
+        apps = copy.deepcopy(at.apps)
+        at.start_job("reading this phone for the profile", self._review_work, at.serial, doc, apps,
+                     _int_or_none(at.props.get("sdk")) or 0, path)
+
+    def _review_work(self, serial, doc, apps, sdk, path):
+        try:
+            user, src = current_user(serial)
+            problem = self.user_problem(user, src)
+            bg = {}
+            want_bg = [p for p, e in doc["apps"].items() if "background" in e["actions"]
+                       and p in apps and not apps[p].get("removed")]
+            if want_bg and not problem:
+                pref = appops_prefix(serial)
+                for i, p in enumerate(want_bg):
+                    self.at.post(self.app.info, "Reading background settings %d/%d ..." % (i + 1, len(want_bg)))
+                    bg[p] = profile_background_state(serial, pref, p, user, sdk,
+                                                     _int_or_none(apps[p].get("target_sdk")))
+            idc = sa.load_json(sa.IDENTITY_FILE, {})
+            signers = {p: pf.signer_evidence(p, apps[p], idc, sa.identity_key)
+                       for p in doc["apps"] if p in apps and not apps[p].get("removed")}
+            ctx = {"serial": serial, "user": user, "problem": problem, "sdk": sdk, "path": path}
+            self.at.post(self._review_done, doc, ctx, bg, {p: s for p, s in signers.items() if s}, None)
+        except Exception as e:                                       # always report back
+            self.at.post(self._review_done, None, None, None, None, "%s: %s" % (type(e).__name__, e))
+
+    def _review_done(self, doc, ctx, bg, signers, error):
+        self.at.end_job()
+        if not self.winfo_exists():
+            return
+        if error:
+            messagebox.showerror("Couldn't compare", error, parent=self)
+            return
+        at = self.at
+        if ctx["serial"] != at.serial:
+            return
+        self.doc, self.ctx, self.results = doc, ctx, {}
+        self.rows = pf.compare(doc, {"apps": at.apps, "sdk": ctx["sdk"], "user": ctx["user"], "background": bg,
+                                     "signers": signers, "critical": kb.CRITICAL,
+                                     "risk_of": lambda p: at.assess(at.apps[p])[0]})
+        self.ticked = {(r["pkg"], a) for r in self.rows for a, v in r["actions"].items()
+                       if v["preselect"]} if not ctx["problem"] else set()
+        src = doc.get("source") or {}
+        self.head.configure(text="Profile from %s (Android %s, saved %s) compared with this phone%s" % (
+            " ".join(x for x in (src.get("maker", ""), src.get("model", "")) if x) or "an unknown phone",
+            src.get("release", "?"), doc.get("created", "?"),
+            "" if not ctx["problem"] else " - CAN'T APPLY: " + ctx["problem"]))
+        self.populate()
+
+    def cell(self, r, act):
+        v = r["actions"].get(act)
+        if v is None:
+            return ""
+        done = self.results.get((r["pkg"], act))
+        if done:
+            return PROFILE_OUTCOME.get(done[0], done[0]).split(" - ")[0]
+        if v["status"] == pf.WILL_CHANGE and not self.ctx["problem"]:
+            return ("☑ " if (r["pkg"], act) in self.ticked else "☐ ") + pf.STATUS_WORDS[v["status"]]
+        return "— " + pf.STATUS_WORDS[v["status"]]
+
+    def populate(self):
+        self.tree.delete(*self.tree.get_children())
+        for r in self.rows or []:
+            risk = kb.RISK_SHORT.get(r["risk"], "") if r["risk"] else ""
+            self.tree.insert("", "end", iid=r["pkg"], text=self.at.label(r["pkg"]) if r["pkg"] in self.at.apps
+                             else r["pkg"], values=tuple(self.cell(r, a) for a in pf.ACTIONS) +
+                             (risk, {"match": "yes", pf.CONFLICT: "⛔ NO", pf.UNKNOWN: "unknown"}[r["signer"]]))
+        c = pf.counts(self.rows or [])
+        crit = sum(1 for p, a in self.ticked if self.row(p)["risk"] == kb.CRITICAL)
+        self.summary.configure(text="%d ticked%s  ·  %d already done  ·  %d not possible / unknown / "
+                                    "missing" % (len(self.ticked), " (%d should stay on!)" % crit if crit else "",
+                                                 c.get(pf.ALREADY, 0),
+                                                 sum(c.get(k, 0) for k in (pf.UNSUPPORTED, pf.UNKNOWN, pf.MISSING,
+                                                                           pf.CONFLICT, pf.NOT_APPLICABLE))))
+        self.apply_btn.state(["!disabled"] if self.ticked and not self.ctx["problem"] else ["disabled"])
+
+    def row(self, pkg):
+        return next(r for r in self.rows if r["pkg"] == pkg)
+
+    def on_click(self, event):
+        if not self.rows or self.ctx["problem"] or self.at.job:
+            return
+        pkg, col = self.tree.identify_row(event.y), self.tree.identify_column(event.x)
+        if not pkg or not col.startswith("#") or col == "#0":
+            return
+        idx = int(col[1:]) - 1
+        if idx >= len(pf.ACTIONS):
+            return
+        self.toggle(pkg, pf.ACTIONS[idx])
+
+    def toggle(self, pkg, act):
+        """Tick / untick one change. Only 'will change' items can be ticked."""
+        if not self.rows or self.ctx["problem"] or self.at.job:
+            return False
+        v = self.row(pkg)["actions"].get(act)
+        if not v or v["status"] != pf.WILL_CHANGE or (pkg, act) in self.results:
+            return False
+        self.ticked ^= {(pkg, act)}
+        self.populate()
+        self.tree.selection_set(pkg)
+        return True
+
+    def on_select(self, event=None):
+        sel = self.tree.selection()
+        if not sel or not self.rows:
+            return
+        r = self.row(sel[0])
+        lines = ["%s: %s" % (pf.ACTION_WORDS[a], v["why"]) for a, v in r["actions"].items()]
+        if r["version"] == "different":
+            lines.append("The app's version here differs from the one in the profile.")
+        if r["risk"] == kb.CRITICAL:
+            lines.append("⛔ On THIS phone this app should stay on - it's never ticked for you.")
+        self.note.configure(text="  ·  ".join(lines))
+
+    # ---- apply ------------------------------------------------------------------
+
+    def apply(self):
+        if not self.ticked or self.ctx["problem"] or not self.ready():
+            return
+        at = self.at
+        if self.ctx["serial"] != at.serial:
+            messagebox.showwarning("Different phone", "The review was made for another phone - open the profile "
+                                   "again.", parent=self)
+            return
+        plan = sorted(self.ticked, key=lambda pa: (pa[0], pf.ACTIONS.index(pa[1])))
+        n = {a: sum(1 for p, x in plan if x == a) for a in pf.ACTIONS}
+        crit = [p for p, a in plan if self.row(p)["risk"] == kb.CRITICAL]
+        text = ("Make %d change(s) on this phone?\n\n  %s: %d\n  %s: %d\n  %s: %d\n\nEach one is checked again "
+                "right before it's made (if something changed since this review, it's skipped) and verified "
+                "afterwards. Removed apps come back with 'Restore removed'; OFF apps with 'Turn ON'; background "
+                "with the Autorun tab's 'Allow background again'." % (
+                    len(plan), pf.ACTION_WORDS["off"], n["off"], pf.ACTION_WORDS["removed"], n["removed"],
+                    pf.ACTION_WORDS["background"], n["background"]))
+        if crit:
+            ans = simpledialog.askstring("Are you sure?", text + "\n\n⛔ %d of these apps should stay on, on "
+                                         "this phone: %s\n\nType YES to include them anyway:" % (
+                                             len(set(crit)), ", ".join(sorted(set(crit))[:6])), parent=self)
+            if ans != "YES":
+                self.app.info("Cancelled - nothing was changed")
+                return
+        elif not messagebox.askyesno("Apply profile", text, parent=self, icon="warning"):
+            return
+        frozen = {"serial": self.ctx["serial"], "user": self.ctx["user"], "sdk": self.ctx["sdk"],
+                  "want_root": bool(at.use_root.get()),
+                  "target_sdk": {p: _int_or_none((at.apps.get(p) or {}).get("target_sdk")) for p, _ in plan}}
+        at.start_job("applying a profile", self._apply_work, plan, frozen)
+
+    def apply_one(self, pkg, act, f):
+        """Recheck, then change one thing through the existing operation. -> (outcome, message)."""
+        serial, user = f["serial"], f["user"]
+        if act == "removed":
+            now = profile_removed_state(serial, pkg)
+            if now is None:
+                return "skipped", "its current state couldn't be read"
+            if now:
+                return "changed", "it's already removed now"
+            eligible, why = profile_removal_check(serial, pkg)      # re-checked NOW, not from the review
+            if eligible is None:
+                return "skipped", "couldn't confirm it can be brought back (%s)" % why
+            if not eligible:
+                return "changed", "it can no longer be removed safely: %s" % why
+            op = journal_begin(serial, 0, pkg, "remove-for-user", "installed", "removed", source="profile")
+            if op is False:
+                return "failed", journal_refusal(pkg)["message"]
+            if op == NOOP:
+                return "changed", ALREADY_MSG
+            ok, msg = pm_uninstall(serial, pkg, "user")
+            journal_end(op)
+            after = profile_removed_state(serial, pkg)
+            log_action(serial, "remove-for-user", pkg, after is True, msg, user=0, source="profile",
+                       outcome="verified" if after is True else "unverified" if ok else "failed")
+            if after is True:
+                return "verified", msg
+            return ("unverified" if ok else "failed"), msg
+        auto = self.app.autorun_tab
+        ctx = {"serial": serial, "user": user, "user_verified": True, "pkg": pkg, "cls": None, "before": None,
+               "target_sdk": f["target_sdk"].get(pkg), "key": AutorunTab.record_key(serial, user, pkg),
+               "want_root": f["want_root"]}
+        if act == "off":
+            st = receiver_states(serial, user, {pkg}).get(pkg)
+            ps = (st or {}).get("pkg_state")
+            if ps is None:
+                return "skipped", "its current state couldn't be read"
+            if ps in (2, 3, 4):
+                return "changed", "it's already OFF now"
+            res = auto._act_run("app_off", ctx)
+        else:
+            now = profile_background_state(serial, appops_prefix(serial), pkg, user, f["sdk"], ctx["target_sdk"])
+            if now is None:
+                return "skipped", "its background settings couldn't be read"
+            if now:
+                return "changed", "background is already restricted now"
+            res = auto._act_run("bg_restrict", ctx)
+        log_action(serial, {"off": "app-off", "background": "bg-restrict"}[act], pkg, res["outcome"] == "verified",
+                   res.get("message", ""), outcome=res["outcome"], user=user, source="profile")
+        return res["outcome"], res.get("message", "")
+
+    def _apply_work(self, plan, f):
+        results = []
+        for i, (pkg, act) in enumerate(plan):
+            if self.at.stop.is_set():                    # only BETWEEN operations
+                results.extend((p, a, "stopped", "") for p, a in plan[i:])
+                break
+            self.at.post(self.app.info, "Profile %d/%d: %s - %s ..." % (i + 1, len(plan), pf.ACTION_WORDS[act], pkg))
+            try:
+                outcome, msg = self.apply_one(pkg, act, f)
+            except Exception as e:                       # one failure never stops the report
+                outcome, msg = "failed", "%s: %s" % (type(e).__name__, e)
+            results.append((pkg, act, outcome, msg))
+        self.at.post(self._apply_done, f["serial"], results)
+
+    def _apply_done(self, serial, results):
+        at = self.at
+        at.end_job()
+        offs = tuple(p for p, a, o, m in results if a == "off" and o == "verified")
+        if offs and serial == at.serial:                 # also offered by the Apps tab's "turn back ON"
+            stamp = time.strftime("%Y-%m-%d %H:%M")
+
+            def add(mine, offs=offs, stamp=stamp):
+                mine = mine if isinstance(mine, dict) else {}
+                for p in offs:
+                    mine[p] = stamp
+                return mine
+            at._store_saved(at.turned_off, at.turned_off.update(serial, add, {}),
+                            "the list of apps this program turned off (used for Undo)")
+        done = sum(1 for r in results if r[2] == "verified")
+        self.app.info("Profile: %d of %d change(s) done and verified" % (done, len(results)))
+        if self.winfo_exists():
+            for p, a, o, m in results:
+                self.results[(p, a)] = (o, m)
+                self.ticked.discard((p, a))
+            self.populate()
+            lines = ["%s - %s: %s%s" % (at.label(p) if p in at.apps else p, pf.ACTION_WORDS[a],
+                                        PROFILE_OUTCOME.get(o, o), (" (%s)" % m) if m and o != "verified" else "")
+                     for p, a, o, m in results]
+            (messagebox.showinfo if done == len(results) else messagebox.showwarning)(
+                "Profile applied", "\n".join(lines[:40]) + ("\n..." if len(lines) > 40 else ""), parent=self)
+        if serial == at.serial and any(r[2] in ("verified", "unverified") for r in results):
+            at.scan()
+
+
+class TimelineWindow(tk.Toplevel):
+    """The saved security checks of one phone, newest first. Each check is compared with
+    the one before it (the same comparison as 'changes since the last check'); what a
+    check couldn't read is listed with it, so 'nothing found' is never mistaken for
+    'nothing changed'. Read-only, nothing here touches the phone."""
+
+    def __init__(self, master, app, serial):
+        super().__init__(master)
+        self.app, self.serial = app, serial
+        self.title("Timeline of security checks")
+        self.transient(master)
+        self.minsize(680, 420)
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill="both", expand=True)
+        self.head = ttk.Label(frm, text="", foreground="#555555", justify="left")
+        self.head.pack(fill="x")
+        self.head.bind("<Configure>", lambda e: self.head.configure(wraplength=max(200, e.width - 4)))
+        body = ttk.Frame(frm)
+        body.pack(fill="both", expand=True, pady=(6, 0))
+        left = ttk.Frame(body)
+        left.pack(side="left", fill="y")
+        self.list = ttk.Treeview(left, columns=("n",), selectmode="browse", show="tree headings")
+        self.list.heading("#0", text="Check")
+        self.list.heading("n", text="Changes")
+        self.list.column("#0", width=175, minwidth=160)
+        self.list.column("n", width=170, minwidth=120)
+        self.list.pack(fill="y", expand=True)
+        self.list.bind("<<TreeviewSelect>>", self.on_select)
+        self.text = tk.Text(body, wrap="word", relief="flat", padx=8, pady=6, cursor="arrow", font=("TkDefaultFont", 10))
+        for tag, color in (("bad", "#b3261e"), ("warn", "#9a6700"), ("dim", "#777777")):
+            self.text.tag_configure(tag, foreground=color)
+        self.text.tag_configure("h", font=("TkDefaultFont", 11, "bold"))
+        self.text.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        self.load()
+
+    def load(self):
+        snaps = sa.list_snapshots(self.serial)
+        self.snaps = snaps
+        self.results = {}
+        self.list.delete(*self.list.get_children())
+        label = self.app.apps_tab.label
+        for i in range(len(snaps) - 1, -1, -1):
+            f, snap = snaps[i]
+            prev = snaps[i - 1][1] if i else None
+            found = sa.compare_snapshots(prev, snap, label)
+            changes = [x for x in found if x["level"] != sa.OK and x["key"] not in ("changes:first",
+                                                                                   "changes:none-partial")]
+            self.results[str(i)] = (snap, prev, found)
+            worst = min((sa.LEVEL_RANK[x["level"]] for x in changes), default=None)
+            mark = "" if worst is None else {0: "⛔ ", 1: "⚠ "}.get(worst, "")
+            n = "first check" if prev is None else ("%s%d change(s)" % (mark, len(changes)) if changes else "none")
+            if sa.snapshot_gaps(snap):
+                n += " · partial"
+            self.list.insert("", "end", iid=str(i), text=snap.get("time", f), values=(n,))
+        self.head.configure(text=("%d saved check(s) of this phone (the newest %d are kept). Each is compared with "
+                                  "the check before it. 'partial' = that check couldn't read everything - see its "
+                                  "details." % (len(snaps), sa.KEEP_SNAPSHOTS)) if snaps else
+                            "No saved checks of this phone yet - run a checkup in the Security tab.")
+        kids = self.list.get_children()
+        if kids:
+            self.list.selection_set(kids[0])
+            self.on_select()
+
+    def on_select(self, event=None):
+        sel = self.list.selection()
+        if not sel or sel[0] not in self.results:
+            return
+        snap, prev, found = self.results[sel[0]]
+        t = self.text
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        t.insert("end", "Check of %s\n" % snap.get("time", "?"), "h")
+        t.insert("end", ("compared with %s\n\n" % prev.get("time", "?")) if prev else "the first saved check\n\n", "dim")
+        for x in found:
+            tag = {sa.BAD: "bad", sa.WARN: "warn"}.get(x["level"], ())
+            t.insert("end", "• " + x["title"] + "\n", tag)
+            if x.get("detail"):
+                t.insert("end", "   " + x["detail"].replace("\n", "\n   ") + "\n", "dim")
+        gaps = sa.snapshot_gaps(snap)
+        if gaps:
+            t.insert("end", "\nThis check couldn't read: %s.\n" % "; ".join(gaps), "warn")
+        t.configure(state="disabled")
+
+
+class PermissionsWindow(tk.Toplevel):
+    """Read-only: which apps hold which permissions, for the phone's current Android user.
+    Nothing here changes anything on the phone."""
+
+    def __init__(self, master, app):
+        super().__init__(master)
+        self.app, self.at = app, app.apps_tab
+        self.title("Permissions (read-only)")
+        self.transient(master)
+        self.minsize(680, 440)
+        self.apps = None
+        self.serial = self.at.serial
+        self.note = ""
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill="both", expand=True)
+        intro = ttk.Label(frm, justify="left", foreground="#555555", text=(
+            "What each app is allowed to do, as the phone reports it for the current Android user. Read-only: "
+            "nothing is changed here. Runtime permissions (camera, location...) are shown by group. 'Special "
+            "access' (draw over apps, all files access...) is decided by separate settings, so it's listed but "
+            "never called allowed or not; accessibility, notification access and device admin are in the Security "
+            "tab."))
+        intro.pack(fill="x")
+        intro.bind("<Configure>", lambda e: intro.configure(wraplength=max(200, e.width - 4)))
+        row = ttk.Frame(frm)
+        row.pack(fill="x", pady=(6, 4))
+        self.view = tk.StringVar(value="group")
+        ttk.Radiobutton(row, text="By permission", variable=self.view, value="group",
+                        command=self.populate).pack(side="left")
+        ttk.Radiobutton(row, text="By app", variable=self.view, value="app",
+                        command=self.populate).pack(side="left", padx=6)
+        self.mine = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row, text="Only apps I installed", variable=self.mine,
+                        command=self.populate).pack(side="left", padx=(12, 0))
+        self.denied = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row, text="Also show 'not allowed'", variable=self.denied,
+                        command=self.populate).pack(side="left", padx=6)
+        self.refresh_btn = ttk.Button(row, text="Refresh", command=self.load)
+        self.refresh_btn.pack(side="right")
+        self.status = ttk.Label(frm, text="", foreground="#555555", justify="left")
+        self.status.pack(fill="x")
+        self.status.bind("<Configure>", lambda e: self.status.configure(wraplength=max(200, e.width - 4)))
+        mid = ttk.Frame(frm)
+        mid.pack(fill="both", expand=True, pady=(4, 0))
+        self.tree = ttk.Treeview(mid, columns=("state", "notes"), selectmode="browse")
+        for c, t, w_ in (("#0", "Permission / app", 300), ("state", "Allowed?", 150), ("notes", "Notes", 300)):
+            self.tree.heading(c, text=t)
+            self.tree.column(c, width=w_, stretch=c != "state")
+        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.tree.bind("<<TreeviewSelect>>", self.on_select)
+        self.detail = ttk.Label(frm, text="", foreground="#555555", justify="left")
+        self.detail.pack(fill="x", pady=(4, 0))
+        self.detail.bind("<Configure>", lambda e: self.detail.configure(wraplength=max(200, e.width - 4)))
+        self.rows = {}
+        self.load()
+
+    def load(self):
+        self.refresh_btn.state(["disabled"])
+        self.status.configure(text="Reading the permissions from the phone ...")
+        threading.Thread(target=self._work, args=(self.serial,
+                                                  _int_or_none(self.at.props.get("sdk"))), daemon=True).start()
+
+    def _work(self, serial, sdk):
+        try:
+            user, src = current_user(serial)
+            verified = src in ("detected", "single-user")
+            rc, out, err = adb_shell(serial, "dumpsys package packages", timeout=240)
+            if rc != 0 or query_error(out + err) or not out.strip():
+                raise AdbError("the phone didn't return its package list (%s)" % (err.strip()[:120] or rc))
+            parsed = pi.parse(out, user)
+            if not parsed:                     # non-empty output with no package records: not an empty phone
+                raise AdbError("the phone's answer contained no package records - the output wasn't in a format "
+                               "this version understands, or it was incomplete")
+            apps = pi.inventory(parsed, sdk, verified)
+            self.app.q.put(("call", self._loaded, serial, apps, user, verified, sdk, None))
+        except Exception as e:
+            self.app.q.put(("call", self._loaded, serial, None, None, False, sdk, "%s" % e))
+
+    def _loaded(self, serial, apps, user, verified, sdk, error):
+        if not self.winfo_exists():
+            return
+        self.refresh_btn.state(["!disabled"])
+        if error:
+            self.apps = None
+            self.status.configure(text="Couldn't read the permissions: %s" % error)
+            self.tree.delete(*self.tree.get_children())
+            return
+        self.apps = apps
+        if sdk is not None and sdk < 23:
+            self.note = ("This phone runs Android older than 6: apps get ALL their permissions when installed, "
+                         "so there are no runtime permissions to show - see 'By app' for what each app has.")
+        elif not verified:
+            self.note = ("The phone's current Android user couldn't be confirmed, so runtime permissions (which are "
+                         "per user) are shown as unknown - not as 'not allowed'.")
+        else:
+            self.note = "Android user %d." % user
+        self.populate()
+
+    def wanted(self, pkg):
+        return not self.mine.get() or not (self.at.apps.get(pkg) or {}).get("system", False)
+
+    def name(self, pkg):
+        return self.at.label(pkg) if pkg in self.at.apps else pkg
+
+    def populate(self):
+        self.tree.delete(*self.tree.get_children())
+        self.rows = {}
+        if not self.apps:
+            return
+        apps = {p: a for p, a in self.apps.items() if self.wanted(p)}
+        if self.view.get() == "group":
+            groups = pi.by_group(apps, self.denied.get())
+            for g in pi.GROUP_ORDER:
+                items = groups.get(g)
+                if not items:
+                    continue
+                n_ok = len({p for p, perm, ok, f in items if ok})
+                gid = self.tree.insert("", "end", text="%s  (%d app%s allowed)" % (g, n_ok, "" if n_ok == 1 else "s"),
+                                       open=False)
+                for i, (pkg, perm, ok, flags) in enumerate(sorted(items, key=lambda x: (not x[2], self.name(x[0]).lower(),
+                                                                                         x[1]))):
+                    st, notes, change = pi.explain(ok, flags)
+                    iid = self.tree.insert(gid, "end", text="%s - %s" % (self.name(pkg), pi.short(perm)),
+                                           values=(st, ("⛔ can't be changed; " if not change else "") +
+                                                   "; ".join(notes)))
+                    self.rows[iid] = (pkg, perm, ok, flags)
+            special = sorted((p, sp) for p, a in apps.items() for sp in a["special"])
+            if special:
+                sid = self.tree.insert("", "end", text="Special access  (%d request%s)" % (
+                    len(special), "" if len(special) == 1 else "s"))
+                for pkg, sp in special:
+                    iid = self.tree.insert(sid, "end", text="%s - %s" % (self.name(pkg), pi.SPECIAL_ACCESS[sp]),
+                                           values=("asks for it", "decided by special-access settings, not shown here"))
+                    self.rows[iid] = (pkg, sp, None, frozenset())
+        else:
+            for pkg in sorted(apps, key=lambda p: self.name(p).lower()):
+                a = apps[pkg]
+                allowed = sum(1 for ok, f in a["runtime"].values() if ok)
+                mode = {"ok": "%d allowed" % allowed, "install_time": "all at install (Android < 6)",
+                        "user_unknown": "unknown (user not confirmed)",
+                        "no_user_block": "no record for this user"}[a["runtime_mode"]]
+                ig = sum(1 for g, f in a["install"].values() if g)
+                ing = len(a["install"]) - ig
+                inst = ("install-time: %d granted%s" % (ig, ", %d not granted" % ing if ing else "")
+                        if a["install"] else "install-time: %d granted at install" % len(a["legacy"]))
+                pid = self.tree.insert("", "end", text=self.name(pkg), values=(mode, inst + (
+                    "; asks for special access" if a["special"] else "")))
+                self.rows[pid] = (pkg, None, None, None)
+                for perm, (ok, flags) in sorted(a["runtime"].items(), key=lambda kv: (not kv[1][0], kv[0])):
+                    if ok or self.denied.get():
+                        st, notes, change = pi.explain(ok, flags)
+                        iid = self.tree.insert(pid, "end", text="%s (%s)" % (pi.short(perm), pi.group_of(perm)),
+                                               values=(st, ("⛔ can't be changed; " if not change else "") +
+                                                       "; ".join(notes)))
+                        self.rows[iid] = (pkg, perm, ok, flags)
+                for sp in a["special"]:
+                    iid = self.tree.insert(pid, "end", text="Special access: %s" % pi.SPECIAL_ACCESS[sp],
+                                           values=("asks for it", "decided by special-access settings"))
+                    self.rows[iid] = (pkg, sp, None, frozenset())
+                if a["install"]:                  # their own sub-list: never mixed with runtime permissions
+                    nid = self.tree.insert(pid, "end", text="Install-time permissions", values=(
+                        "%d granted" % ig, "%d not granted" % ing if ing else ""))
+                    self.rows[nid] = (pkg, None, None, None)
+                    for perm, (ok, flags) in sorted(a["install"].items(), key=lambda kv: (not kv[1][0], kv[0])):
+                        if ok or self.denied.get():
+                            st, notes, change = pi.explain(ok, flags)
+                            iid = self.tree.insert(nid, "end", text="%s (install-time)" % pi.short(perm),
+                                                   values=("granted" if ok else "not granted", "; ".join(notes)))
+                            self.rows[iid] = (pkg, perm, ok, flags)
+        total = sum(1 for a in apps.values() for ok, f in a["runtime"].values() if ok)
+        self.status.configure(text="%s  %d app(s), %d runtime permission(s) allowed.%s" % (
+            self.note, len(apps), total, "  (Only apps you installed.)" if self.mine.get() else ""))
+
+    def on_select(self, event=None):
+        sel = self.tree.selection()
+        if not sel or sel[0] not in self.rows:
+            self.detail.configure(text="")
+            return
+        pkg, perm, ok, flags = self.rows[sel[0]]
+        if perm is None:
+            a = self.apps[pkg]
+            if a["install"]:                   # the modern records win whenever they exist
+                granted = sorted(pi.short(p) for p, (g, f) in a["install"].items() if g)
+            else:                              # only then the old 'grantedPermissions' list
+                granted = sorted(pi.short(p) for p in a["legacy"])
+            denied = sorted(pi.short(p) for p, (g, f) in a["install"].items() if not g)
+            self.detail.configure(text="%s  ·  install-time granted: %s%s" % (
+                pkg, ", ".join(granted) or "none", ("  ·  NOT granted: " + ", ".join(denied)) if denied else ""))
+        elif ok is None:
+            self.detail.configure(text="%s asks for %s (%s). Whether it's switched on is a special-access setting, "
+                                       "which this list doesn't show." % (pkg, pi.short(perm), pi.SPECIAL_ACCESS[perm]))
+        else:
+            st, notes, change = pi.explain(ok, flags)
+            self.detail.configure(text="%s  ·  %s: %s.%s  Android flags: %s" % (
+                pkg, perm, st, (" " + "; ".join(notes) + ".") if notes else "",
+                " ".join(sorted(flags)) or "none"))
+
+
+HISTORY_WHAT = {"disable": "Turned OFF", "enable": "Turned ON", "app-off": "Turned OFF", "app-on": "Turned ON",
+                "uninstall-full": "Uninstalled", "uninstall-user": "Removed for the user",
+                "uninstall-updates": "Removed updates", "remove-for-user": "Removed for the user",
+                "restore": "Brought back", "install": "Installed", "receiver-off": "Start-up receiver off",
+                "receiver-back": "Start-up receiver put back", "bg-restrict": "Background restricted",
+                "bg-allow": "Background allowed again"}
+HISTORY_OUTCOME = {"verified": "✅ checked on the phone", "done": "✔ phone said OK",
+                   "unverified": "⚠ not confirmed", "refused": "⛔ phone refused", "failed": "⛔ failed",
+                   "unsupported": "– not possible", "changed": "↻ skipped (changed)",
+                   "skipped": "– skipped", "stopped": "– stopped", "not_applied": "– not applied",
+                   "uncertain": "⚠ uncertain", "restored": "↩ restored",
+                   "already": "– already that way"}
+
+
+class HistoryWindow(tk.Toplevel):
+    """Everything this program changed on phones, newest first (read-only)."""
+
+    def __init__(self, master, app):
+        super().__init__(master)
+        self.app = app
+        self.title("History of changes")
+        self.transient(master)
+        self.minsize(640, 360)
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill="both", expand=True)
+        row = ttk.Frame(frm)
+        row.pack(fill="x")
+        self.only_this = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row, text="Only the connected phone", variable=self.only_this,
+                        command=self.refresh).pack(side="left")
+        self.summary = ttk.Label(row, text="", foreground="#555555")
+        self.summary.pack(side="left", padx=12)
+        ttk.Button(row, text="Refresh", command=self.refresh).pack(side="right")
+        self.tree = ttk.Treeview(frm, columns=("what", "app", "result", "from"), selectmode="browse")
+        for c, t, w_ in (("#0", "When", 140), ("what", "What", 190), ("app", "App", 220),
+                         ("result", "Result", 170), ("from", "From", 70)):
+            self.tree.heading(c, text=t)
+            self.tree.column(c, width=w_, stretch=c == "app")
+        sb = ttk.Scrollbar(frm, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True, pady=(6, 0))
+        sb.pack(side="left", fill="y", pady=(6, 0))
+        self.tree.bind("<<TreeviewSelect>>", self.on_select)
+        self.detail = ttk.Label(self, text="", foreground="#555555", justify="left", padding=(10, 0, 10, 8))
+        self.detail.pack(fill="x")
+        self.detail.bind("<Configure>", lambda e: self.detail.configure(wraplength=max(200, e.width - 4)))
+        self.events = []
+        self.refresh()
+
+    def refresh(self):
+        events, bad = history.read(HISTORY_FILE)
+        serial = self.app.apps_tab.serial
+        if self.only_this.get() and serial:
+            events = [e for e in events if e.get("serial") == serial]
+        self.events = events
+        self.tree.delete(*self.tree.get_children())
+        label = self.app.apps_tab.label
+        for i, e in enumerate(events):
+            what = HISTORY_WHAT.get(e["what"], e["what"])
+            if e.get("target"):
+                what += " (%s)" % e["target"].rsplit(".", 1)[-1]
+            pkg = e.get("pkg", "")
+            self.tree.insert("", "end", iid=str(i), text=e["t"], values=(
+                what, label(pkg) if pkg in self.app.apps_tab.apps else pkg,
+                HISTORY_OUTCOME.get(e.get("outcome"), e.get("outcome", "")), e.get("source", "")))
+        self.summary.configure(text="%d change(s)%s" % (len(events), "  ·  %d unreadable line(s) skipped" % bad
+                                                         if bad else ""))
+
+    def on_select(self, event=None):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        e = self.events[int(sel[0])]
+        self.detail.configure(text="%s  ·  phone %s%s  ·  %s%s" % (
+            e.get("pkg", ""), e.get("serial", "?"), (", user %d" % e["user"]) if isinstance(e.get("user"), int) else "",
+            e.get("t", ""), ("\n" + e["msg"]) if e.get("msg") else ""))
 
 
 # --------------------------------------------------------------------------
@@ -3684,14 +5124,14 @@ class NetworkTab(ttk.Frame):
             return
         kind, data = row
         if kind == "owner":
-            items = [s for s in self.socks if s["uid"] % 100000 == data]
+            items = [s for s in self.socks if s["uid"] == data]     # data = full UID (work profiles too)
             self.render_owner(w, data, items)
         else:
             self.render_sock(w, data)
         t.configure(state="disabled")
 
-    def render_owner(self, w, app_id, items):
-        uid = items[0]["uid"] if items else app_id
+    def render_owner(self, w, uid, items):
+        app_id = self.app_id(uid)
         w(self.owner_name(uid) + "\n", "h1")
         pkgs = self.owner_pkgs(uid)
         if app_id < 10000:
@@ -3815,6 +5255,1050 @@ LEVEL_WORD = {sa.OK: "fine", sa.INFO: "for your info", sa.WARN: "look at it", sa
 LEVEL_TAG = {sa.OK: "safe", sa.INFO: "", sa.WARN: "caution", sa.BAD: "critical"}
 
 
+# ---- Autorun: what can start at boot (milestone 1: read-only) -------------------
+#
+# A boot receiver in an app's manifest means the app CAN be woken when the phone
+# finishes starting - not that it will definitely run. Detection is established
+# per device at run time (never from the Android version alone):
+#   1. Package Manager query, including disabled receivers where supported:
+#      --query-flags 0x8200 = MATCH_DISABLED_COMPONENTS (0x200) | MATCH_DISABLED_
+#      UNTIL_USED_COMPONENTS (0x8000). query-receivers exists only on Android 7+,
+#      where both bits have exactly these meanings; asking for both covers packages
+#      in the "off until used" state whether or not 0x200 alone already matches them.
+#   2. fallback: the receiver resolver table in dumpsys package (older Android)
+# Whatever couldn't be established is reported as partial, never as complete.
+
+BOOT_ACTIONS = ("android.intent.action.BOOT_COMPLETED", "android.intent.action.LOCKED_BOOT_COMPLETED",
+                "android.intent.action.QUICKBOOT_POWERON", "com.htc.intent.action.QUICKBOOT_POWERON")
+BOOT_ACTION_WORDS = {"android.intent.action.BOOT_COMPLETED": "after start-up",
+                     "android.intent.action.LOCKED_BOOT_COMPLETED": "after start-up, before unlocking",
+                     "android.intent.action.QUICKBOOT_POWERON": "after quick start-up (maker-specific)",
+                     "com.htc.intent.action.QUICKBOOT_POWERON": "after quick start-up (HTC)"}
+_COMPONENT_RE = re.compile(r"^([A-Za-z0-9_.]+)/([A-Za-z0-9_.$]+)$")
+QUERY_FLAGS = "0x8200"     # MATCH_DISABLED_COMPONENTS | MATCH_DISABLED_UNTIL_USED_COMPONENTS
+PKG_STATE_WORDS = {0: "DEFAULT (manifest decides)", 1: "ENABLED (explicitly)", 2: "OFF", 3: "OFF (by user)",
+                   4: "OFF until used"}
+
+
+def full_component(comp):
+    """'pkg/.Cls' -> ('pkg', 'pkg.Cls'); 'pkg/a.b.Cls' -> ('pkg', 'a.b.Cls'). None if malformed."""
+    m = _COMPONENT_RE.match(comp.strip())
+    if not m:
+        return None
+    pkg, cls = m.groups()
+    return pkg, (pkg + cls if cls.startswith(".") else cls)
+
+
+def parse_query_receivers(text):
+    """Components from 'cmd package query-receivers --brief' (each entry: a 'Receiver #N'
+    header line, then 'pkg/component'). Returns a list of (pkg, class)."""
+    out = []
+    for line in text.splitlines():
+        fc = full_component(line)
+        if fc:
+            out.append(fc)
+    return out
+
+
+# a genuine section heading, not the words appearing somewhere in the output; used
+# both to decide that a table was found and by the parser, so they can't disagree
+RESOLVER_HEADING_RE = re.compile(r"^\s*Receiver Resolver Table\s*:")
+
+
+def has_receiver_resolver(dumpsys_text):
+    return any(RESOLVER_HEADING_RE.match(l) for l in (dumpsys_text or "").splitlines())
+
+
+def parse_receiver_resolver(dumpsys_text, actions=BOOT_ACTIONS):
+    """Fallback for older Android: 'Receiver Resolver Table' in dumpsys package.
+    Returns {(pkg, class): set(actions)}."""
+    found, in_table, action = {}, False, None
+    for line in dumpsys_text.splitlines():
+        s = line.strip()
+        if RESOLVER_HEADING_RE.match(line):
+            in_table = True
+            continue
+        if in_table and line and not line.startswith(" "):
+            break                                         # next top-level section
+        if not in_table:
+            continue
+        m = re.match(r'^(?:Action:\s*)?"?([A-Za-z0-9_.]+)"?:$', s)     # quoted or bare action header
+        if m:
+            action = m.group(1) if m.group(1) in actions else None
+            continue
+        if action:
+            for tok in s.split():
+                fc = full_component(tok)
+                if fc:
+                    found.setdefault(fc, set()).add(action)
+                    break
+    return found
+
+
+_QUERY_ERROR_RE = re.compile(r"(?im)^\s*(error\b|exception occurred|java\.lang\.\w*exception|"
+                             r"unknown (option|command)|usage:|.*: not found$|.*: inaccessible)")
+
+
+def query_error(text):
+    """True only for real command-error LINES - never for a component that merely
+    contains such a word (com.example/.ExceptionReceiver)."""
+    return bool(_QUERY_ERROR_RE.search(text or ""))
+
+
+def current_user(serial):
+    """(user, source) for the user whose apps are being managed. source:
+    "detected" (am get-current-user), "single-user" (that failed, but pm list users
+    shows user 0 is the only one), "unverified" (failed and several users exist, or
+    users couldn't be listed) - then states are NOT verified current-user states."""
+    try:
+        rc, out, err = adb_shell(serial, "am get-current-user", timeout=15)
+        if rc == 0 and out.strip().isdigit():
+            return int(out.strip()), "detected"
+    except AdbError:
+        pass
+    try:
+        rc, out, err = adb_shell(serial, "pm list users", timeout=15)
+        ids = {int(x) for x in re.findall(r"UserInfo\{(\d+):", out)} if rc == 0 else set()
+    except AdbError:
+        ids = set()
+    if ids == {0}:
+        return 0, "single-user"
+    return 0, "unverified"
+
+
+def parse_package_user_state(dumpsys_pkg_text, user):
+    """From 'dumpsys package <pkg>': the package's enabled state and the explicit
+    component overrides for ONE user. Returns {"pkg_state": int|None,
+    "disabled": set, "enabled": set, "found": bool}."""
+    res = {"pkg_state": None, "disabled": set(), "enabled": set(), "found": False}
+    lines = dumpsys_pkg_text.splitlines()
+    i, n = 0, len(lines)
+    while i < n:
+        m = re.match(r"^(\s*)User (\d+):(.*)$", lines[i])
+        if not m or int(m.group(2)) != user:
+            i += 1
+            continue
+        res["found"] = True
+        indent = len(m.group(1))
+        e = re.search(r"\benabled=(\d+)", m.group(3))
+        if e:
+            res["pkg_state"] = int(e.group(1))
+        i += 1
+        current = None
+        while i < n:
+            line = lines[i]
+            if line.strip() and len(line) - len(line.lstrip()) <= indent:
+                break                                     # next user / section
+            s = line.strip()
+            if s in ("disabledComponents:", "enabledComponents:"):
+                current = "disabled" if s.startswith("disabled") else "enabled"
+            elif current and re.match(r"^[A-Za-z0-9_.$]+$", s):
+                res[current].add(s)
+            elif s:
+                e = re.search(r"\benabled=(\d+)", s)
+                if e and res["pkg_state"] is None:
+                    res["pkg_state"] = int(e.group(1))
+                current = None if not s.endswith(":") else current
+            i += 1
+        break
+    return res
+
+
+def detect_boot_receivers(serial, user):
+    """Read-only inventory. Returns {"receivers": {(pkg, cls): {"actions": set}},
+    "method", "complete", "disabled_included", "user_scoped", "notes": [..]}.
+    "complete" = the RECEIVER INVENTORY was fully established by a user-scoped
+    Package Manager query that included switched-off receivers. It says nothing
+    about whether the current user was verified (that's reported separately)."""
+    res = {"receivers": {}, "method": "", "disabled_included": None, "user_scoped": None,
+           "inventory_scope": None, "complete": False, "notes": []}
+    ok_actions = 0
+    for action in BOOT_ACTIONS:
+        out = None
+        # both options tried independently: a device may support one but not the other
+        for args in (("--user", str(user), "--query-flags", QUERY_FLAGS), ("--user", str(user)),
+                     ("--query-flags", QUERY_FLAGS), ()):
+            cmd = "cmd package query-receivers %s --brief -a %s" % (" ".join(args), action)
+            try:
+                rc, o, err = adb_shell(serial, cmd, timeout=30)
+            except AdbError:
+                continue
+            if rc == 0 and not query_error(o + err):
+                out, flag, scoped = o, QUERY_FLAGS in args, "--user" in args
+                break
+        if out is None:
+            continue
+        ok_actions += 1
+        res["disabled_included"] = flag if res["disabled_included"] is None else res["disabled_included"] and flag
+        res["user_scoped"] = scoped if res["user_scoped"] is None else res["user_scoped"] and scoped
+        for fc in parse_query_receivers(out):
+            res["receivers"].setdefault(fc, {"actions": set()})["actions"].add(action)
+    if ok_actions:
+        if not res["disabled_included"]:
+            res["notes"].append("this phone's Package Manager couldn't include receivers that are already "
+                                "switched off, so those may be missing")
+        if not res["user_scoped"]:
+            res["notes"].append("some receiver queries couldn't be scoped to the selected Android user - "
+                                "results may reflect the Package Manager's default user")
+    if ok_actions:
+        res["inventory_scope"] = "user" if res["user_scoped"] else "unscoped"
+    if ok_actions == len(BOOT_ACTIONS):
+        res["method"] = "Package Manager query"
+        res["complete"] = bool(res["disabled_included"] and res["user_scoped"])
+        return res
+    # fallback for older Android, or when the query didn't answer for every action
+    cmd_ok, table_found, table = False, False, {}
+    for cmd, tmo in (("dumpsys package r", 60), ("dumpsys package", 120)):   # 2nd runs if 1st fails / has no table
+        try:
+            rc, o, err = adb_shell(serial, cmd, timeout=tmo)
+        except AdbError:
+            continue
+        if rc != 0:
+            continue
+        cmd_ok = True
+        if has_receiver_resolver(o):
+            table_found = True
+            table = parse_receiver_resolver(o)
+            break
+    for fc, acts in table.items():
+        res["receivers"].setdefault(fc, {"actions": set()})["actions"].update(acts)
+    pm = "Package Manager query (some start-up events only)" if ok_actions else ""
+    if table_found:
+        res["method"] = (pm + " + " if pm else "") + "dumpsys receiver table"
+        res["inventory_scope"] = "resolver"
+        res["notes"].append("part of the list comes from an older receiver table that may miss receivers "
+                            "that are switched off" + ("" if table else " (that table lists no start-up receivers)"))
+        res["notes"].append("read from the resolver table; per-user inventory scope not established (the "
+                            "states shown are still read for the selected user)")
+    elif cmd_ok:
+        res["method"] = pm or "nothing usable"
+        res["notes"].append("dumpsys answered but contained no receiver table, so the older fallback "
+                            "couldn't be used")
+    else:
+        res["method"] = pm or "nothing worked"
+        res["notes"].append("the older dumpsys fallback was unavailable" + (
+            "" if pm else " and the Package Manager query didn't answer either - the list is empty because "
+                          "it couldn't be read, not because no app starts at boot"))
+    return res
+
+
+def receiver_states(serial, user, pkgs, on_progress=None):
+    """Per package: package state + component overrides for `user` (+ target SDK)."""
+    out = {}
+    for i, p in enumerate(sorted(pkgs)):
+        if on_progress:
+            on_progress(i, len(pkgs))
+        try:
+            rc, o, err = adb_shell(serial, "dumpsys package " + shlex.quote(p), timeout=30)
+            out[p] = parse_package_user_state(o, user) if rc == 0 else None
+            if out[p] is not None:
+                m = re.search(r"\btargetSdk=(\d+)", o)
+                out[p]["target_sdk"] = int(m.group(1)) if m else None      # None = couldn't be read
+        except AdbError:
+            out[p] = None
+    return out
+
+
+def boot_signals(det, states, user_verified):
+    """Start-at-boot per package, for the Security tab's spyware-pattern check.
+    Returns None when the inventory couldn't be read at all, else {"complete": bool,
+    "pkgs": {pkg: True if any start-up receiver may run, False if all are switched
+    off}}. "complete" = every start-up event answered by a Package Manager query
+    scoped to the verified current user; only then does "not listed" mean "no
+    start-up receiver". (Queries that leave out switched-off receivers are still
+    complete for this purpose: a switched-off receiver can't start the app.)"""
+    if not det or not det.get("receivers") and det.get("method") in ("nothing usable", "nothing worked", ""):
+        return None
+    by = {}
+    for pkg, cls in det["receivers"]:
+        by.setdefault(pkg, []).append(cls)
+    pkgs = {pkg: not all(receiver_state_word(c, (states or {}).get(pkg)) == "DISABLED" for c in classes)
+            for pkg, classes in by.items()}
+    complete = det.get("method") == "Package Manager query" and bool(det.get("user_scoped")) and user_verified
+    return {"complete": complete, "pkgs": pkgs}
+
+
+def receiver_state_word(cls, st):
+    """DEFAULT / ENABLED / DISABLED / UNKNOWN for one receiver, plus whether the whole
+    package is off."""
+    if st is None or not st.get("found"):
+        return "UNKNOWN"
+    if cls in st["disabled"]:
+        return "DISABLED"
+    if cls in st["enabled"]:
+        return "ENABLED"
+    return "DEFAULT"
+
+
+# ---- Autorun milestone 2: controls (each one confirmed, applied, then VERIFIED) --
+#
+# Three separate actions, never substituted for one another:
+#   A. one boot receiver off / back  (pm disable-user / enable / default-state on
+#      that component; Android often refuses this for the adb shell - then nothing
+#      changes and we say so; with the user's root option it goes through su)
+#   B. restrict / allow background execution (AppOps; the ops depend on the
+#      Android version and the app's target SDK, like AOSP's battery restriction)
+#   C. the whole app OFF / ON (pm disable-user / enable for the package)
+# Every change is read back from the phone before it's reported as done.
+
+REFUSAL_RE = re.compile(r"(?i)securityexception|shell cannot change component state|permission denial|"
+                        r"not allowed to")
+UNSUPPORTED_RE = re.compile(r"(?i)unknown command|unknown option|^error: unknown|not found$", re.M)
+COMPONENT_TARGET = {"disabled": ("disable-user", "DISABLED"), "enabled": ("enable", "ENABLED"),
+                    "default": ("default-state", "DEFAULT")}
+OUTCOME_WORDS = {"verified": "Done - checked on the phone",
+                 "refused": "Not changed - Android refused it",
+                 "unsupported": "Not changed - this phone doesn't support that command",
+                 "unverified": "Unknown - the command ran, but the phone doesn't show the expected state",
+                 "failed": "Not changed - the command failed",
+                 "already": "Nothing to do - it was already in that state, so nothing was sent"}
+
+
+def root_available(serial):
+    """True only if su really gives uid 0 (an su binary alone proves nothing)."""
+    try:
+        rc, out, err = adb_shell(serial, "su -c id", timeout=20)
+    except AdbError:
+        return False
+    return rc == 0 and "uid=0(" in out
+
+
+def device_fingerprint(serial):
+    try:
+        return adb_shell(serial, "getprop ro.build.fingerprint", timeout=15)[1].strip() or "?"
+    except AdbError:
+        return "?"
+
+
+def _shell_maybe_root(serial, cmd, use_root):
+    full = "su -c " + shlex.quote(cmd) if use_root else cmd
+    try:
+        rc, out, err = adb_shell(serial, full, timeout=30)
+    except AdbError as e:
+        return None, str(e)
+    return rc, (out + "\n" + err).strip()
+
+
+def _classify(rc, text):
+    if rc is None:
+        return "failed"
+    if REFUSAL_RE.search(text):
+        return "refused"
+    if UNSUPPORTED_RE.search(text):
+        return "unsupported"
+    return None
+
+
+def set_component_state(serial, user, pkg, cls, target, use_root=False):
+    """Set ONE component to disabled / enabled / default for `user`, then read it back.
+    Returns {"outcome", "message", "state"} - the state actually read afterwards."""
+    verb, expect = COMPONENT_TARGET[target]
+    comp = shlex.quote("%s/%s" % (pkg, cls))
+    rc, text = _shell_maybe_root(serial, "pm %s --user %d %s" % (verb, user, comp), use_root)
+    bad = _classify(rc, text)
+    st = receiver_states(serial, user, {pkg}).get(pkg)
+    now = receiver_state_word(cls, st)
+    if bad:
+        return {"outcome": bad, "message": last_line(text) or "", "state": now}
+    if now == expect:
+        return {"outcome": "verified", "message": last_line(text) or "", "state": now}
+    return {"outcome": "unverified" if rc == 0 else "failed", "message": last_line(text) or "", "state": now}
+
+
+def set_package_state(serial, user, pkg, enable, use_root=False):
+    """The WHOLE app on/off for `user`, then read back. Never used as a fallback."""
+    cmd = ("pm enable --user %d %s" if enable else "pm disable-user --user %d %s") % (user, shlex.quote(pkg))
+    rc, text = _shell_maybe_root(serial, cmd, use_root)
+    bad = _classify(rc, text)
+    st = receiver_states(serial, user, {pkg}).get(pkg) or {}
+    ps = st.get("pkg_state")
+    ok = (ps in (0, 1)) if enable else (ps in (2, 3))
+    if bad:
+        return {"outcome": bad, "message": last_line(text) or "", "pkg_state": ps}
+    return {"outcome": "verified" if ok else ("unverified" if rc == 0 else "failed"),
+            "message": last_line(text) or "", "pkg_state": ps}
+
+
+APPOPS_PROBE_OP = "RUN_IN_BACKGROUND"
+APPOPS_PROBE = "get android " + APPOPS_PROBE_OP      # a harmless read of one Android setting
+
+
+def appops_answer_ok(out, err, op=APPOPS_PROBE_OP):
+    """True when the text IS a real AppOps answer for `op` ("No operations." or
+    "OP: mode"). Judged by content, not exit code: on some phones (seen on a Redmi,
+    Android 15) the appops commands return exit code 255 even when they work."""
+    text = (out or "") + (err or "")
+    return not UNSUPPORTED_RE.search(text) and not query_error(text) and parse_appops_mode(out, op) is not None
+
+
+def appops_prefix(serial):
+    """'cmd appops' (Android 7+), else the older 'appops' tool, else None - found
+    by a harmless real read, not by the help text (whose exit code isn't reliable)."""
+    for pref in ("cmd appops", "appops"):
+        try:
+            rc, out, err = adb_shell(serial, "%s %s" % (pref, APPOPS_PROBE), timeout=15)
+        except AdbError:
+            continue
+        if appops_answer_ok(out, err):
+            return pref
+    return None
+
+
+def background_ops(sdk, target_sdk):
+    """AppOps a background restriction uses, following AOSP: Android 9+ sets
+    RUN_ANY_IN_BACKGROUND, plus RUN_IN_BACKGROUND for apps targeting < 26;
+    Android 7-8 has only RUN_IN_BACKGROUND; older Android has none."""
+    if sdk >= 28:
+        if not target_sdk:
+            return None              # unknown target SDK: can't tell whether the legacy op applies
+        return ["RUN_ANY_IN_BACKGROUND"] + (["RUN_IN_BACKGROUND"] if target_sdk < 26 else [])
+    if sdk >= 24:
+        return ["RUN_IN_BACKGROUND"]
+    return []
+
+
+def parse_appops_mode(text, op):
+    """'implicit' when the app has no entry ('No operations.'), else the mode word."""
+    m = re.search(r"(?m)^\s*%s:\s*([a-z_]+)" % re.escape(op), text or "")
+    if m:
+        return m.group(1)
+    if "No operations" in (text or ""):
+        return "implicit"
+    return None
+
+
+def _appops(serial, pref, args, user, accept):
+    """Run an appops command for `user`; `accept(out, err)` decides whether it
+    worked (by content - the exit code isn't reliable on every phone). The
+    unscoped form is only acceptable for user 0 (older tools without --user act on
+    it); for any other user a missing --user would read or change the WRONG user's
+    settings, so it isn't tried."""
+    cmds = ["%s %s --user %d %s" % (pref, args[0], user, args[1])]
+    if user == 0:
+        cmds.append("%s %s %s" % (pref, args[0], args[1]))
+    for cmd in cmds:
+        try:
+            rc, out, err = adb_shell(serial, cmd, timeout=20)
+        except AdbError:
+            continue
+        if accept(out, err):
+            return out
+    return None
+
+
+def appops_get(serial, pref, pkg, op, user):
+    """The mode, or None - only a real AppOps answer counts."""
+    out = _appops(serial, pref, ("get", "%s %s" % (shlex.quote(pkg), op)), user,
+                  lambda o, e: appops_answer_ok(o, e, op))
+    return None if out is None else parse_appops_mode(out, op)
+
+
+def appops_set(serial, pref, pkg, op, mode, user):
+    """True if the phone didn't reject the command. That does NOT mean it took
+    effect: callers always read the mode back, and only that read decides."""
+    return _appops(serial, pref, ("set", "%s %s %s" % (shlex.quote(pkg), op, mode)), user,
+                   lambda o, e: not UNSUPPORTED_RE.search(o + e) and not query_error(o + e)) is not None
+
+
+def read_background_modes(serial, pref, pkg, user, ops):
+    """Current mode of every op, or None if ANY can't be read (then nothing may change)."""
+    originals = {op: appops_get(serial, pref, pkg, op, user) for op in ops}
+    return None if not ops or any(v is None for v in originals.values()) else originals
+
+
+def restrict_background(serial, pref, pkg, user, ops, originals=None):
+    """Set 'ignore' on each op and read back. `originals` must already be read AND
+    saved by the caller (write-ahead); if not given they're read here.
+    Returns {"outcome", "originals", "readback"}."""
+    if originals is None:
+        originals = read_background_modes(serial, pref, pkg, user, ops)
+    if not originals:
+        return {"outcome": "unsupported", "originals": {}, "readback": {}}
+    for op in ops:
+        if not appops_set(serial, pref, pkg, op, "ignore", user):
+            break
+    readback = {op: appops_get(serial, pref, pkg, op, user) for op in ops}
+    ok = all(v == "ignore" for v in readback.values())
+    return {"outcome": "verified" if ok else "unverified", "originals": originals, "readback": readback}
+
+
+def allow_background(serial, pref, pkg, user, originals):
+    """Put every saved op back. An original 'no entry' can only be restored as an
+    explicit 'default' entry - functionally the same, reported as such."""
+    readback, approx = {}, []
+    for op, orig in originals.items():
+        target = "default" if orig in ("implicit", None) else orig
+        if orig == "implicit":
+            approx.append(op)
+        appops_set(serial, pref, pkg, op, target, user)
+        readback[op] = appops_get(serial, pref, pkg, op, user)
+    ok = all(readback[op] == ("default" if o in ("implicit", None) else o) for op, o in originals.items())
+    return {"outcome": "verified" if ok else "unverified", "readback": readback, "approximate": approx}
+
+
+# ---- opening an interactive adb shell in the user's terminal ------------------
+
+# how each terminal is told what to run: "argv" = program and arguments follow as
+# separate words after the flag; "string" = one command string after the flag.
+TERMINALS = [("x-terminal-emulator", "-e", "argv"), ("gnome-terminal", "--", "argv"),
+             ("konsole", "-e", "argv"), ("xfce4-terminal", "-x", "argv"), ("mate-terminal", "-x", "argv"),
+             ("lxterminal", "-e", "string"), ("tilix", "-e", "string"), ("terminator", "-x", "argv"),
+             ("kitty", "", "argv"), ("alacritty", "-e", "argv"), ("xterm", "-e", "argv")]
+
+
+def find_terminal():
+    """(path, flag, style, extra_args) of a terminal emulator, or None.
+    $TERMINAL wins when set; it may carry its own arguments ("kitty --single-instance",
+    '"/opt/my term/term" -x'), split with shlex - never run through a shell. Then the
+    system default, then common terminals."""
+    import shutil as _sh
+    env = (os.environ.get("TERMINAL") or "").strip()
+    if env:
+        try:
+            words = shlex.split(env)
+        except ValueError:
+            words = []
+        if words:
+            exe = words[0]
+            if os.path.isabs(exe):
+                path = exe if (os.path.isfile(exe) and os.access(exe, os.X_OK)) else None   # not a directory
+            else:
+                path = _sh.which(exe)
+            if path:
+                known = next((t for t in TERMINALS if t[0] == os.path.basename(path)), None)
+                flag, style = (known[1], known[2]) if known else ("-e", "argv")
+                return path, flag, style, words[1:]
+    for name, flag, style in TERMINALS:
+        path = _sh.which(name)
+        if path:
+            return path, flag, style, []
+    return None
+
+
+def shell_command(term, serial):
+    """argv that opens `<configured adb> -s SERIAL shell` in that terminal. The serial
+    is never interpolated unquoted: separate argv words, or shlex-quoted in string
+    mode. The user's own terminal arguments come right after the terminal program."""
+    path, flag, style = term[:3]
+    extra = list(term[3]) if len(term) > 3 else []
+    inner = [ADB, "-s", serial, "shell"]
+    if style == "string":
+        return [path] + extra + [flag, " ".join(shlex.quote(x) for x in inner)]
+    return [path] + extra + ([flag] if flag else []) + inner
+
+
+def manual_shell_hint(serial):
+    """The command a user can paste themselves - same adb the app uses, quoted."""
+    return "%s -s %s shell" % (shlex.quote(ADB), shlex.quote(serial or ""))
+
+
+def open_device_shell(serial):
+    """Start the terminal (detached). Returns None on success or an error message."""
+    if not serial:
+        return "No device connected - pick one at the top"
+    term = find_terminal()
+    if not term:
+        return ("No terminal program was found. Install one (e.g. xterm) or set the TERMINAL "
+                "environment variable - or run this yourself: %s" % manual_shell_hint(serial))
+    try:
+        subprocess.Popen(shell_command(term, serial), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as e:
+        return "Couldn't start %s: %s" % (os.path.basename(term[0]), e.strerror or e)
+    return None
+
+
+class AutorunTab(ttk.Frame):
+    """Read-only view of apps that can start at boot (milestone 1)."""
+    # an unset override does NOT mean "on": the manifest may say android:enabled="false"
+    STATE_WORDS = {"DEFAULT": "DEFAULT - manifest decides", "ENABLED": "ENABLED - explicitly",
+                   "DISABLED": "DISABLED - explicitly", "UNKNOWN": "UNKNOWN - couldn't be read"}
+
+    def __init__(self, master, app):
+        super().__init__(master)
+        self.app, self.serial, self.busy, self.gen = app, None, False, 0
+        self.data = None
+        top = ttk.Frame(self, padding=(6, 6, 6, 2))
+        top.pack(fill="x")
+        self.refresh_btn = ttk.Button(top, text="Refresh", command=self.refresh)
+        self.refresh_btn.pack(side="left")
+        self.show_sys = tk.BooleanVar(value=False)
+        ttk.Checkbutton(top, text="Show system apps", variable=self.show_sys,
+                        command=self.populate).pack(side="left", padx=8)
+        self.shell_btn = ttk.Button(top, text="Open shell", command=self.open_shell)
+        self.shell_btn.pack(side="right")
+        self.status = ttk.Label(self, text="", foreground="#555555", padding=(6, 0))
+        self.status.pack(fill="x")
+        self.saved = JsonStore(os.path.join(CONFIG_DIR, "autorun_saved.json"))   # originals, for exact restore
+        self.denied = set()                   # (serial, build, privilege) where Android refused receivers
+        self.sel_pkg = self.sel_cls = None
+        ctl = ttk.LabelFrame(self, text="Change - you confirm first, and every change is checked on the phone "
+                                        "afterwards", padding=6)
+        ctl.pack(side="bottom", fill="x", padx=6, pady=(0, 6))
+        self.btns = {}
+        for r, (label, items) in enumerate((
+                ("This start-up receiver:", (("rx_off", "Switch it off"), ("rx_back", "Put it back"))),
+                ("Background (the app keeps working):", (("bg_restrict", "Restrict background"),
+                                                         ("bg_allow", "Allow background again"))),
+                ("The WHOLE app:", (("app_off", "Turn app OFF"), ("app_on", "Turn app ON"))))):
+            ttk.Label(ctl, text=label).grid(row=r, column=0, sticky="w", padx=(0, 8), pady=1)
+            for c, (key, text) in enumerate(items):
+                b = ttk.Button(ctl, text=text, command=lambda k=key: self.act(k))
+                b.grid(row=r, column=c + 1, sticky="w", padx=2, pady=1)
+                self.btns[key] = b
+        ttk.Checkbutton(ctl, text="Use root (su) for this operation", variable=self.app.apps_tab.use_root) \
+            .grid(row=0, column=3, sticky="w", padx=(16, 0))
+        self.update_buttons()
+        pane = ttk.PanedWindow(self, orient="horizontal")
+        pane.pack(fill="both", expand=True, padx=6, pady=6)
+        left = ttk.Frame(pane)
+        pane.add(left, weight=3)
+        self.tree = ttk.Treeview(left, columns=("when", "state", "package"), show="tree headings",
+                                 selectmode="browse")
+        for c, h, w in (("#0", "App / start-up receiver", 300), ("when", "Can start", 200),
+                        ("state", "State", 160), ("package", "Package", 220)):
+            self.tree.heading(c, text=h)
+            self.tree.column(c, width=w, anchor="w")
+        sb = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.tree.tag_configure("off", foreground="#777777")
+        self.tree.bind("<<TreeviewSelect>>", self.on_select)
+        self.detail = tk.Text(pane, wrap="word", width=40, relief="flat", padx=8, pady=6, cursor="arrow")
+        self.detail.tag_configure("h1", font=("TkDefaultFont", 12, "bold"))
+        self.detail.tag_configure("dim", foreground="#777777")
+        pane.add(self.detail, weight=2)
+        self._detail([("Apps that can start when the phone finishes starting up are listed here. "
+                       "Press Refresh after connecting a phone.", "dim")])
+
+    def post(self, fn, *args):
+        self.app.q.put(("call", fn) + args)
+
+    def open_shell(self):
+        """An interactive adb shell for the selected phone, in a terminal window."""
+        err = open_device_shell(self.serial)
+        if err:
+            self.app.error(err)
+        else:
+            # Popen only proves the terminal was started; adb errors show up in that terminal
+            self.app.info("Started a terminal for an ADB shell on %s" % self.serial)
+
+    def _detail(self, chunks):
+        self.detail.configure(state="normal")
+        self.detail.delete("1.0", "end")
+        for t, tag in chunks:
+            self.detail.insert("end", t, tag)
+        self.detail.configure(state="disabled")
+
+    def set_device(self, serial):
+        if serial == self.serial:
+            return
+        self.serial, self.data = serial, None
+        self.gen += 1                                     # drop late results for the old device ...
+        self.busy = False                                 # ... and free the tab for the new one
+        self.refresh_btn.state(["!disabled"])
+        self.populate()
+
+    def on_shown(self):
+        if self.serial and self.data is None and not self.busy:
+            self.refresh()
+
+    def refresh(self):
+        if not self.serial or self.busy:
+            return
+        self.busy = True
+        self.refresh_btn.state(["disabled"])
+        self.status.configure(text="Reading which apps can start at boot ...")
+        threading.Thread(target=self._work, args=(self.gen, self.serial), daemon=True).start()
+
+    def _work(self, gen, serial):
+        try:
+            t0 = time.time()
+            user, usrc = current_user(serial)
+            det = detect_boot_receivers(serial, user)
+            states = receiver_states(serial, user, {p for p, _ in det["receivers"]},
+                                     lambda i, n: self.post(self._progress, gen, "Reading app states %d/%d ..."
+                                                            % (i + 1, n)))
+            self.post(self._done, gen, serial, dict(det, user=user, user_source=usrc, states=states,
+                                                    user_verified=usrc in ("detected", "single-user"),
+                                                    seconds=round(time.time() - t0, 1)), None)
+        except Exception as e:                            # always report back
+            self.post(self._done, gen, serial, None, "%s: %s" % (type(e).__name__, e))
+
+    def _progress(self, gen, text):
+        if gen == self.gen and self.busy:
+            self.status.configure(text=text)
+
+    def _done(self, gen, serial, data, error):
+        if gen != self.gen or serial != self.serial:
+            return
+        self.busy = False
+        self.refresh_btn.state(["!disabled"])
+        if error:
+            self.status.configure(text="Couldn't read the start-up list: " + error)
+            return
+        self.data = data
+        self.populate()
+
+    def label(self, pkg):
+        try:
+            return self.app.apps_tab.label(pkg)
+        except Exception:
+            return pkg
+
+    def is_system(self, pkg):
+        """True / False when the Apps list knows this package, None while it doesn't
+        (e.g. the Apps scan hasn't finished) - unknown is never treated as 'user app'."""
+        a = getattr(self.app.apps_tab, "apps", {}).get(pkg)
+        if not a or a.get("system") is None:
+            return None                                   # no record, or no classification in it
+        return bool(a["system"])
+
+    def populate(self):
+        self.tree.delete(*self.tree.get_children())
+        self.sel_pkg = self.sel_cls = None               # the old selection is gone with the old rows
+        self.update_buttons()
+        d = self.data
+        if not d:
+            self.status.configure(text="")
+            return
+        by_pkg = {}
+        for (pkg, cls), info in d["receivers"].items():
+            by_pkg.setdefault(pkg, []).append((cls, info))
+        shown, unclassified = 0, 0
+        for pkg in sorted(by_pkg, key=lambda p: self.label(p).lower()):
+            kind = self.is_system(pkg)
+            if kind is None:
+                unclassified += 1                         # shown, and said honestly
+            elif kind and not self.show_sys.get():
+                continue
+            st = d["states"].get(pkg)
+            pstate = (st or {}).get("pkg_state")
+            off = pstate in (2, 3, 4)
+            words = sorted({BOOT_ACTION_WORDS.get(a, a) for _, i in by_pkg[pkg] for a in i["actions"]})
+            # " · " joins them: the words themselves contain commas
+            pid = "p:" + pkg
+            self.tree.insert("", "end", iid=pid, text=self.label(pkg), open=False,
+                             values=(" · ".join(words), "app OFF" if off else
+                                     ("system or user: not known yet" if kind is None else ""), pkg),
+                             tags=("off",) if off else ())
+            for cls, info in sorted(by_pkg[pkg]):
+                state = receiver_state_word(cls, st)
+                sword = self.STATE_WORDS[state] + ("" if d.get("user_verified", d.get("user_source") in
+                                                                ("detected", "single-user"))
+                                                   else " (user 0, not verified)")
+                self.tree.insert(pid, "end", iid="r:%s/%s" % (pkg, cls), text=cls.rsplit(".", 1)[-1],
+                                 values=(" · ".join(BOOT_ACTION_WORDS.get(a, a) for a in sorted(info["actions"])),
+                                         sword, pkg),
+                                 tags=("off",) if off or state == "DISABLED" else ())
+            shown += 1
+        hidden = len(by_pkg) - shown
+        usrc = {"detected": "detected", "single-user": "the only user"}.get(d.get("user_source"), "NOT verified")
+        text = "%d app(s) can start at boot (user %d, %s) - found by: %s" % (len(by_pkg), d["user"], usrc,
+                                                                          d["method"])
+        if hidden:
+            text += " - %d system app(s) hidden" % hidden
+        if unclassified:
+            text += " - %d not yet known as system or user (the Apps list is still loading)" % unclassified
+        text += "  |  Receiver inventory: " + (
+            "complete Package Manager query for this user, including switched-off and off-until-used "
+            "receivers (APK manifests not yet cross-checked)" if d["complete"] else
+            "PARTIAL - " + "; ".join(d["notes"]))
+        if not d.get("user_verified", d.get("user_source") in ("detected", "single-user")):
+            text += "  |  Current user: NOT VERIFIED - component states shown for user 0 and may not be yours"
+        if d.get("seconds") is not None:
+            text += "  |  read in %.1f s" % d["seconds"]
+        self.status.configure(text=text)
+
+    # ---- controls ------------------------------------------------------------
+
+    @staticmethod
+    def record_key(serial, user, pkg):
+        return "%s|%s|%s" % (serial, user, pkg)
+
+    def saved_key(self, pkg):
+        return self.record_key(self.serial, (self.data or {}).get("user", 0), pkg)
+
+    def update_buttons(self):
+        st = ((self.data or {}).get("states") or {}).get(self.sel_pkg) or {}
+        saved = self.saved.get(self.saved_key(self.sel_pkg)) or {} if self.sel_pkg else {}
+        off = st.get("pkg_state") in (2, 3, 4)
+        can = {"rx_off": bool(self.sel_cls), "rx_back": bool(self.sel_cls and self.sel_cls in
+                                                              saved.get("components", {})),
+               "bg_restrict": bool(self.sel_pkg), "bg_allow": bool(saved.get("appops")),
+               "app_off": bool(self.sel_pkg) and not off, "app_on": bool(self.sel_pkg) and off}
+        verified = bool(self.data) and self.user_verified()
+        for k, b in self.btns.items():
+            b.state(["!disabled"] if can[k] and not self.busy and verified else ["disabled"])
+
+    def user_verified(self):
+        d = self.data or {}
+        return bool(d.get("user_verified", d.get("user_source") in ("detected", "single-user")))
+
+    def confirm_text(self, kind, pkg, cls):
+        label = self.label(pkg)
+        sysapp = self.is_system(pkg)
+        warn = ("\n\nThis is a SYSTEM app - changing it can affect how the phone works." if sysapp
+                else "\n\nIt isn't known yet whether this is a system app." if sysapp is None else "")
+        if kind == "rx_off":
+            key = (self.serial, getattr(self, "_fp", "?"), "root" if self.app.apps_tab.use_root.get() else "shell")
+            again = ("\n\nAndroid refused this on this phone before. Try again?" if key in self.denied else "")
+            return ("Switch off only this start-up receiver?\n\n%s\n(%s)\n\nThe app itself keeps working; "
+                    "Android just won't wake it through this receiver. Many phones refuse this over adb - if "
+                    "so, nothing is changed.%s%s" % (cls, label, warn, again))
+        if kind == "rx_back":
+            return "Put this receiver back exactly as it was before?\n\n%s\n(%s)" % (cls, label)
+        if kind == "bg_restrict":
+            return ("Restrict background execution for %s?\n\nThe app keeps working when you open it, but "
+                    "can't keep running in the background (like Android's battery 'Restricted' setting). "
+                    "It does NOT remove its start-up receivers.%s" % (label, warn))
+        if kind == "bg_allow":
+            return "Allow %s to run in the background again, as it was before?" % label
+        if kind == "app_off":
+            return ("Turn the WHOLE app OFF?\n\n%s\n\nIt can't be used at all until you turn it back on - "
+                    "its icon disappears. This is NOT the same as switching off one receiver.%s" % (label, warn))
+        return "Turn %s back ON?" % label
+
+    def act(self, kind):
+        if self.busy or not self.data or not self.sel_pkg:
+            return
+        if not self.user_verified():                     # second guard, not only the disabled buttons
+            messagebox.showwarning("Can't change anything", "The current Android user couldn't be "
+                                   "established, so a change might hit the wrong user. Nothing was changed.",
+                                   parent=self)
+            return
+        pkg, cls = self.sel_pkg, self.sel_cls
+        if not messagebox.askyesno("Please confirm", self.confirm_text(kind, pkg, cls), parent=self):
+            return
+        st = (self.data.get("states") or {}).get(pkg)
+        ctx = {"serial": self.serial, "user": self.data["user"], "user_verified": True, "pkg": pkg, "cls": cls,
+               "before": receiver_state_word(cls, st) if cls else None,
+               "target_sdk": (st or {}).get("target_sdk"), "key": self.saved_key(pkg),
+               "want_root": bool(self.app.apps_tab.use_root.get())}       # frozen for the worker
+        self.busy = True
+        self.update_buttons()
+        self.status.configure(text="Applying the change and checking it on the phone ...")
+        threading.Thread(target=self._act_work, args=(self.gen, kind, ctx), daemon=True).start()
+
+    def _act_work(self, gen, kind, ctx):
+        try:
+            res = self._act_run(kind, ctx)
+        except Exception as e:                            # always report back
+            res = {"outcome": "failed", "message": "%s: %s" % (type(e).__name__, e)}
+        log_action(ctx["serial"], {"rx_off": "receiver-off", "rx_back": "receiver-back", "bg_restrict": "bg-restrict",
+                                   "bg_allow": "bg-allow", "app_off": "app-off", "app_on": "app-on"}.get(kind, kind),
+                   ctx["pkg"], res.get("outcome") == "verified", res.get("message", ""), outcome=res.get("outcome"),
+                   user=ctx["user"], target=ctx["cls"] or "", source="autorun")
+        try:
+            res["fresh"] = receiver_states(ctx["serial"], ctx["user"], {ctx["pkg"]}).get(ctx["pkg"])
+        except Exception:
+            res["fresh"] = None
+        self.post(self._act_done, gen, ctx["serial"], kind, ctx["pkg"], ctx["cls"], res)
+
+    def _save_record(self, key, saved):
+        """True only if the restore record is safely on disk."""
+        return bool(self.saved.put(key, saved))
+
+    def _persist_before_change(self, key, saved, previous):
+        """Write the record and confirm it's on disk BEFORE any change - every time,
+        even if a record already exists (a failed write leaves it in memory only).
+        On failure the in-memory record is rolled back to what it was, so the GUI
+        never offers to restore a change that never happened."""
+        if self._save_record(key, saved):
+            return True
+        self.saved.put(key, previous)        # in-memory rollback (disk may still fail; that's fine)
+        return False
+
+    def _act_run(self, kind, ctx):
+        """Runs in the worker using ONLY the frozen context - never live GUI state.
+        Restore records are written BEFORE the phone is changed (write-ahead)."""
+        serial, user, pkg, cls, key = ctx["serial"], ctx["user"], ctx["pkg"], ctx["cls"], ctx["key"]
+        root = ctx["want_root"] and root_available(serial)
+        if ctx["want_root"] and not root and kind in ("rx_off", "rx_back"):
+            return {"outcome": "failed", "message": "root (su) isn't available - su didn't return uid 0, "
+                                                    "so nothing was tried"}
+        previous = self.saved.get(key)
+        saved = copy.deepcopy(previous) if previous else {}
+        nosave = {"outcome": "failed", "message": "the restore record couldn't be saved to disk, so nothing "
+                                                  "was changed on the phone"}
+        if kind == "rx_off":
+            self._fp = device_fingerprint(serial)
+            before = ctx["before"]
+            if before in (None, "UNKNOWN"):
+                return {"outcome": "failed", "message": "its current state couldn't be read, so it couldn't be "
+                                                        "restored exactly - nothing was changed"}
+            if before == "DISABLED":                    # already off: no record, no command
+                return {"outcome": "already", "message": ALREADY_MSG, "state": before}
+            new_record = cls not in saved.get("components", {})
+            saved.setdefault("components", {}).setdefault(cls, before)     # keep the FIRST original
+            if not self._persist_before_change(key, saved, previous):
+                return nosave
+            op = journal_begin(serial, user, pkg, "receiver-off", before, "DISABLED", cls, "autorun")
+            if op is False:
+                return journal_refusal(pkg)
+            if op == NOOP:
+                return {"outcome": "already", "message": ALREADY_MSG, "state": before}
+            res = journal_close(op, set_component_state(serial, user, pkg, cls, "disabled", root))
+            if res["outcome"] == "refused":
+                self.denied.add((serial, self._fp, "root" if root else "shell"))
+            if new_record:
+                # decided ONLY by the read-back, whatever the outcome: discard the new
+                # record exactly when the phone provably still has the original state
+                # (e.g. "off" pressed on a receiver that was already off)
+                if res.get("state") == before:
+                    saved["components"].pop(cls, None)
+                    if not self._save_record(key, saved):
+                        res["message"] = (res.get("message", "") + " (the unneeded restore record couldn't be "
+                                          "removed from disk)").strip()
+                elif res["outcome"] != "verified":
+                    res["message"] = (res.get("message", "") + " - it couldn't be confirmed that the receiver is "
+                                      "unchanged, so its original state was kept: 'Put it back' can restore it"
+                                      ).strip(" -")
+            return res
+        if kind == "rx_back":
+            before = saved.get("components", {}).get(cls)
+            if not isinstance(before, str) or before.lower() not in COMPONENT_TARGET:
+                return {"outcome": "failed", "message": "the saved original state for this receiver is missing "
+                                                        "or damaged, so it can't be put back exactly - nothing "
+                                                        "was changed"}
+            op = journal_begin(serial, user, pkg, "receiver-back", None, COMPONENT_TARGET[before.lower()][1], cls,
+                               "autorun")
+            if op is False:
+                return journal_refusal(pkg)
+            if op == NOOP:
+                return {"outcome": "already", "message": ALREADY_MSG}
+            res = journal_close(op, set_component_state(serial, user, pkg, cls, before.lower(), root))
+            if res["outcome"] == "verified":
+                saved["components"].pop(cls, None)
+                if not self._save_record(key, saved):
+                    res["message"] = "restored on the phone, but the restore record couldn't be removed from disk"
+            return res
+        if kind in ("bg_restrict", "bg_allow"):
+            pref = appops_prefix(serial)
+            if not pref:
+                return {"outcome": "unsupported", "message": "this phone has no AppOps command"}
+            if kind == "bg_allow":
+                orig = saved.get("appops", {})
+                op = journal_begin(serial, user, pkg, "bg-allow", None,
+                                   {o: ("default" if v in ("implicit", None) else v) for o, v in orig.items()} or None,
+                                   "", "autorun")
+                if op is False:
+                    return journal_refusal(pkg)
+                if op == NOOP:
+                    return {"outcome": "already", "message": ALREADY_MSG}
+                res = journal_close(op, allow_background(serial, pref, pkg, user, orig))
+                if res["outcome"] == "verified":
+                    saved.pop("appops", None)
+                    if not self._save_record(key, saved):
+                        res["message"] = "restored on the phone, but the restore record couldn't be removed"
+                return res
+            try:
+                sdk = int(adb_shell(serial, "getprop ro.build.version.sdk", timeout=15)[1].strip())
+            except (AdbError, ValueError):
+                sdk = 0
+            ops = background_ops(sdk, ctx["target_sdk"])
+            if ops is None:
+                return {"outcome": "unsupported", "message": "the app's target Android version couldn't be read, "
+                                                             "so it isn't known which background settings apply - "
+                                                             "nothing was changed"}
+            if not ops:
+                return {"outcome": "unsupported", "message": "background restriction needs Android 7 or newer"}
+            originals = read_background_modes(serial, pref, pkg, user, ops)
+            if originals is None:
+                return {"outcome": "unsupported", "message": "the current background settings couldn't be read "
+                                                             "for this user - nothing was changed"}
+            if all(v == "ignore" for v in originals.values()):     # already restricted: no record, no command
+                return {"outcome": "already", "message": ALREADY_MSG, "originals": originals, "readback": originals}
+            saved.setdefault("appops", originals)        # keep the FIRST originals
+            if not self._persist_before_change(key, saved, previous):   # every time, not only the first
+                return nosave
+            op = journal_begin(serial, user, pkg, "bg-restrict", originals, {o: "ignore" for o in ops}, "", "autorun")
+            if op is False:
+                return journal_refusal(pkg)
+            if op == NOOP:
+                return {"outcome": "already", "message": ALREADY_MSG, "originals": originals, "readback": originals}
+            return journal_close(op, restrict_background(serial, pref, pkg, user, ops, originals))
+        op = journal_begin(serial, user, pkg, "app-on" if kind == "app_on" else "app-off", None,
+                           "on" if kind == "app_on" else "off", "", "autorun")
+        if op is False:
+            return journal_refusal(pkg)
+        if op == NOOP:
+            return {"outcome": "already", "message": ALREADY_MSG}
+        return journal_close(op, set_package_state(serial, user, pkg, kind == "app_on", root))
+
+    def _act_done(self, gen, serial, kind, pkg, cls, res):
+        if gen != self.gen or serial != self.serial:
+            return
+        self.busy = False
+        if res.get("fresh") is not None and self.data:
+            self.data["states"][pkg] = res["fresh"]
+        if kind in ("app_off", "app_on") and res["outcome"] == "verified":
+            a = self.app.apps_tab.apps.get(pkg)
+            if a is not None:
+                a["disabled"] = kind == "app_off"
+        sel = ("r:%s/%s" % (pkg, cls)) if cls and kind.startswith("rx") else "p:" + pkg
+        self.populate()
+        if self.tree.exists(sel):
+            self.tree.selection_set(sel)
+            self.on_select()
+        lines = [OUTCOME_WORDS.get(res["outcome"], res["outcome"])]
+        if kind.startswith("rx") and res.get("state"):
+            lines.append("This receiver now: " + self.STATE_WORDS.get(res["state"], res["state"]))
+        if kind.startswith("app") and "pkg_state" in res:
+            lines.append("The app now: " + PKG_STATE_WORDS.get(res["pkg_state"], "unknown"))
+        if kind.startswith("bg") and res.get("readback"):
+            lines.append("Now on the phone: " + ", ".join("%s = %s" % kv for kv in res["readback"].items()))
+        if res.get("approximate"):
+            lines.append("Note: these had no setting before and are now set to 'default', which behaves the "
+                         "same: " + ", ".join(res["approximate"]))
+        if res["outcome"] == "refused" and kind == "rx_off":
+            lines.append("Nothing else was changed. Options: 'Restrict background', or turn the whole app OFF, "
+                         "or root (su) if your phone has it.")
+        if res.get("message") and res["outcome"] != "verified":
+            lines.append("\nDetails: " + res["message"])
+        (messagebox.showinfo if res["outcome"] in ("verified", "already") else messagebox.showwarning)(
+            OUTCOME_WORDS.get(res["outcome"], "Result"), "\n".join(lines), parent=self)
+        self.update_buttons()
+
+    def on_select(self, event=None):
+        sel = self.tree.selection()
+        if not sel or not self.data:
+            self.sel_pkg = self.sel_cls = None
+            self.update_buttons()
+            return
+        iid = sel[0]
+        if iid.startswith("p:"):
+            self.sel_pkg, self.sel_cls = iid[2:], None
+        else:
+            self.sel_pkg, self.sel_cls = iid[2:].split("/", 1)
+        self.update_buttons()
+        d = self.data
+        if iid.startswith("p:"):
+            pkg = iid[2:]
+            st = d["states"].get(pkg)
+            pstate = (st or {}).get("pkg_state")
+            self._detail([(self.label(pkg) + "\n", "h1"), (pkg + "\n\n", "dim"),
+                          ("This app declares that Android may wake it when the phone finishes starting up. "
+                           "That's a capability - it doesn't prove the app actually runs every time.\n\n", ()),
+                          ("Whole app: %s\n" % PKG_STATE_WORDS.get(pstate, "unknown"), ())])
+        else:
+            pkg, cls = iid[2:].split("/", 1)
+            st = d["states"].get(pkg)
+            state = receiver_state_word(cls, st)
+            info = d["receivers"].get((pkg, cls), {"actions": set()})
+            expl = {"DEFAULT": "No explicit override. Whether it's active is decided by the app's manifest, "
+                               "which this version doesn't read yet - so it may be on or off.",
+                    "ENABLED": "Explicitly switched on.",
+                    "DISABLED": "Explicitly switched off - Android won't wake it for these events.",
+                    "UNKNOWN": "Its state couldn't be read on this phone."}[state]
+            self._detail([(cls.rsplit(".", 1)[-1] + "\n", "h1"), (pkg + "/" + cls + "\n\n", "dim"),
+                          ("Wakes up: %s\n" % " · ".join(BOOT_ACTION_WORDS.get(a, a) for a in sorted(info["actions"])), ()),
+                          ("State: %s\n%s\n" % (self.STATE_WORDS[state], expl), ()),
+                          ("\nUse the buttons below to change it - you'll confirm first, and the result is "
+                           "checked on the phone.\n", "dim")])
+
+
 class SecurityTab(ttk.Frame):
     def __init__(self, master, app):
         super().__init__(master, padding=4)
@@ -3838,6 +6322,8 @@ class SecurityTab(ttk.Frame):
         self.info_btn.pack(side="left", padx=(12, 0))
         self.set_btn = ttk.Button(top, text="Security settings", command=self.open_settings)
         self.set_btn.pack(side="left", padx=4)
+        self.timeline_btn = ttk.Button(top, text="Timeline\u2026", command=self.open_timeline)
+        self.timeline_btn.pack(side="left")
         ttk.Checkbutton(top, text="Show technical details", variable=self.show_tech,
                         command=self.render).pack(side="right")
         expl = ttk.Label(self, text="Checkup: quick, nothing leaves your computer.   Deep scan: also copies "
@@ -3901,6 +6387,17 @@ class SecurityTab(ttk.Frame):
 
     def on_shown(self):
         pass
+
+    def open_timeline(self):
+        serial = self.app.apps_tab.serial
+        if not serial:
+            self.app.error("No device connected - pick one at the top")
+            return
+        win = getattr(self, "_timeline_win", None)
+        if win is not None and win.winfo_exists():
+            win.lift()
+            return
+        self._timeline_win = TimelineWindow(self.app.root, self.app, serial)
 
     def device_info(self):
         if not self.serial:
@@ -4016,7 +6513,18 @@ class SecurityTab(ttk.Frame):
         else:
             launcher = set()
         access = sa.access_lists(facts)
-        found = (sa.check_device(facts) + sa.check_access(facts, access, launcher, label) +
+        self.say("Security: checking which apps start at boot ...")
+        user, usrc = None, None
+        try:
+            user, usrc = current_user(serial)
+            det = detect_boot_receivers(serial, user)
+            mine = {p for p, _ in det["receivers"]} & set(users)
+            boot = boot_signals(det, receiver_states(serial, user, mine) if mine else {},
+                                usrc in ("detected", "single-user"))
+        except Exception:                                  # unreadable -> "couldn't check", never "none"
+            boot = None
+        found = (sa.check_patterns(facts, access, launcher, label, boot) +
+                 sa.check_device(facts) + sa.check_access(facts, access, launcher, label) +
                  sa.check_origin(facts, launcher, label) + sa.check_usage(facts, launcher, label))
 
         idcache = sa.load_json(sa.IDENTITY_FILE, {})
@@ -4049,7 +6557,16 @@ class SecurityTab(ttk.Frame):
                 shutil.rmtree(work, ignore_errors=True)
 
         prev_snap = sa.last_snapshot(serial)
-        snap = sa.build_snapshot(serial, facts, access, launcher, idcache, prev=prev_snap)
+        verified = usrc in ("detected", "single-user")
+        bg = None
+        if verified and "appops" not in facts["failed"] and facts.get("appops_raw", "").strip():
+            sdk = _int_or_none((facts.get("props") or {}).get("sdk")) or _int_or_none(self.app.apps_tab.props.get("sdk"))
+            if sdk:                  # unknown Android version: the ops can't be chosen -> unread (None), not empty
+                targets = {p: _int_or_none(a.get("target_sdk")) for p, a in apps.items()}
+                bg = pf.background_from_appops(facts["appops_raw"], user,
+                                               lambda p: background_ops(sdk, targets.get(p)) if p in targets else None)
+        snap = sa.build_snapshot(serial, facts, access, launcher, idcache, prev=prev_snap,
+                                 boot=boot if verified else None, bg=bg, user=user if verified else None)
         found += sa.compare_snapshots(prev_snap, snap, label)
         if not self.stop.is_set() and not sa.save_snapshot(serial, snap):
             found.append(sa.finding(
@@ -4321,6 +6838,7 @@ class DeviceInfoWindow(tk.Toplevel):
         self.refresh_btn.pack(side="left", padx=4)
         self.db_btn = ttk.Button(btns, text="Database ...", command=self.open_db)
         self.db_btn.pack(side="left")
+        ttk.Button(btns, text="Known security issues\u2026", command=self.open_issues).pack(side="left", padx=4)
         self.ai_note = ttk.Label(btns, text="", foreground="#777777")
         self.ai_note.pack(side="left", padx=8)
 
@@ -4540,10 +7058,18 @@ class DeviceInfoWindow(tk.Toplevel):
                 w(value + "\n", tag)
         if a.get("confidence"):
             w("\nAI confidence: %s\n" % a["confidence"], "dim")
+        note = source_check_note(a)
+        if note and note[1] == "warn":
+            w(note[0], note[1])
         if a.get("sources"):
             w("Sources (click to open)\n", "label")
+            if note and note[1] != "warn":
+                w(note[0], note[1])
             for u in a["sources"][:10]:
                 self.add_link(self.txt, u)
+                mark = source_mark(a, u)
+                if mark:
+                    w("     " + mark.strip() + "\n", "dim")
 
     def render_ai(self, res):
         t = self._ai_section_start()
@@ -4568,6 +7094,13 @@ class DeviceInfoWindow(tk.Toplevel):
         t.configure(state="disabled")
         t.see(self._ai_mark)
 
+    def open_issues(self):
+        win = getattr(self, "_issues_win", None)
+        if win is not None and win.winfo_exists():
+            win.lift()
+            return
+        self._issues_win = KnownIssuesWindow(self, self.info, self.app)
+
     def open_db(self):
         win = getattr(self, "_db_win", None)
         if win is not None and win.winfo_exists():
@@ -4578,6 +7111,303 @@ class DeviceInfoWindow(tk.Toplevel):
     def copy(self, txt):
         self.clipboard_clear()
         self.clipboard_append(txt.get("1.0", "end").strip())
+
+
+CVE_STATE_WORDS = {cv.POTENTIAL: "⚠ may be affected", cv.UNKNOWN: "? can't tell",
+                   cv.FIXED: "✔ fixed (by reported patch)", cv.NOT_AFFECTED: "– not affected"}
+CVE_SHOW = ["May be affected", "Can't tell", "Fixed by reported patch", "Everything", "Chip maker's notices"]
+
+
+class KnownIssuesWindow(tk.Toplevel):
+    """Known Android security issues vs. this phone - information only. Uses the saved
+    bulletin data; the network is used only when the user presses a button."""
+
+    def __init__(self, master, info, app):
+        super().__init__(master)
+        self.title("Known security issues")
+        self.transient(master)
+        self.minsize(720, 480)
+        self.info, self.app = info, app
+        self.props = dict(info.get("props") or {})
+        self.data = sa.load_cve_data()
+        self.assessment = None
+        self.maker = None                     # chip maker's notices (list of findings) once searched
+        self.maker_note = ""
+        self.busy = False
+        self.stop = threading.Event()
+        self.rows = {}
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill="both", expand=True)
+        intro = ttk.Label(frm, justify="left", foreground="#555555", text=(
+            "Publicly known Android security issues, compared with this phone's Android version and the security "
+            "patch it REPORTS. Information only: nothing is tested or run on the phone. 'May be affected' means "
+            "the issue is newer than your patch - not that your phone was attacked, nor that an attack exists for "
+            "it."))
+        intro.pack(fill="x")
+        intro.bind("<Configure>", lambda e: intro.configure(wraplength=max(200, e.width - 4)))
+        self.head = ttk.Label(frm, text="", font=("TkDefaultFont", 10, "bold"), justify="left")
+        self.head.pack(fill="x", pady=(6, 0))
+        self.head.bind("<Configure>", lambda e: self.head.configure(wraplength=max(200, e.width - 4)))
+        row = ttk.Frame(frm)
+        row.pack(fill="x", pady=(6, 4))
+        self.dl_btn = ttk.Button(row, text="Download / update the bulletin data", command=self.download)
+        self.dl_btn.pack(side="left")
+        self.maker_btn = ttk.Button(row, text="Search the chip maker's notices", command=self.search_maker)
+        self.maker_btn.pack(side="left", padx=6)
+        self.stop_btn = ttk.Button(row, text="Stop", command=self.stop.set)
+        ttk.Label(row, text="Show:").pack(side="left", padx=(12, 0))
+        self.show = tk.StringVar(value=CVE_SHOW[0])
+        cb = ttk.Combobox(row, textvariable=self.show, values=CVE_SHOW, state="readonly", width=22)
+        cb.pack(side="left", padx=4)
+        cb.bind("<<ComboboxSelected>>", lambda e: self.populate())
+        self.status = ttk.Label(frm, text="", foreground="#555555")
+        self.status.pack(fill="x")
+        pw = ttk.PanedWindow(frm, orient="vertical")
+        pw.pack(fill="both", expand=True, pady=(4, 0))
+        top = ttk.Frame(pw)
+        self.tree = ttk.Treeview(top, columns=("state", "wild", "fix", "sev"), selectmode="browse", height=9)
+        for c, t, w_ in (("#0", "Issue", 170), ("state", "This phone", 190), ("wild", "Used in attacks?", 130),
+                         ("fix", "Fixed in patch", 110), ("sev", "Severity", 80)):
+            self.tree.heading(c, text=t)
+            self.tree.column(c, width=w_, stretch=c == "#0")
+        sb = ttk.Scrollbar(top, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.tree.bind("<<TreeviewSelect>>", self.on_select)
+        pw.add(top, weight=3)
+        self.details = tk.Text(pw, wrap="word", height=9, relief="flat", padx=8, pady=6, cursor="arrow",
+                               font=("TkDefaultFont", 10))
+        self.details.tag_configure("h", font=("TkDefaultFont", 11, "bold"))
+        self.details.tag_configure("dim", foreground="#777777")
+        self.details.tag_configure("link", foreground="#1f5fbf", underline=True)
+        pw.add(self.details, weight=2)
+        bot = ttk.Frame(frm)
+        bot.pack(fill="x", pady=(6, 0))
+        ttk.Button(bot, text="Close", command=self.destroy).pack(side="right")
+        self.recompute()
+
+    # ---- assessment ---------------------------------------------------------
+
+    def recompute(self):
+        d = self.data
+        if d:
+            self.assessment = cv.assess(d["osv_records"], self.props, d["kev"])
+        else:
+            self.assessment = None
+        self.populate()
+
+    def headline(self):
+        rel = self.props.get("ro.build.version.release", "?")
+        spl = self.props.get("ro.build.version.security_patch") or "unknown"
+        if not self.data:
+            return ("Your phone: Android %s, security patch %s. No bulletin data yet - press 'Download / update "
+                    "the bulletin data' (about 10 MB from Google and CISA; nothing about your phone is sent)."
+                    % (rel, spl))
+        c = self.assessment["counts"]
+        text = ("Your phone: Android %s, security patch %s.  Bulletin data checked %s.\n"
+                "%d serious issue(s) may affect it (fixed only in newer patches)%s; %d can't be told; "
+                "%d fixed by the patch it reports." % (
+                    rel, spl, self.data["checked"], c[cv.POTENTIAL],
+                    ", %d known to be used in real attacks" % c["potential_and_exploited"]
+                    if c["potential_and_exploited"] else "", c[cv.UNKNOWN], c[cv.FIXED]))
+        notes = list(self.assessment["notes"])
+        if self.data.get("osv_skipped"):
+            notes.append("%d record(s) in the download couldn't be read." % self.data["osv_skipped"])
+        return text + ("\n" + " ".join(notes) if notes else "")
+
+    def populate(self):
+        self.head.configure(text=self.headline())
+        self.tree.delete(*self.tree.get_children())
+        self.rows = {}
+        show = self.show.get()
+        if show == "Chip maker's notices":
+            for i, f in enumerate(self.maker or []):
+                iid = "m%d" % i
+                if f["source"] == "bulletin":
+                    state = ("see bulletin: " + CVE_STATE_WORDS[f["bulletin_state"]]) if f["bulletin_state"] \
+                        else "in the bulletin data"
+                elif f["source"] == "mention":
+                    state = "only mentions the maker"
+                else:
+                    state = {"listed": "chip listed", "family": "chip family listed", "unmatched": "chip not matched",
+                             "unknown": "chips not stated"}[f["chip"]] + (
+                        ", Android listed" if f["android"] == "listed" else
+                        ", Android not listed" if f["android"] == "not_listed" else "")
+                self.tree.insert("", "end", iid=iid, text=f["cve"], values=(
+                    state, "CISA list (via CIRCL)" if f["kev_listed"] else "-", "unknown", f["severity"] or "-"))
+                self.rows[iid] = ("maker", f)
+            self.status.configure(text=self.maker_note or "Press 'Search the chip maker's notices' to search.")
+            return
+        if not self.assessment:
+            return
+        want = {"May be affected": (cv.POTENTIAL,), "Can't tell": (cv.UNKNOWN,),
+                "Fixed by reported patch": (cv.FIXED,)}.get(show)
+        for i, f in enumerate(self.assessment["findings"]):
+            if want and f["state"] not in want:
+                continue
+            iid = "b%d" % i
+            wild = {True: "⛔ yes (CISA list)", False: "not on CISA's list", None: "unknown"}[f["exploited_in_wild"]]
+            self.tree.insert("", "end", iid=iid, text=", ".join(f["cves"]) or f["id"],
+                             values=(CVE_STATE_WORDS[f["state"]], wild, f["fix_spl"] or "?", f["severity"] or "-"))
+            self.rows[iid] = ("bulletin", f)
+
+    def on_select(self, event=None):
+        sel = self.tree.selection()
+        if not sel or sel[0] not in self.rows:
+            return
+        kind, f = self.rows[sel[0]]
+        t = self.details
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        w = lambda text, tag=(): t.insert("end", text, tag)  # noqa: E731
+        if kind == "bulletin":
+            w((", ".join(f["cves"]) or f["id"]) + "\n", "h")
+            w(CVE_STATE_WORDS[f["state"]] + ": " + f["reason"] + "\n")
+            if f["applies"] is None and f["state"] == cv.FIXED:
+                w("(It isn't known whether this issue applies to your phone at all.)\n", "dim")
+            w("\n" + (f["details"] or "") + "\n\n")
+            w("Four separate questions:\n", "h")
+            w("• Could your phone have this issue?  %s\n" % CVE_STATE_WORDS[f["state"]])
+            w("• Used in real attacks?  %s\n" % {True: "yes - on CISA's known-exploited list",
+                                                     False: "not on CISA's known-exploited list",
+                                                     None: "unknown"}[f["exploited_in_wild"]])
+            w("• Public exploit available?  not tracked here (unknown)\n")
+            w("• Root shown on similar phones?  not tracked here (unknown)\n")
+            w("Impact: %s.  Confidence: %s.\n" % (f["impact"], f["confidence"]), "dim")
+            links = f["advisories"]
+        else:
+            w(f["cve"] + "\n", "h")
+            w(f["summary"] + ".\n", ())
+            if f["source"] == "bulletin":
+                w("The Android bulletin data covers this issue%s.\n" % (
+                    ": see it under 'Everything'" if f["bulletin_state"] else
+                    " (it isn't one of the serious issues listed there)"), "dim")
+            w("\n" + (f["desc"] or "") + "\n\n")
+            w("Published %s.  Severity: %s.%s\n" % (f["published"] or "?", f["severity"] or "not given",
+                                                    "  Listed on CISA's exploited list (per CIRCL's record)."
+                                                    if f["kev_listed"] else ""), "dim")
+            if f["source"] == "maker":
+                w("This comes from the chip maker's own notice (via CIRCL Vulnerability-Lookup). It names chips "
+                  "and Android versions, but not patch dates.\n", "dim")
+            elif f["source"] == "mention":
+                w("Found by searching for the maker's name, but published by someone else - it's not the maker's "
+                  "notice, so it isn't matched against your phone.\n", "dim")
+            links = f["refs"]
+        for i, u in enumerate(links):
+            tag = "u%d" % i
+            w(u + "\n", ("link", tag))
+            t.tag_bind(tag, "<Button-1>", lambda e, u=u: webbrowser.open(u))
+        t.configure(state="disabled")
+
+    # ---- network (only on a click) -------------------------------------------
+
+    def set_busy(self, on):
+        self.busy = on
+        for b in (self.dl_btn, self.maker_btn):
+            b.state(["disabled"] if on else ["!disabled"])
+        if on:
+            self.stop.clear()
+            self.stop_btn.pack(side="left", padx=4, after=self.maker_btn)
+        else:
+            self.stop_btn.pack_forget()
+
+    def post(self, fn, *args):
+        self.app.q.put(("call", fn) + args)
+
+    def download(self):
+        if self.busy:
+            return
+        self.set_busy(True)
+
+        def work():
+            res = sa.refresh_cve_data(self.stop, lambda m: self.post(self._status, m))
+            self.post(self._downloaded, res)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _status(self, text):
+        if self.winfo_exists():
+            self.status.configure(text=text)
+
+    def _downloaded(self, res):
+        if not self.winfo_exists():
+            return
+        self.set_busy(False)
+        self.status.configure(text=("Done: " if res["ok"] else "Not updated: ") + res["message"])
+        if res["ok"]:
+            self.data = sa.load_cve_data()
+            self.recompute()
+
+    def search_maker(self, refresh=False):
+        if self.busy:
+            return
+        vendor = sa.circl_vendor(self.props)
+        if not vendor:
+            messagebox.showinfo("Chip maker unknown", "This phone doesn't say who made its chip in a way this "
+                                "search understands, so there's nothing to search for.", parent=self)
+            return
+        cached = load_circl_cache_entry(vendor)
+        if cached and not refresh:
+            if messagebox.askyesno("Search again?", "%s's notices were fetched %s. Fetch them again now?\n\n"
+                                   "No = use the saved copy." % (vendor, cached.get("fetched", "?")), parent=self):
+                refresh = True
+        elif not cached and not messagebox.askyesno(
+                "Search the chip maker's notices",
+                "This asks CIRCL Vulnerability-Lookup (a public service run by CIRCL, Luxembourg) for %s's security "
+                "notices. Only the word \"%s\" is sent - nothing about your phone. Up to 10 requests.\n\nGo ahead?"
+                % (vendor, vendor), parent=self):
+            return
+        self.set_busy(True)
+        self.status.configure(text="Searching CIRCL for %s's notices ..." % vendor)
+
+        def work():
+            try:
+                # "No, use the saved copy" means no network at all, however old the copy is
+                res = sa.circl_search(vendor, refresh=refresh, cancel=self.stop,
+                                      max_age=float("inf") if cached and not refresh else sa.CIRCL_MAX_AGE)
+                self.post(self._searched, vendor, res, None)
+            except sa.CirclError as e:
+                self.post(self._searched, vendor, None, e)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _searched(self, vendor, res, err):
+        if not self.winfo_exists():
+            return
+        self.set_busy(False)
+        if err is not None:
+            self.maker_note = "Search unavailable: %s. (That's not the same as 'no issues'.)" % err
+            self.show.set("Chip maker's notices")
+            self.populate()
+            return
+        bulletin = {}
+        for f in (self.assessment or {}).get("findings", []):
+            for c in f["cves"]:
+                bulletin[c] = f
+        known = {c for r in (self.data or {}).get("osv_records", []) for c in r.get("cves", [])}   # ALL of it
+        self.maker = sa.circl_assess(res["records"], self.props, bulletin, known, vendor)
+        how = "loaded from the saved copy (%s)" % res["fetched"] if res["from_cache"] else "retrieved just now"
+        self.maker_note = ("%s: %d notice(s) %s%s. Matched on your PC against your chip (%s) and Android %s." % (
+            vendor, len(res["records"]), how,
+            "" if res["complete"] else " - PARTIAL (%s; %d exist)" % (res.get("partial_reason") or "incomplete",
+                                                                     res["count"]),
+            self.props.get("ro.soc.model") or self.props.get("ro.board.platform") or "?",
+            self.props.get("ro.build.version.release", "?")))
+        if not res["records"]:
+            if res.get("stopped"):
+                self.maker_note = "%s: the search was stopped before any notices arrived." % vendor
+            elif res["complete"]:
+                self.maker_note = "%s: no notices found (the search completed)." % vendor
+            else:
+                self.maker_note = "%s: the search didn't complete (%s) - nothing can be said." % (
+                    vendor, res.get("partial_reason") or "incomplete")
+        self.show.set("Chip maker's notices")
+        self.populate()
+
+
+def load_circl_cache_entry(vendor):
+    c = sa.load_json(sa.CIRCL_CACHE_FILE, {})
+    e = c.get(vendor)
+    return e if isinstance(e, dict) and e.get("complete") is True and isinstance(e.get("records"), list) else None
 
 
 class RootingDBWindow(tk.Toplevel):
@@ -5806,6 +8636,355 @@ class AISettings(tk.Toplevel):
 # GUI: main window
 # --------------------------------------------------------------------------
 
+# ==========================================================================
+# Look & feel: window fitted to the screen, wrapping toolbars, icons
+# ==========================================================================
+#
+# Icons are drawn by the program itself (small line drawings rasterised at the
+# desktop's scale), so there are no image files to ship, no icon-pack licences
+# and no extra dependency. Text labels stay next to them.
+
+def _seg(px, py, ax, ay, bx, by):
+    dx, dy = bx - ax, by - ay
+    t = 0.0 if dx == dy == 0 else max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)))
+    return ((px - ax - t * dx) ** 2 + (py - ay - t * dy) ** 2) ** 0.5
+
+
+def _poly(pts, closed=False):
+    pairs = list(zip(pts, pts[1:])) + ([(pts[-1], pts[0])] if closed else [])
+    return lambda x, y: min(_seg(x, y, a[0], a[1], b[0], b[1]) for a, b in pairs)
+
+
+def _ring(cx, cy, r, a0=None, a1=None):
+    """Circle outline; with a0/a1 (degrees, 0 = right, clockwise, y down) an arc."""
+    import math
+
+    def f(x, y):
+        if a0 is not None:
+            ang = math.degrees(math.atan2(y - cy, x - cx)) % 360
+            inside = (a0 <= ang <= a1) if a0 <= a1 else (ang >= a0 or ang <= a1)
+            if not inside:
+                ends = [(cx + r * math.cos(math.radians(a)), cy + r * math.sin(math.radians(a))) for a in (a0, a1)]
+                return min(((x - ex) ** 2 + (y - ey) ** 2) ** 0.5 for ex, ey in ends)
+        return abs(((x - cx) ** 2 + (y - cy) ** 2) ** 0.5 - r)
+    return f
+
+
+def _fill_rect(x0, y0, x1, y1):
+    return lambda x, y: 0.0 if (x0 <= x <= x1 and y0 <= y <= y1) else 9.0
+
+
+def _fill_circle(cx, cy, r):
+    return lambda x, y: 0.0 if (x - cx) ** 2 + (y - cy) ** 2 <= r * r else 9.0
+
+
+def _fill_tri(a, b, c):
+    def f(x, y):
+        def side(p, q):
+            return (x - q[0]) * (p[1] - q[1]) - (p[0] - q[0]) * (y - q[1])
+        d1, d2, d3 = side(a, b), side(b, c), side(c, a)
+        neg, pos = (d1 < 0) or (d2 < 0) or (d3 < 0), (d1 > 0) or (d2 > 0) or (d3 > 0)
+        return 0.0 if not (neg and pos) else 9.0
+    return f
+
+
+def _ellipse(cx, cy, rx, ry):
+    return lambda x, y: abs((((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2) ** 0.5 - 1) * min(rx, ry)
+
+
+_FOLDER = [(.08, .28), (.38, .28), (.46, .37), (.92, .37), (.92, .84), (.08, .84)]
+ICON_SHAPES = {
+    "files": [_poly(_FOLDER, True)],
+    "apps": [_fill_rect(.12, .12, .43, .43), _fill_rect(.57, .12, .88, .43),
+             _fill_rect(.12, .57, .43, .88), _fill_rect(.57, .57, .88, .88)],
+    "network": [_ring(.5, .5, .38), _poly([(.12, .5), (.88, .5)]), _ellipse(.5, .5, .17, .38)],
+    "security": [_poly([(.5, .08), (.86, .2), (.82, .56), (.5, .92), (.18, .56), (.14, .2)], True),
+                 _poly([(.33, .5), (.46, .63), (.68, .38)])],
+    "autorun": [_ring(.5, .56, .32, 300, 240), _poly([(.5, .1), (.5, .5)])],
+    "refresh": [_ring(.5, .52, .32, 330, 250), _fill_tri((.62, .06), (.86, .2), (.6, .34))],
+    "terminal": [_poly([(.08, .16), (.92, .16), (.92, .84), (.08, .84)], True),
+                 _poly([(.24, .36), (.40, .5), (.24, .64)]), _poly([(.46, .66), (.72, .66)])],
+    "install": [_poly([(.5, .1), (.5, .6)]), _poly([(.3, .42), (.5, .62), (.7, .42)]),
+                _poly([(.12, .62), (.12, .88), (.88, .88), (.88, .62)])],
+    "trash": [_poly([(.14, .24), (.86, .24)]), _poly([(.38, .24), (.4, .12), (.6, .12), (.62, .24)]),
+              _poly([(.24, .24), (.3, .9), (.7, .9), (.76, .24)]), _poly([(.44, .38), (.44, .78)]),
+              _poly([(.56, .38), (.56, .78)])],
+    "off": [_ring(.5, .5, .36), _poly([(.25, .75), (.75, .25)])],
+    "on": [_ring(.5, .5, .36), _poly([(.32, .5), (.45, .63), (.68, .38)])],
+    "undo": [_ring(.54, .56, .3, 180, 90), _fill_tri((.06, .56), (.40, .56), (.23, .32))],
+    "pause": [_fill_rect(.26, .2, .42, .8), _fill_rect(.58, .2, .74, .8)],
+    "search": [_ring(.42, .42, .26), _poly([(.61, .61), (.88, .88)])],
+    "ai": [_poly([(.5, .1), (.5, .9)]), _poly([(.1, .5), (.9, .5)]), _poly([(.24, .24), (.76, .76)]),
+           _poly([(.76, .24), (.24, .76)])],
+    "settings": [_poly([(.1, .25), (.9, .25)]), _poly([(.1, .5), (.9, .5)]), _poly([(.1, .75), (.9, .75)]),
+                 _fill_circle(.32, .25, .1), _fill_circle(.66, .5, .1), _fill_circle(.42, .75, .1)],
+    "info": [_ring(.5, .5, .38), _fill_circle(.5, .3, .07), _poly([(.5, .45), (.5, .72)])],
+    "code": [_poly([(.36, .22), (.12, .5), (.36, .78)]), _poly([(.64, .22), (.88, .5), (.64, .78)])],
+    "newfolder": [_poly(_FOLDER, True), _poly([(.5, .48), (.5, .74)]), _poly([(.37, .61), (.63, .61)])],
+    "rename": [_poly([(.2, .8), (.24, .62), (.7, .16), (.86, .32), (.4, .78), (.2, .8)])],
+    "stop": [_fill_rect(.24, .24, .76, .76)],
+    "copy": [_poly([(.3, .3), (.86, .3), (.86, .88), (.3, .88)], True),
+             _poly([(.14, .7), (.14, .12), (.7, .12)])],
+    "database": [_ellipse(.5, .22, .34, .1), _poly([(.16, .22), (.16, .78)]), _poly([(.84, .22), (.84, .78)]),
+                 _ring(.5, .78, .34, 0, 180)],
+}
+
+# button label -> icon. Buttons are matched by their text, so a button added
+# later with one of these labels gets the same icon automatically.
+ICON_FOR_TEXT = {
+    "Refresh": "refresh", "Refresh selected": "refresh", "Rescan": "refresh",
+    "Refresh this model": "refresh", "Refresh whole database": "refresh", "Check again": "refresh",
+    "Scan apps": "refresh", "Load models": "refresh",
+    "Open shell": "terminal",
+    "Install APK from PC": "install", "Install": "install",
+    "Uninstall selected": "trash", "Uninstall": "trash", "Delete selected": "trash", "Delete": "trash",
+    "Turn OFF selected": "off", "Turn app OFF": "off", "Switch it off": "off",
+    "Turn ON selected": "on", "Turn app ON": "on", "Turn back ON everything I turned off": "on",
+    "Restore removed": "undo", "Put it back": "undo", "Allow background again": "undo",
+    "Restrict background": "pause",
+    "Look up selected online": "search", "Look up all (slow)": "search", "Deep scan": "search",
+    "Ask AI about selected": "ai", "Ask AI about this": "ai", "Ask AI again": "ai", "Ask this AI": "ai",
+    "Compare AIs": "ai", "Research rooting with AI": "ai",
+    "AI settings": "settings", "Security settings": "settings",
+    "About": "info", "Info about this device": "info",
+    "Run checkup": "security",
+    "Inspect code…": "code", "Inspect now": "code", "Inspect again": "code",
+    # (Up / Upload / Download / the refresh arrow already show a symbol in their text)
+    "New folder": "newfolder", "Rename": "rename", "Stop": "stop", "Copy all": "copy",
+    "Database ...": "database",
+    "Profiles\u2026": "copy", "Save this phone's profile\u2026": "copy", "Open a profile\u2026": "copy",
+    "Apply the ticked changes": "on",
+    "Known security issues\u2026": "security", "History\u2026": "database", "Permissions\u2026": "security",
+    "Timeline\u2026": "database", "Download / update the bulletin data": "refresh",
+    "Search the chip maker's notices": "search",
+}
+TAB_ICONS = ("files", "apps", "network", "security", "autorun")
+
+
+def raster_icon(name, size, stroke=0.11, samples=3):
+    """size x size boolean mask for an icon (pure Python, no Tk): a pixel is on
+    when at least ~45% of its sub-samples fall on the drawing."""
+    shapes = ICON_SHAPES[name]
+    half = stroke / 2
+    rows = []
+    for py in range(size):
+        row = []
+        for px in range(size):
+            hits = 0
+            for sy in range(samples):
+                for sx in range(samples):
+                    x = (px + (sx + 0.5) / samples) / size
+                    y = (py + (sy + 0.5) / samples) / size
+                    if any(f(x, y) <= half for f in shapes):
+                        hits += 1
+            row.append(hits >= 0.45 * samples * samples)
+        rows.append(row)
+    return rows
+
+
+def ui_scale(root):
+    """Desktop scale factor (1.0 at 96 dpi) from Tk's own scaling."""
+    try:
+        return max(1.0, float(root.tk.call("tk", "scaling")) / (96 / 72.0))
+    except (tk.TclError, ValueError):
+        return 1.0
+
+
+def make_icon(root, name, size, color):
+    img = tk.PhotoImage(master=root, width=size, height=size)
+    mask = raster_icon(name, size)
+    img.put(" ".join("{%s}" % " ".join(color if on else "#000000" for on in row) for row in mask), to=(0, 0))
+    for y, row in enumerate(mask):
+        for x, on in enumerate(row):
+            if not on:
+                img.transparency_set(x, y, True)
+    return img
+
+
+class Icons:
+    """All icons for one Tk root, made once, in a normal and a dimmed (disabled) look."""
+    NORMAL, DIMMED = "#3c4450", "#a3a8b0"
+
+    def __init__(self, root):
+        self.root = root
+        self.size = max(16, int(round(16 * ui_scale(root))))
+        self.cache = {}
+
+    def get(self, name, dimmed=False):
+        key = (name, dimmed)
+        if key not in self.cache:
+            self.cache[key] = make_icon(self.root, name, self.size, self.DIMMED if dimmed else self.NORMAL)
+        return self.cache[key]
+
+    def image_spec(self, name):
+        """For ttk widgets: the normal image, and the dimmed one when disabled."""
+        return (self.get(name), "disabled", self.get(name, True))
+
+
+def apply_icons(root, icons, notebook=None):
+    """Put icons on the tabs and on every ttk.Button whose label is known. Safe to
+    run more than once (buttons that already have an image are left alone)."""
+    if notebook is not None:
+        for i, tab in enumerate(notebook.tabs()):
+            if i < len(TAB_ICONS):
+                notebook.tab(tab, image=icons.get(TAB_ICONS[i]), compound="left")
+
+    def walk(w):
+        for c in w.winfo_children():
+            if isinstance(c, ttk.Button):
+                try:
+                    text = str(c.cget("text"))
+                    if text in ICON_FOR_TEXT and not str(c.cget("image")):
+                        c.configure(image=icons.image_spec(ICON_FOR_TEXT[text]), compound="left")
+                except tk.TclError:
+                    pass
+            walk(c)
+    walk(root)
+
+
+# ---- window size from the screen ---------------------------------------------
+
+def initial_window_size(screen_w, screen_h, scale=1.0, want=(1250, 780), least=(860, 480)):
+    """(w, h, x, y, min_w, min_h): the wanted size scaled for the desktop, but never
+    more than ~92% x 88% of the screen (panels, taskbars); a minimum that shrinks
+    on small screens so it can never push controls off-screen; centred."""
+    max_w, max_h = int(screen_w * 0.92), int(screen_h * 0.88)
+    w = min(int(want[0] * scale), max_w)
+    h = min(int(want[1] * scale), max_h)
+    min_w = min(int(least[0] * scale), int(screen_w * 0.7), w)
+    min_h = min(int(least[1] * scale), int(screen_h * 0.7), h)
+    x, y = max(0, (screen_w - w) // 2), max(0, (screen_h - h) // 3)
+    return w, h, x, y, min_w, min_h
+
+
+# ---- toolbars that wrap, status lines that wrap ------------------------------
+
+class WrapRow:
+    """Makes a packed row of buttons flow onto more lines when the window is too
+    narrow, instead of pushing buttons off the right edge. Widgets keep their
+    order; right-packed ones go last."""
+
+    def __init__(self, frame):
+        self.frame = frame
+        self.items = []
+        for w in frame.pack_slaves():
+            info = w.pack_info()
+            self.items.append((w, info.get("padx", 0), info.get("side") == "right", info.get("fill", "none")))
+            w.pack_forget()
+        self.items = [i for i in self.items if not i[2]] + [i for i in self.items if i[2]]
+        self.rows, self.width = [], None
+        frame.bind("<Configure>", self._on_configure, add="+")
+        self.layout(frame.winfo_width() if frame.winfo_width() > 1 else 10 ** 6)
+
+    def _on_configure(self, event):
+        if event.width > 1 and event.width != self.width:
+            self.layout(event.width)
+
+    @staticmethod
+    def _pad(p):
+        if isinstance(p, (tuple, list)):
+            return sum(int(float(str(x))) for x in p)
+        try:
+            return 2 * int(float(str(p)))
+        except ValueError:
+            return 0
+
+    def layout(self, width):
+        self.width = width
+        lines, cur, used = [], [], 0
+        for item in self.items:
+            need = item[0].winfo_reqwidth() + self._pad(item[1]) + 4
+            if cur and used + need > width:
+                lines.append(cur)
+                cur, used = [], 0
+            cur.append(item)
+            used += need
+        if cur:
+            lines.append(cur)
+        while len(self.rows) < len(lines):
+            self.rows.append(ttk.Frame(self.frame))
+        for w, *_ in self.items:
+            w.pack_forget()
+        for i, row in enumerate(self.rows):
+            if i < len(lines):
+                row.pack(fill="x", side="top")
+            else:
+                row.pack_forget()
+        for row, line in zip(self.rows, lines):
+            for w, padx, _, fill in line:
+                w.pack(in_=row, side="left", padx=padx, pady=1, fill=fill)
+                w.lift(row)       # row frames are created after the buttons: raise or they'd be hidden
+
+    def line_count(self):
+        return sum(1 for r in self.rows if r.winfo_manager())
+
+
+def wrap_label(label, margin=12):
+    """Let a status line wrap at the window edge instead of being cut off."""
+    label.bind("<Configure>", lambda e: label.configure(wraplength=max(100, e.width - margin)), add="+")
+
+
+def protect_bottom_bars(root):
+    """Controls packed BELOW a stretching widget (a list, a text pane) are squeezed
+    out of a short window, because pack serves widgets in order and the stretching
+    one asks for its full height first. Re-pack those trailing controls from the
+    bottom up, ahead of the stretching widget, so the list shrinks instead and the
+    buttons always stay visible. Same look on a big screen."""
+    moved = []
+
+    def walk(w):
+        kids = w.pack_slaves()
+        for i, k in enumerate(kids):
+            info = k.pack_info()
+            if str(info.get("expand")) in ("1", "True", "true") and info.get("side", "top") == "top":
+                tail = [t for t in kids[i + 1:] if t.pack_info().get("side", "top") == "top"
+                        and str(t.pack_info().get("expand")) not in ("1", "True", "true")]
+                for t in reversed(tail):
+                    opts = {key: v for key, v in t.pack_info().items() if key in ("fill", "padx", "pady", "ipadx",
+                                                                                  "ipady", "anchor")}
+                    t.pack_configure(side="bottom", before=k, **opts)
+                    moved.append(t)
+                break
+        for c in w.winfo_children():
+            walk(c)
+    walk(root)
+    return moved
+
+
+def make_responsive(root):
+    """Find packed button rows and full-width status labels everywhere, and make
+    them wrap. A button row = a frame packed full-width whose children are all
+    packed left/right, with at least three of them, and no big content widgets."""
+    rows, labels = [], []
+
+    def walk(w):
+        for c in w.winfo_children():
+            if isinstance(c, (ttk.Frame, tk.Frame)) and not isinstance(c, ttk.LabelFrame):
+                kids = c.pack_slaves()
+                try:
+                    fill = c.pack_info().get("fill") if c.winfo_manager() == "pack" else None
+                except tk.TclError:
+                    fill = None
+                if fill in ("x", "both") and len(kids) >= 3 and all(
+                        k.pack_info().get("side") in ("left", "right") for k in kids) and \
+                        not any(isinstance(k, (ttk.Treeview, tk.Text, ttk.PanedWindow, ttk.Notebook,
+                                               ttk.Frame, tk.Frame, ttk.Progressbar)) for k in kids):
+                    rows.append(c)
+            elif isinstance(c, ttk.Label) and c.winfo_manager() == "pack":
+                try:
+                    if c.pack_info().get("fill") in ("x", "both"):
+                        labels.append(c)
+                except tk.TclError:
+                    pass
+            walk(c)
+    walk(root)
+    wrappers = [WrapRow(f) for f in rows]
+    for lab in labels:
+        wrap_label(lab)
+    protect_bottom_bars(root)
+    return wrappers, labels
+
+
 class App:
     def __init__(self, root, args):
         self.root = root
@@ -5817,12 +8996,17 @@ class App:
         self.show_hidden = tk.BooleanVar(value=False)
 
         root.title("ADB Manager")
-        root.geometry("1250x780")
-        root.minsize(860, 480)
+        # size from THIS screen: never larger than the desktop, minimum shrinks on
+        # small screens, everything scaled with the desktop's DPI
+        w, h, x, y, mw, mh = initial_window_size(root.winfo_screenwidth(), root.winfo_screenheight(),
+                                                 ui_scale(root))
+        root.geometry("%dx%d+%d+%d" % (w, h, x, y))
+        root.minsize(mw, mh)
         style = ttk.Style()
         if "clam" in style.theme_names():
             style.theme_use("clam")
-        style.configure("Treeview", rowheight=22)
+        # tree rows follow the font size (large fonts / HiDPI) instead of a fixed 22 px
+        style.configure("Treeview", rowheight=max(22, tkfont.nametofont("TkDefaultFont").metrics("linespace") + 6))
 
         # --- device bar
         top = ttk.Frame(root, padding=(6, 6, 6, 0))
@@ -5883,11 +9067,14 @@ class App:
         self.nb.add(self.net_tab, text="  Network  ")
         self.sec_tab = SecurityTab(self.nb, self)
         self.nb.add(self.sec_tab, text="  Security  ")
+        self.autorun_tab = AutorunTab(self.nb, self)
+        root.after(800, self.apps_tab._report_store_problems)   # all stores exist now
+        self.nb.add(self.autorun_tab, text="  Autorun  ")
         self.nb.bind("<<NotebookTabChanged>>", self.on_tab_changed)
 
         # --- status bar
         bottom = ttk.Frame(root, padding=(6, 2, 6, 6))
-        bottom.pack(fill="x")
+        bottom.pack(fill="x", side="bottom", before=self.nb)   # keeps its place when the window is small
         self.status = ttk.Label(bottom, text="", anchor="w")
         self.status.pack(side="left", fill="x", expand=True)
         self.cancel_btn = ttk.Button(bottom, text="Cancel", command=self.cancel.set)
@@ -5903,6 +9090,14 @@ class App:
             lambda: (self.show_hidden.set(not self.show_hidden.get()), self.repopulate())))
         root.bind("<Control-r>", self.files_key(lambda: self.active.refresh()))
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        # --- look & feel: icons (tabs, buttons, and windows opened later) and
+        #     toolbars / status lines that wrap instead of disappearing
+        self.icons = Icons(root)
+        apply_icons(root, self.icons, self.nb)
+        root.bind_class("Toplevel", "<Map>", lambda e: apply_icons(e.widget, self.icons)
+                        if isinstance(e.widget, tk.Toplevel) else None, add="+")
+        self.wrappers, _ = make_responsive(root)
 
         self.left.load(local_start) or self.left.load("~")
         self.set_active(self.left)
@@ -5940,6 +9135,8 @@ class App:
             self.net_tab.on_shown()
         elif idx == 3:
             self.sec_tab.on_shown()
+        elif idx == 4:
+            self.autorun_tab.on_shown()
 
     # ---- status ----------------------------------------------------------
 
@@ -6017,6 +9214,7 @@ class App:
         self.apps_tab.set_device(serial)
         self.net_tab.set_device(serial)
         self.sec_tab.set_device(serial)
+        self.autorun_tab.set_device(serial)
         self.on_tab_changed()
         for start in (self.args.remote, "/sdcard", "/storage/emulated/0", "/"):
             if self.right.load(start):
@@ -6205,6 +9403,51 @@ class App:
         else:
             self.info("Deleted %s" % what)
 
+    def show_diagnostics(self):
+        """Collect the diagnostics in the background, then show them - the window IS
+        the preview of exactly what gets copied."""
+        win = tk.Toplevel(self.root)
+        win.title("Diagnostics for a bug report")
+        win.transient(self.root)
+        self._diag_win = win
+        frm = ttk.Frame(win, padding=10)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="This is everything that will be copied. No serial number, no app names, nothing "
+                            "personal.", wraplength=520, justify="left").pack(anchor="w")
+        txt = tk.Text(frm, width=80, height=18, wrap="word")
+        txt.insert("1.0", "Collecting ...")
+        txt.configure(state="disabled")
+        btns = ttk.Frame(frm)
+        btns.pack(side="bottom", fill="x", pady=(8, 0))
+        txt.pack(fill="both", expand=True, pady=(6, 0))
+        ttk.Button(btns, text="Close", command=win.destroy).pack(side="right")
+        copy_btn = ttk.Button(btns, text="Copy all", state="disabled")
+        copy_btn.pack(side="right", padx=6)
+
+        def copy():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(txt.get("1.0", "end-1c"))
+            self.info("Diagnostics copied - paste them into your bug report")
+
+        def show(text):
+            if not win.winfo_exists():
+                return
+            txt.configure(state="normal")
+            txt.delete("1.0", "end")
+            txt.insert("1.0", text)
+            txt.configure(state="disabled")
+            copy_btn.configure(state="normal", command=copy)
+
+        serial = self.apps_tab.serial          # the connected phone, or None
+
+        def work():
+            try:
+                text = diagnostics_text(serial)
+            except Exception as e:                      # always report back
+                text = "Couldn't collect the diagnostics: %s: %s" % (type(e).__name__, e)
+            self.q.put(("call", show, text))
+        threading.Thread(target=work, daemon=True).start()
+
     def show_about(self):
         win = getattr(self, "_about_win", None)
         if win is not None and win.winfo_exists():
@@ -6259,6 +9502,8 @@ class App:
                   font=("TkDefaultFont", 9, "italic"), wraplength=460, justify="left").pack(anchor="w",
                                                                                          pady=(10, 0))
         ttk.Button(frm, text="Close", command=win.destroy).pack(side="right", pady=(12, 0))
+        ttk.Button(frm, text="Copy diagnostics", command=self.show_diagnostics).pack(side="right", padx=6,
+                                                                                    pady=(12, 0))
 
     def _open_url(self, url):
         try:
@@ -6287,12 +9532,591 @@ class App:
         self.root.destroy()
 
 
+# ==========================================================================
+# Device capture (developer tool) and Copy diagnostics
+# ==========================================================================
+#
+#   python3 adb_manager.py --capture [-s SERIAL]
+#
+# Runs a FIXED list of READ-ONLY commands on the phone, sanitises the answers
+# before anything touches the disk, and writes one JSON file (0600, in a 0700
+# folder) under ~/.config/adb_manager/captures/. The file is plain readable JSON:
+# opening it is the preview before sharing it. It feeds two things:
+#   - the compatibility record (which commands this phone accepts, and what the
+#     output actually shows - "accepted" is not "observed");
+#   - real-output parser tests (app_tests.py loads captures put in fixtures/).
+#
+# Privacy boundaries:
+#   - the serial is never stored, and is scrubbed from every captured string;
+#   - only allowlisted system properties are kept;
+#   - packages that Package Manager doesn't confirm as system packages (third-party
+#     or unknown) become stable placeholders user.app.N everywhere: names,
+#     component references, paths, resolver output;
+#   - user names become user<N>; e-mail / phone / MAC-like strings are masked;
+#   - no accounts, IMEI, Wi-Fi, contacts, SMS or network connections are read;
+#   - package dumps are trimmed to the few lines the parsers need.
+
+CAPTURE_SCHEMA = "adbm-capture"
+CAPTURE_VERSION = 1
+CAPTURE_DIR = os.path.join(CONFIG_DIR, "captures")
+CAPTURE_PROBE_CAP = 512 * 1024          # bytes kept per probe (more is read only for big dumps)
+CAPTURE_TOTAL_CAP = 8 * 1024 * 1024     # all probes together
+CAPTURE_ERR_CAP = 2048
+CAPTURE_TIMEOUT = 30
+CAPTURE_SAMPLE_SYSTEM = 8
+CAPTURE_SAMPLE_USER = 3
+CAPTURE_PROPS = (
+    "ro.build.version.release", "ro.build.version.sdk", "ro.build.version.security_patch",
+    "ro.build.version.incremental", "ro.build.id", "ro.build.type", "ro.build.fingerprint",
+    "ro.build.characteristics", "ro.product.manufacturer", "ro.product.brand", "ro.product.model",
+    "ro.product.device", "ro.product.cpu.abi", "ro.boot.verifiedbootstate", "ro.boot.flash.locked",
+    "ro.boot.vbmeta.device_state", "ro.boot.slot_suffix", "ro.build.ab_update",
+    "ro.boot.dynamic_partitions", "persist.sys.locale", "ro.product.locale", "ro.miui.ui.version.name",
+    "ro.build.version.emui", "ro.config.low_ram")
+DIAG_PROPS = ("ro.build.version.release", "ro.build.version.sdk", "ro.product.manufacturer",
+              "ro.product.model", "ro.build.characteristics", "ro.config.low_ram")
+QUERY_FORMS = (("user+flags", True, True), ("user", True, False), ("flags", False, True), ("plain", False, False))
+
+
+def capture_run(serial, cmd, cap=CAPTURE_PROBE_CAP, timeout=CAPTURE_TIMEOUT):
+    """Run one read-only shell command with hard bounds: output is read in chunks
+    and the process is killed once `cap` bytes have arrived or `timeout` passes, so
+    memory stays bounded however much the phone sends. Returns
+    {"rc", "out", "err", "truncated", "timed_out", "ms"}."""
+    import selectors
+    t0 = time.time()
+    res = {"rc": None, "out": "", "err": "", "truncated": False, "err_truncated": False, "timed_out": False,
+           "ms": 0}
+    try:
+        p = subprocess.Popen([ADB, "-s", serial, "shell", cmd], stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, start_new_session=True)
+    except OSError as e:
+        res["err"] = "couldn't run adb: %s" % (e.strerror or e)
+        return res
+    out, err = bytearray(), bytearray()
+    sel = selectors.DefaultSelector()
+    sel.register(p.stdout, selectors.EVENT_READ, out)
+    sel.register(p.stderr, selectors.EVENT_READ, err)
+    open_streams = 2
+    try:
+        while open_streams:
+            left = timeout - (time.time() - t0)
+            if left <= 0:
+                res["timed_out"] = True
+                break
+            for key, _ in sel.select(timeout=min(left, 1.0)):
+                chunk = os.read(key.fileobj.fileno(), 65536)
+                if not chunk:
+                    sel.unregister(key.fileobj)
+                    open_streams -= 1
+                    continue
+                buf = key.data
+                room = (cap if buf is out else CAPTURE_ERR_CAP) - len(buf)
+                buf += chunk[:max(0, room)]
+                if len(chunk) > room:
+                    res["truncated" if buf is out else "err_truncated"] = True
+            if res["truncated"]:
+                break
+    finally:
+        sel.close()
+        if p.poll() is None:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except OSError:
+                pass
+        p.wait()
+        p.stdout.close()
+        p.stderr.close()
+    res["rc"] = None if (res["timed_out"] or res["truncated"]) else p.returncode
+    res["out"] = out.decode("utf-8", "replace")
+    res["err"] = err.decode("utf-8", "replace")[:CAPTURE_ERR_CAP]
+    res["ms"] = int((time.time() - t0) * 1000)
+    return res
+
+
+def filter_props(text, allow):
+    keep = []
+    for line in text.splitlines():
+        m = re.match(r"^\[([^\]]+)\]: \[(.*)\]$", line.strip())
+        if m and m.group(1) in allow:
+            keep.append(line.strip())
+    return "\n".join(keep) + ("\n" if keep else "")
+
+
+def props_dict(text):
+    return {m.group(1): m.group(2) for m in (re.match(r"^\[([^\]]+)\]: \[(.*)\]$", l.strip())
+                                             for l in text.splitlines()) if m}
+
+
+def trim_package_dump(text):
+    """Keep only what the parsers use from 'dumpsys package <pkg>': the package
+    header, its key=value identity lines, and each 'User N:' line with its
+    disabled/enabled component lists. Permissions, timestamps and the rest go."""
+    keep, in_user, in_list, user_indent = [], False, False, 0
+    key_re = re.compile(r"^\s+(versionCode|versionName|targetSdk|minSdk|flags|pkgFlags|codePath|"
+                        r"userId|appId)=")
+    for line in text.splitlines():
+        s = line.strip()
+        ind = len(line) - len(line.lstrip())
+        if PKG_HDR_RE.match(line) or line.startswith("Packages:"):
+            keep.append(line)
+            in_user = in_list = False
+            continue
+        m = re.match(r"^(\s*)User (\d+):", line)
+        if m:
+            keep.append(line)
+            in_user, in_list, user_indent = True, False, len(m.group(1))
+            continue
+        if in_user:
+            if s and ind <= user_indent:
+                in_user = in_list = False
+            elif s in ("disabledComponents:", "enabledComponents:"):
+                keep.append(line)
+                in_list = True
+                continue
+            elif in_list and re.match(r"^[A-Za-z0-9_.$]+$", s):
+                keep.append(line)
+                continue
+            else:
+                in_list = False
+                continue
+        if key_re.match(line) or re.match(r"^\s+(versionCode|targetSdk)=", line):
+            keep.append(line)
+    return "\n".join(keep) + ("\n" if keep else "")
+
+
+def resolver_section(text):
+    """Only the 'Receiver Resolver Table' section of a package dump."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if RESOLVER_HEADING_RE.match(line):
+            out = [line]
+            for l2 in lines[i + 1:]:
+                if l2 and not l2.startswith(" "):
+                    break
+                out.append(l2)
+            return "\n".join(out) + "\n"
+    return ""
+
+
+class CaptureSanitizer:
+    """Replaces identifying strings consistently across a whole capture."""
+
+    def __init__(self, serial, system, third, all_pkgs):
+        self.serial = serial or ""
+        self.system = set(system)
+        anon = sorted(p for p in all_pkgs if p not in self.system or p in third)   # unknown or 3rd -> anon
+        self.anon = {p: "user.app.%d" % (i + 1) for i, p in enumerate(anon)}
+        self.patterns = []
+        for p in sorted(self.anon, key=len, reverse=True):
+            # never touch a SYSTEM package that merely starts with this name
+            longer = sorted({s[len(p) + 1:] for s in self.system if s.startswith(p + ".")}, key=len, reverse=True)
+            guard = "".join(r"(?!\.%s(?![A-Za-z0-9_]))" % re.escape(x) for x in longer)
+            self.patterns.append((re.compile(r"(?<![A-Za-z0-9_.])%s(?![A-Za-z0-9_])%s" % (re.escape(p), guard)),
+                                  self.anon[p]))
+
+    def __call__(self, text):
+        if not text:
+            return text
+        if self.serial:
+            text = text.replace(self.serial, "<serial>")
+        text = re.sub(r"/data/app/~~[A-Za-z0-9_\-]+==/", "/data/app/~~X==/", text)
+        text = re.sub(r"/mnt/expand/[^/\s]+/", "/mnt/expand/X/", text)           # SD-card volume id
+        text = re.sub(r"(/data/app/(?:~~X==/)?[A-Za-z0-9_.]+)-[A-Za-z0-9_\-]+==", r"\1-X==", text)
+        for rx, rep in self.patterns:
+            text = rx.sub(rep, text)
+        text = re.sub(r"UserInfo\{(\d+):[^:}]*", r"UserInfo{\1:user\1", text)
+        text = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "<email>", text)
+        text = re.sub(r"\+\d[\d \-]{7,}\d", "<phone>", text)
+        text = re.sub(r"(?<![\w.=:/])(?:\(\d{2,4}\)\s?|\d{2,4}[ \-])\d{3}[ \-]\d{3,4}(?![\w.])", "<phone>", text)
+        text = re.sub(r"(?i)\b[0-9a-f]{2}(?::[0-9a-f]{2}){5}\b", "<mac>", text)
+        return text
+
+
+def pick_sample(receiver_pkgs, system, third, disabled, evidence=()):
+    """Which packages get a (trimmed) dumpsys: first the owners of receivers that
+    only the disabled-matching query returned (the evidence for that claim), then
+    a few system ones with boot receivers, a few user ones, and one switched-off app."""
+    total = CAPTURE_SAMPLE_SYSTEM + CAPTURE_SAMPLE_USER + 1           # 12, the agreed maximum
+    pick = sorted(set(evidence))[:4]                                   # evidence first
+    for p in sorted(p for p in receiver_pkgs if p in third and p not in pick)[:CAPTURE_SAMPLE_USER]:
+        pick.append(p)                                                 # then a few user apps
+    for p in sorted(disabled):                                         # and one switched-off app
+        if p not in pick:
+            pick.append(p)
+            break
+    for p in sorted(p for p in receiver_pkgs if p in system and p != "android" and p not in pick):
+        if len(pick) >= total:
+            break
+        pick.append(p)                                                 # system ones fill the rest
+    return pick[:total]
+
+
+def capture_summary(probes):
+    """Compatibility summary. Every capability is "accepted" (the phone took the
+    command), "observed" (the output itself shows the behaviour) or "unknown"."""
+    by = {p["id"]: p for p in probes}
+
+    def complete(p):
+        return p.get("rc") == 0 and not (p.get("truncated") or p.get("err_truncated") or p.get("timed_out"))
+
+    def ok(pid):
+        p = by.get(pid)
+        return bool(p) and complete(p) and not p.get("command_error") and not query_error(p["out"] + p["err"])
+    s = {"truncated": sorted(p["id"] for p in probes
+                             if p.get("truncated") or p.get("err_truncated") or p.get("timed_out"))}
+    props = props_dict(by.get("props", {}).get("out", ""))
+    s["android"] = props.get("ro.build.version.release", "?")
+    s["sdk"] = props.get("ro.build.version.sdk", "?")
+    s["device"] = "%s %s" % (props.get("ro.product.manufacturer", "?"), props.get("ro.product.model", "?"))
+    forms = {}
+    for name, _, _ in QUERY_FORMS:
+        forms[name] = all(ok("query:%s:%s" % (name, a)) for a in BOOT_ACTIONS)
+    s["query_forms_accepted"] = [n for n, v in forms.items() if v]
+    a0 = BOOT_ACTIONS[0]
+
+    def rx(pid):            # receivers from a probe - None unless the probe itself succeeded completely
+        return set(parse_query_receivers(by[pid]["out"])) if ok(pid) else None
+    plain = rx("query:plain:%s" % a0)
+    flag_pid = next((pid for pid in ("query:user+flags:%s" % a0, "query:flags:%s" % a0) if ok(pid)), None)
+    flagged = rx(flag_pid) if flag_pid else None              # chosen by SUCCESS, never by emptiness
+    scoped = rx("query:user+flags:%s" % a0)
+    cu_out = by.get("current_user", {}).get("out", "").strip()
+    detected = ok("current_user") and cu_out.isdigit()
+    user = int(cu_out) if detected else 0
+    users = {int(x) for x in re.findall(r"UserInfo\{(\d+):", by.get("users", {}).get("out", ""))} \
+        if ok("users") else set()
+    user_known = detected or users == {0}
+    if not (forms["user+flags"] or forms["flags"]):
+        s["disabled_matching"] = "unknown"
+    else:
+        # "observed" only if a receiver returned ONLY with the flag is confirmed
+        # disabled by its complete package dump, for a user we actually know
+        s["disabled_matching"] = "accepted"
+        if user_known and flagged is not None and plain is not None:
+            for pkg, cls in sorted(flagged - plain):
+                d = by.get("pkg:" + pkg)
+                if d and ok("pkg:" + pkg) and cls in parse_package_user_state(d["out"], user)["disabled"]:
+                    s["disabled_matching"] = "observed"
+                    break
+    if not (forms["user+flags"] or forms["user"]):
+        s["user_scoping"] = "unknown"
+    else:
+        # "observed" only from a real comparison: the same query for another user
+        # succeeded and returned a different set
+        s["user_scoping"] = "accepted"
+        # compare EQUIVALENT queries: this user's --user+flags result vs the other
+        # user's, both complete; an empty set on either side is a valid answer
+        other = [pid for pid in by if pid.startswith("query:other_user:")]
+        theirs = rx(other[0]) if other else None
+        other_id = int(other[0].rsplit(":", 1)[1]) if other and other[0].rsplit(":", 1)[1].isdigit() else None
+        # both users must be CONFIRMED by a complete user list, and different
+        confirmed = ok("users") and user in users and other_id in users and other_id != user
+        if confirmed and scoped is not None and theirs is not None and scoped != theirs:
+            s["user_scoping"] = "observed"
+    s["users"] = len(users) if users else None
+    cu = by.get("current_user", {})
+    s["current_user"] = "detected" if detected else "single-user" if users == {0} else "unverified"
+    def runs(pid):          # help text often contains "usage:" - for these, the exit code decides
+        p = by.get(pid)
+        return bool(p) and complete(p)
+    def answers(pid):       # a real AppOps answer, whatever the exit code
+        p = by.get(pid)
+        return bool(p) and not (p.get("truncated") or p.get("err_truncated") or p.get("timed_out")
+                                or p.get("command_error")) and appops_answer_ok(p["out"], p["err"])
+    s["appops_tool"] = "cmd appops" if answers("appops_tool:cmd") else "appops" if answers("appops_tool:old") \
+        else "none"
+    res = by.get("resolver")
+    s["resolver_table"] = ("unknown" if not res or not complete(res) or res.get("command_error")
+                           or query_error(res["out"] + res["err"])
+                           else                                                   # failed: we don't know
+                           "present" if has_receiver_resolver(res["out"]) else "absent")
+    s["boot_receivers"] = len(flagged if flagged is not None else plain or set())
+    return s
+
+
+def run_capture(serial, out_dir=CAPTURE_DIR, runner=None):
+    """Collect, sanitise and save one capture. Returns (path, summary). Only
+    read-only commands are ever sent."""
+    run_ = runner or capture_run
+    raw = []                                                    # (id, cmd, result) before sanitising
+    total = [0]
+
+    def probe(pid, cmd, cap=CAPTURE_PROBE_CAP, post=None):
+        cap = max(0, min(cap, CAPTURE_TOTAL_CAP - total[0]))
+        r = run_(serial, cmd, cap) if cap else {"rc": None, "out": "", "err": "", "truncated": True,
+                                                "timed_out": False, "ms": 0}
+        r = dict(r, command_error=query_error(r["out"] + r["err"]))   # BEFORE filtering
+        if post:
+            r = dict(r, out=post(r["out"]))
+        total[0] += len(r["out"]) + len(r["err"])
+        raw.append({"id": pid, "cmd": cmd, **r})
+        return r
+
+    probe("props", "getprop", post=lambda t: filter_props(t, CAPTURE_PROPS))
+    probe("current_user", "am get-current-user")
+    probe("users", "pm list users")
+    lists = {}
+    for pid, flags in (("pkgs_all", "-f -u"), ("pkgs_system", "-s -u"), ("pkgs_third", "-3 -u"),
+                       ("pkgs_disabled", "-d")):
+        lists[pid] = parse_pm_list(probe(pid, "pm list packages " + flags, cap=2 * CAPTURE_PROBE_CAP)["out"])
+    m = re.match(r"\s*(\d+)", raw[1]["out"])
+    user = int(m.group(1)) if m and raw[1]["rc"] == 0 else 0
+    receiver_pkgs = set()
+    for name, with_user, with_flags in QUERY_FORMS:
+        for action in BOOT_ACTIONS:
+            args = (["--user", str(user)] if with_user else []) + (["--query-flags", QUERY_FLAGS] if with_flags else [])
+            r = probe("query:%s:%s" % (name, action),
+                      "cmd package query-receivers %s --brief -a %s" % (" ".join(args), action))
+            receiver_pkgs.update(p for p, _ in parse_query_receivers(r["out"]))
+    u = raw[2]
+    users_ok = u["rc"] == 0 and not (u["truncated"] or u.get("err_truncated") or u["timed_out"]) \
+        and not query_error(u["out"] + u["err"])
+    users = sorted({int(x) for x in re.findall(r"UserInfo\{(\d+):", u["out"])} - {user}) if users_ok else []
+    if users:                                    # a real comparison needs a confirmed second user
+        probe("query:other_user:%d" % users[0], "cmd package query-receivers --user %d --query-flags %s --brief -a %s"
+              % (users[0], QUERY_FLAGS, BOOT_ACTIONS[0]))
+    res_out = probe("resolver", "dumpsys package r", cap=4 * CAPTURE_PROBE_CAP, post=resolver_section)["out"]
+
+    def good(pid):          # same rule as the summary's ok(): exit 0, complete, no error line
+        r = next(x for x in raw if x["id"] == pid)
+        return r["rc"] == 0 and not (r["truncated"] or r.get("err_truncated") or r["timed_out"]) \
+            and not r.get("command_error") and not query_error(r["out"] + r["err"])
+    # system means CONFIRMED system: if that list couldn't be read completely,
+    # nothing counts as system and every package name is anonymised
+    system = set(lists["pkgs_system"]) if good("pkgs_system") else set()
+    third = set(lists["pkgs_third"])
+    a0 = BOOT_ACTIONS[0]
+
+    def rx(pid):
+        if not good(pid):
+            return None
+        return set(parse_query_receivers(next(x for x in raw if x["id"] == pid)["out"]))
+    plain_rx = rx("query:plain:%s" % a0)
+    flag_rx = next((r for r in (rx("query:user+flags:%s" % a0), rx("query:flags:%s" % a0)) if r is not None), None)
+    evidence = {pk for pk, _ in flag_rx - plain_rx} if flag_rx is not None and plain_rx is not None else set()
+    for p in pick_sample(receiver_pkgs, system, third, set(lists["pkgs_disabled"]), evidence=evidence):
+        probe("pkg:" + p, "dumpsys package " + shlex.quote(p), cap=2 * CAPTURE_PROBE_CAP, post=trim_package_dump)
+    probe("appops_tool:cmd", "cmd appops " + APPOPS_PROBE, cap=8192)
+    probe("appops_tool:old", "appops " + APPOPS_PROBE, cap=8192)
+    def answers(pid):       # same rule as the app: a real AppOps answer, whatever the exit code
+        r = next(x for x in raw if x["id"] == pid)
+        return not (r["truncated"] or r.get("err_truncated") or r["timed_out"] or r.get("command_error")) \
+            and appops_answer_ok(r["out"], r["err"])
+    tool = "cmd appops" if answers("appops_tool:cmd") else "appops" if answers("appops_tool:old") else None
+    if tool:                                     # the tool this phone actually has
+        for p in (sorted(receiver_pkgs & third) or sorted(receiver_pkgs))[:2]:
+            for op in ("RUN_ANY_IN_BACKGROUND", "RUN_IN_BACKGROUND"):
+                probe("appops:%s:%s" % (p, op), "%s get %s %s" % (tool, shlex.quote(p), op), cap=8192)
+
+    # every package-like name anywhere in the capture is either confirmed system or
+    # anonymised - an incomplete inventory never lets an unknown name through
+    seen = set(lists["pkgs_all"]) | set(lists["pkgs_system"]) | third | receiver_pkgs
+    for r in raw:
+        seen.update(re.findall(r"(?<![A-Za-z0-9_.])([a-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+)/", r["out"] + r["err"]))
+        seen.update(re.findall(r"Package \[([^\]]+)\]", r["out"]))
+    seen.update(pk for pk, _ in parse_receiver_resolver(res_out))
+    clean = CaptureSanitizer(serial, system, third, seen)
+    probes = []
+    for r in raw:
+        probes.append({"id": clean(r["id"]), "cmd": clean(r["cmd"]), "rc": r["rc"], "out": clean(r["out"]),
+                       "err": clean(r["err"])[:CAPTURE_ERR_CAP], "truncated": bool(r["truncated"]),
+                       "err_truncated": bool(r.get("err_truncated")), "timed_out": bool(r["timed_out"]),
+                       "command_error": bool(r.get("command_error")), "ms": r["ms"]})
+    props = props_dict(probes[0]["out"])
+    doc = fit_capture({"schema": CAPTURE_SCHEMA, "version": CAPTURE_VERSION,
+                       "created": time.strftime("%Y-%m-%dT%H:%M:%S"), "device": props, "probes": probes})
+    summary = doc["summary"]
+    os.makedirs(out_dir, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(out_dir, 0o700)
+    except OSError:
+        pass
+    base = "%s-%s-sdk%s-%s" % (props.get("ro.product.manufacturer", "device"), props.get("ro.product.model", ""),
+                               props.get("ro.build.version.sdk", "x"), time.strftime("%Y%m%d"))
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("_")[:80] or "capture"
+    path, n = os.path.join(out_dir, base + ".json"), 1
+    while os.path.exists(path):
+        n += 1
+        path = os.path.join(out_dir, "%s-%d.json" % (base, n))
+    sa.atomic_write_json(path, doc, private=True)
+    return path, summary
+
+
+def capture_bytes(doc):
+    """Size of the file exactly as atomic_write_json will write it."""
+    return len(sa.json_payload(doc, indent=1).encode("utf-8"))
+
+
+def fit_capture(doc, cap=None):
+    """Enforce the limit on the FINAL saved bytes (JSON structure, escaping and
+    multibyte text included): shorten the biggest probe output, marking it
+    truncated, until the file fits. The summary is computed afterwards, so cut
+    probes are reported as incomplete."""
+    cap = CAPTURE_TOTAL_CAP if cap is None else cap
+    doc["summary"] = capture_summary(doc["probes"])
+    while capture_bytes(doc) > cap:
+        big = max(doc["probes"], key=lambda p: len(p["out"]) + len(p["err"]))
+        if big["out"]:
+            big["out"] = big["out"][:len(big["out"]) // 2]
+            big["truncated"], big["rc"] = True, None
+        elif big["err"]:
+            big["err"], big["err_truncated"], big["rc"] = "", True, None
+        else:
+            raise OSError("the capture can't fit in %d bytes even with every probe output removed - "
+                          "nothing was saved" % cap)
+        doc["summary"] = capture_summary(doc["probes"])
+    return doc
+
+
+def capture_summary_text(summary):
+    words = {"observed": "yes (seen in the output)", "accepted": "command accepted (behaviour not proven)",
+             "unknown": "not supported / unknown"}
+    lines = ["Device:            %s, Android %s (SDK %s)" % (summary["device"], summary["android"], summary["sdk"]),
+             "Receiver query:    %s" % (", ".join(summary["query_forms_accepted"]) or "not available"),
+             "Disabled matching: %s" % words[summary["disabled_matching"]],
+             "Per-user query:    %s" % words[summary["user_scoping"]],
+             "Current user:      %s" % summary["current_user"],
+             "AppOps tool:       %s" % summary["appops_tool"],
+             "Old receiver table: %s" % {"present": "present", "absent": "not on this phone",
+                                         "unknown": "couldn't be checked"}[summary["resolver_table"]],
+             "Boot receivers:    %d" % summary["boot_receivers"]]
+    if summary["truncated"]:
+        lines.append("INCOMPLETE probes (cut at the size/time limit): " + ", ".join(summary["truncated"]))
+    return "\n".join(lines)
+
+
+def pick_capture_serial(explicit=None):
+    """The serial to capture: the one given, or the only connected device."""
+    if explicit:
+        return explicit, None
+    try:
+        rc, out, err = run([ADB, "devices"], timeout=20)
+    except AdbError as e:
+        return None, str(e)
+    devs = [l.split()[0] for l in out.splitlines()[1:] if l.strip().endswith("\tdevice")]
+    if len(devs) != 1:
+        return None, ("no device connected" if not devs else
+                      "%d devices connected - choose one with -s SERIAL" % len(devs))
+    return devs[0], None
+
+
+def capture_main(serial_arg):
+    serial, err = pick_capture_serial(serial_arg)
+    if not serial:
+        print("Capture not made: %s" % err, file=sys.stderr)
+        return 1
+    print("Reading the phone (read-only commands only) ...")
+    try:
+        path, summary = run_capture(serial)
+    except Exception as e:                              # e.g. the file couldn't be written
+        print("Capture not saved: %s: %s" % (type(e).__name__, e), file=sys.stderr)
+        return 1
+    print(capture_summary_text(summary))
+    print("\nSaved (private file): %s" % path)
+    print("Open it to see exactly what it contains before sharing it.")
+    return 0
+
+
+# ---- Copy diagnostics (a small allowlisted subset, for bug reports) -----------
+
+def diagnostics_text(serial, runner=None):
+    """Plain text for a GitHub issue: versions, tools found, and - if a phone is
+    connected - its Android version, maker, model and what it supports. No serial,
+    no package names, nothing personal."""
+    import platform
+    lines = ["ADB Manager diagnostics", ""]
+    try:
+        osr = platform.freedesktop_os_release().get("PRETTY_NAME", "")
+    except (OSError, AttributeError):
+        osr = ""
+    lines.append("Computer: %s %s" % (osr or platform.system(), platform.machine()))
+    lines.append("Python %s, Tk %s" % (platform.python_version(), tk.TkVersion))
+    try:
+        rc, out, _ = run([ADB, "version"], timeout=15)
+        lines.append("adb: %s" % (out.splitlines()[0].strip() if rc == 0 and out.strip() else "not working"))
+    except AdbError:
+        lines.append("adb: not found")
+    env = sa.inspector_env(sa.load_sec_config())
+    lines.append("Code inspector: %s" % ("Androguard %s" % env["androguard"] if env["ok"] else "Androguard not installed"))
+    lines.append("readelf: %s" % ("found" if env["readelf"] else "not found"))
+    lines.append("Terminal for Open shell: %s" % ("found" if find_terminal() else "not found"))
+    if not serial:
+        lines += ["", "No phone connected."]
+        return "\n".join(lines)
+    run_ = runner or capture_run
+    probes = []
+
+    def probe(pid, cmd, post=None):
+        r = run_(serial, cmd, 65536)
+        probes.append({"id": pid, "cmd": cmd, "rc": r["rc"], "out": post(r["out"]) if post else r["out"],
+                       "command_error": query_error(r["out"] + r["err"]),
+                       "err": r["err"], "truncated": r["truncated"], "err_truncated": r.get("err_truncated", False),
+                       "timed_out": r["timed_out"]})
+    probe("props", "getprop", post=lambda t: filter_props(t, DIAG_PROPS))
+    probe("current_user", "am get-current-user")
+    probe("users", "pm list users", post=lambda t: re.sub(r"UserInfo\{(\d+):[^:}]*", r"UserInfo{\1:user\1", t))
+    cu = probes[1]["out"].strip()
+    user = int(cu) if probes[1]["rc"] == 0 and cu.isdigit() else 0
+    for name, with_user, with_flags in QUERY_FORMS:
+        for action in BOOT_ACTIONS:
+            args = (["--user", str(user)] if with_user else []) + (["--query-flags", QUERY_FLAGS] if with_flags else [])
+            # only component names are kept (to compare the queries), never shown
+            probe("query:%s:%s" % (name, action), "cmd package query-receivers %s --brief -a %s"
+                  % (" ".join(args), action),
+                  post=lambda t: "\n".join("%s/%s" % c for c in parse_query_receivers(t)) + "\n")
+    r = run_(serial, "dumpsys package r", 4 * CAPTURE_PROBE_CAP)
+    probes.append({"id": "resolver", "cmd": "dumpsys package r", "rc": r["rc"], "out": resolver_section(r["out"]),
+                   "command_error": query_error(r["out"] + r["err"]),
+                   "err": r["err"], "truncated": r["truncated"], "err_truncated": r.get("err_truncated", False),
+                   "timed_out": r["timed_out"]})
+    probe("appops_tool:cmd", "cmd appops " + APPOPS_PROBE)
+    probe("appops_tool:old", "appops " + APPOPS_PROBE)
+    s = capture_summary(probes)
+    p = props_dict(probes[0]["out"])
+
+    def category(pr):
+        if pr["id"].startswith("appops_tool"):           # reported on its own line ("AppOps tool:")
+            return None
+        if pr.get("timed_out"):
+            return "timed out"
+        if pr.get("truncated"):
+            return "cut at the size limit"
+        if pr.get("err_truncated"):
+            return "error output cut at the size limit"
+        if pr.get("command_error") and pr.get("rc") == 0:
+            return "reported an error"
+        if pr.get("rc") != 0:
+            return "not supported" if re.search(r"(?i)not found|unknown (option|command)", pr["err"] + pr["out"]) \
+                else "failed (exit %s)" % pr.get("rc")
+        return None
+    failed = ["%s: %s" % (pr["id"], category(pr)) for pr in probes if category(pr)]
+    words = {"observed": "seen in the output", "accepted": "accepted, not proven", "unknown": "not supported"}
+    lines += ["", "Phone: %s %s, Android %s (SDK %s)%s" % (
+        p.get("ro.product.manufacturer", "?"), p.get("ro.product.model", "?"), p.get("ro.build.version.release", "?"),
+        p.get("ro.build.version.sdk", "?"), ", Go/low-RAM" if p.get("ro.config.low_ram") == "true" else ""),
+        "Checked for Android user %d (%s)" % (user, s["current_user"]),
+        "Receiver query forms accepted: %s" % (", ".join(s["query_forms_accepted"]) or "none"),
+        "Switched-off receivers included: %s" % words[s["disabled_matching"]],
+        "Old receiver table: %s" % {"present": "present", "absent": "not on this phone",
+                                    "unknown": "couldn't be checked"}[s["resolver_table"]],
+        "AppOps tool: %s" % s["appops_tool"],
+        "Checks that didn't work: %s" % ("; ".join(failed) if failed else "none")]
+    text = "\n".join(lines)
+    return text.replace(serial, "<serial>") if serial else text
+
+
 def main():
     ap = argparse.ArgumentParser(description="Android device manager over adb (GUI)")
     ap.add_argument("-s", "--serial", help="device serial to connect to")
     ap.add_argument("--local", default=os.getcwd(), help="start folder on this computer")
     ap.add_argument("--remote", default="/sdcard", help="start folder on the device")
+    ap.add_argument("--capture", action="store_true",
+                    help="developer tool: read the phone with read-only commands and save a sanitised "
+                         "capture file (no GUI)")
     args = ap.parse_args()
+    if args.capture:
+        sys.exit(capture_main(args.serial))
 
     root = tk.Tk()
     if not (shutil.which(ADB) or os.path.isfile(ADB)):

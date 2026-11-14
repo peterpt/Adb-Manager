@@ -299,6 +299,27 @@ def _url_norm(u):
     return urllib.parse.urlunsplit((p.scheme.lower(), netloc, p.path, p.query, ""))
 
 
+MAX_CHECKED_SOURCES = 40
+
+
+def source_check(urls, usage):
+    """Provenance of the sources an AI listed: for each one, does it match a page
+    the web-search tool REALLY returned in this request? A match shows where an
+    address came from - not that the page supports the answer. A source that
+    doesn't match may have been written from the model's memory.
+    Returns {"searches": n, "urls": {url: bool}}."""
+    got = {_url_norm(u) for u in (usage or {}).get("urls") or [] if isinstance(u, str)}
+    out = {}
+    for u in urls:
+        if isinstance(u, str) and u.strip() and u not in out and len(out) < MAX_CHECKED_SOURCES:
+            out[u] = _url_norm(u) in got
+    try:
+        searches = max(0, int((usage or {}).get("searches") or 0))
+    except (TypeError, ValueError):
+        searches = 0
+    return {"searches": searches, "urls": out}
+
+
 def _short(e, limit=300):
     s = str(getattr(e, "message", "") or e)
     return s if len(s) <= limit else s[:limit] + "..."
@@ -513,6 +534,7 @@ def research_rooting(provider, cfg, info, timeout=240):
         res["usage"] = usage
         try:
             res["answer"] = normalize_root(extract_json(text))
+            res["answer"]["source_check"] = source_check(res["answer"]["sources"], usage)
         except ValueError as e:
             res["error"] = "the AI's reply wasn't valid JSON (%s)" % e
             res["raw"] = (text or "")[:4000]
@@ -634,7 +656,9 @@ def research(provider, cfg, app, props, timeout=240):
         text, usage = ask(cfg, SYSTEM_PROMPT, prompt, timeout)
         res["usage"] = usage
         try:
-            res["answer"] = normalize(extract_json(text))
+            a = res["answer"] = normalize(extract_json(text))
+            a["source_check"] = source_check(
+                [f["source"] for f in a["independent_findings"] if f.get("source")] + a["sources"], usage)
         except ValueError as e:
             res["error"] = "the AI's reply wasn't valid JSON (%s)" % e
             res["raw"] = (text or "")[:4000]

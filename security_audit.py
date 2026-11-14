@@ -53,12 +53,15 @@ KEEP_SNAPSHOTS = 30
 
 DEFAULT_SEC_CONFIG = {"virustotal_key": "", "malwarebazaar_key": "", "exodus_token": "",
                       "exodus_url": "https://reports.exodus-privacy.eu.org",
-                      "deep_include_updated_system": False}
+                      "deep_include_updated_system": False,
+                      "app_labels_enabled": True,       # read real app names from the phone
+                      "app_labels_max_mb": 200}         # max data read for names per connection
 
 OK, INFO, WARN, BAD = "ok", "info", "warn", "bad"
 LEVEL_RANK = {BAD: 0, WARN: 1, INFO: 2, OK: 3}
 
-SECTIONS = [("device", "Device protection"),
+SECTIONS = [("pattern", "Spyware pattern (several warning signs on one app)"),
+            ("device", "Device protection"),
             ("access", "Powerful access (what malware abuses)"),
             ("origin", "Where apps came from"),
             ("changes", "Changes since the last check"),
@@ -194,13 +197,21 @@ def ensure_dir(path, private=False):
         os.chmod(path, 0o700)
 
 
-def atomic_write_json(path, data, private=True, indent=1):
+def json_payload(data, indent=1):
+    """The exact text atomic_write_json writes (callers measuring file size use this
+    too, so the two can never disagree)."""
+    return json.dumps(data, indent=indent, ensure_ascii=False)
+
+
+def atomic_write_json(path, data, private=True, indent=1, folder_private=None):
     """Write JSON so the file is either the complete old version or the complete
     new one - never half-written, never left with loose permissions.
 
       - the temp file has a UNIQUE name (mkstemp) in the same folder, so two
         writers can't trample each other's temp file;
       - private=True (the default): file 0600 from the moment it exists, folder 0700;
+        folder_private=False keeps the file 0600 but leaves the folder's permissions
+        alone (for files saved into a folder the USER picked, e.g. Downloads);
       - data is flushed + fsync'd before the rename, and the rename is atomic: a
         reader sees either the whole old file or the whole new one;
       - the folder is fsync'd afterwards to make the rename survive a power cut,
@@ -211,9 +222,9 @@ def atomic_write_json(path, data, private=True, indent=1):
     Values that JSON can't encode raise OSError too (wrapping the TypeError)."""
     import tempfile
     folder = os.path.dirname(os.path.abspath(path))
-    ensure_dir(folder, private=private)
+    ensure_dir(folder, private=private if folder_private is None else folder_private)
     try:
-        payload = json.dumps(data, indent=indent, ensure_ascii=False)
+        payload = json_payload(data, indent=indent)
     except (TypeError, ValueError) as e:
         raise OSError("can't encode data for %s: %s" % (path, e))
     fd, tmp = tempfile.mkstemp(dir=folder, prefix="." + os.path.basename(path) + ".",
@@ -473,7 +484,7 @@ def collect(shell, apps, sockets=None):
     return {"failed": failed, "props": props, "settings": settings, "selinux": selinux, "su": su,
             "vpn_ifaces": [n for n in nets if n.startswith(("tun", "ppp", "ipsec", "wg"))],
             "admins": admins, "appops": parse_appops(appops_raw), "apps": apps,
-            "sockets": sockets or []}
+            "sockets": sockets or [], "appops_raw": appops_raw}
 
 
 def launcher_packages(shell, pkgs):
@@ -1055,6 +1066,145 @@ def check_access(facts, access, launcher, labeler):
     return out
 
 
+# --------------------------------------------------------------------------
+# "connect the dots": several stalkerware signs on the SAME app
+# --------------------------------------------------------------------------
+
+# access that stalkerware relies on (reading the screen, notifications, messages,
+# drawing over apps, staying impossible to uninstall, watching app usage)
+PATTERN_ACCESS = ("accessibility", "notifications", "admin", "sms", "overlay", "usage")
+_MARK = {True: "\u2714 yes", False: "\u2718 no", None: "? couldn't be checked"}
+
+
+def _recent_use(facts, pkg, days=7):
+    ops = (facts.get("appops") or {}).get(pkg) or {}
+    used = []
+    for op, word in USAGE_OPS.items():
+        o = ops.get(op)
+        if o and o.get("ago") is not None and o["ago"] <= days * 86400 and o.get("mode") != "ignore":
+            used.append((o["ago"], word))
+    return [w + " " + ago_text(t) for t, w in sorted(used)]
+
+
+def _pattern_level(access, outside, hidden, boots):
+    """BAD / WARN / None for one app's signs (True/False/None each). Only real
+    combinations count: powerful access plus ONE other sign is already reported in
+    the 'Powerful access' section, and starting at boot alone is very common."""
+    persist = sum(1 for v in (outside, hidden, boots) if v is True)
+    if access and persist >= 2:
+        return BAD
+    if not access and persist == 3:
+        return WARN
+    return None
+
+
+def check_patterns(facts, access, launcher, labeler, boot):
+    """One finding per user app that shows SEVERAL stalkerware signs at once:
+    powerful access + installed outside a store + no launcher icon + starts at boot.
+    Each sign alone is common and harmless; together they are the usual shape of
+    stalkerware. Recent camera/microphone/location use is shown as supporting detail.
+
+    launcher: set of packages with an icon, or None if that couldn't be read.
+    boot: None if start-at-boot couldn't be read at all, else
+          {"complete": bool, "pkgs": {pkg: True (can start at boot) / False (its
+          start-up receivers are all switched off)}}. A package missing from "pkgs"
+          has no start-up receiver - but only when "complete" is True.
+    A sign that couldn't be read is never counted as absent: if it could raise the
+    level, the app is still reported, as 'couldn't fully check'."""
+    out = []
+    apps = facts["apps"]
+    access_unread = sorted({ACCESS_INFO[c][0] for c in PATTERN_ACCESS
+                            if unread(facts, *ACCESS_SOURCES[c])})
+    uncertain_origin = []        # apps where an unrecorded installer could change the result
+    for p in sorted(pp for pp, a in apps.items() if not a.get("system") and not a.get("removed")):
+        a = apps[p]
+        inst_text, kind = installer_text(a.get("installer", ""))
+        # no recorded installer (often 'adb install', but it can't be proven) is UNKNOWN, not sideloading
+        outside = None if kind == "unknown" else kind != "store"
+        hidden = None if launcher is None else p not in launcher
+        if boot is None:
+            boots = None
+        elif p in boot["pkgs"]:
+            boots = boot["pkgs"][p]
+        else:
+            boots = False if boot["complete"] else None
+        held = [ACCESS_INFO[c][0] for c in PATTERN_ACCESS if p in (access.get(c) or ())]
+        level = _pattern_level(held, outside, hidden, boots)
+        # what it could be if every sign we couldn't read turned out to be present
+        worst = _pattern_level(held or bool(access_unread), True if outside is None else outside,
+                               True if hidden is None else hidden, True if boots is None else boots)
+        if level is None and worst is None:
+            continue
+        lbl = label_of(apps, labeler, p)
+        unknown_signs = [n for n, v in (("where it came from", outside), ("icon", hidden),
+                                        ("start at boot", boots)) if v is None]
+        if access_unread and not held:
+            unknown_signs.append("powerful access")
+        if level is None or worst != level:
+            uncertain_origin += [p] if outside is None else []
+        dots = ["Installed outside an app store: %s" % (
+                    "? unknown - no installer was recorded (often an install from a computer)" if outside is None
+                    else _MARK[outside] + (" (%s)" % inst_text if outside else "")),
+                "No icon in the app drawer: %s" % _MARK[hidden],
+                "Starts by itself when the phone boots: %s" % (
+                    _MARK[boots] if boots is not False or p not in (boot or {}).get("pkgs", {})
+                    else "\u2718 no (its start-up receivers are switched off)"),
+                "Powerful access: %s" % (", ".join(held) if held else
+                                         "? couldn't be checked" if access_unread else "\u2718 none")]
+        used = _recent_use(facts, p)
+        if used:
+            dots.append("Used recently: " + ", ".join(used[:5]))
+        if a.get("disabled"):
+            dots.append("The whole app is currently turned OFF, so it can't run until it's turned on again.")
+        if level is None:
+            title = "Couldn't fully check: %s" % lbl
+            sev = INFO
+            lead = ("Some signs couldn't be read (%s). With them, this app could match the spyware "
+                    "pattern - check it by hand." % ", ".join(unknown_signs))
+        else:
+            sev = level
+            title = ("Looks like stalkerware: %s" if level == BAD else "Several warning signs: %s") % lbl
+            lead = ("This app has powerful access AND hides or starts itself the way stalkerware does."
+                    if level == BAD else
+                    "Each sign alone is common, but together they are worth a look.")
+            if unknown_signs and worst != level:
+                lead += " Some signs couldn't be read (%s), so it could be more serious." % ", ".join(unknown_signs)
+        detail = lead + "\n\n" + "\n".join("\u2022 " + d for d in dots)
+        detail += ("\n\nKeyboards, launchers, parental-control and backup apps can legitimately have some "
+                   "of these signs. What matters is whether YOU installed it and know what it does.")
+        advice = ("If you don't recognise it: look it up (Apps tab > Ask AI) and remove it. If it's a device "
+                  "administrator, take that away first (Settings > Security > Device admin apps). If you "
+                  "think someone put it there to watch you, removing it may alert them - think about your "
+                  "safety first and consider getting support before you act.")
+        tech = "package=%s installer=%s hidden=%s boots=%s access=%s" % (
+            p, a.get("installer") or "-", hidden, boots, ",".join(c for c in PATTERN_ACCESS
+                                                                 if p in (access.get(c) or ())) or "-")
+        out.append(finding("pattern", sev, title, detail, advice, tech, pkg=p, key="pattern:%s" % p))
+    out.sort(key=lambda f: (LEVEL_RANK[f["level"]], f["title"].lower()))
+    gaps = []
+    if launcher is None:
+        gaps.append("which apps hide their icon")
+    if boot is None:
+        gaps.append("which apps start at boot")
+    elif not boot["complete"]:
+        gaps.append("the full list of apps that start at boot")
+    if access_unread:
+        gaps.append("some powerful access (%s)" % ", ".join(access_unread))
+    if uncertain_origin:
+        gaps.append("where %d app(s) came from (no installer recorded)" % len(uncertain_origin))
+    if gaps:
+        out.append(finding("pattern", INFO, "This check is incomplete",
+                           "The phone didn't answer for: %s. Apps can only be matched on what could be "
+                           "read, so this is NOT an all-clear." % "; ".join(gaps),
+                           "Run the checkup again; the Autorun tab shows the start-up list on its own.",
+                           key="pattern:incomplete"))
+    elif not out:
+        out.append(finding("pattern", OK, "No app shows the spyware pattern",
+                           "No app you installed combines powerful access with hiding its icon, coming "
+                           "from outside a store or starting itself at boot.", key="pattern:none"))
+    return out
+
+
 SYSTEM_WORDS = ("system", "android", "service", "update", "settings", "security", "google")
 
 
@@ -1152,7 +1302,7 @@ def check_usage(facts, launcher, labeler):
 # snapshots: fingerprint the device, compare with the previous check
 # --------------------------------------------------------------------------
 
-def build_snapshot(serial, facts, access, launcher, identities, prev=None):
+def build_snapshot(serial, facts, access, launcher, identities, prev=None, boot=None, bg=None, user=None):
     """Snapshot of the device for 'changes since last check'.
 
     Signing certificate: taken from this version's identity when known. When it
@@ -1205,8 +1355,20 @@ def build_snapshot(serial, facts, access, launcher, identities, prev=None):
             acc_unverified.append(k)
         else:
             acc[k] = sorted(v)
+    # start at boot (from the checkup's boot detection) and background restriction (per
+    # verified user). Unreadable -> the previous value, marked unverified, never "none".
+    pboot, pbg = (prev or {}).get("boot"), (prev or {}).get("bg")
+    if boot is None:
+        boot_s = dict(pboot, unverified=True) if isinstance(pboot, dict) else None
+    else:
+        boot_s = {"pkgs": sorted(p for p, v in boot["pkgs"].items() if v), "complete": bool(boot["complete"]),
+                  "user": user, "unverified": False}
+    if bg is None:
+        bg_s = dict(pbg, unverified=True) if isinstance(pbg, dict) else None
+    else:
+        bg_s = {"pkgs": {p: bool(v) for p, v in bg.items()}, "user": user, "unverified": False}
     return {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "serial": serial, "device": device,
-            "apps": apps, "access": acc, "access_unverified": acc_unverified}
+            "apps": apps, "access": acc, "access_unverified": acc_unverified, "boot": boot_s, "bg": bg_s}
 
 
 def snap_dir(serial):
@@ -1220,6 +1382,41 @@ def last_snapshot(serial):
     except OSError:
         return None
     return load_json(os.path.join(d, files[-1]), {}) if files else None
+
+
+def list_snapshots(serial):
+    """All saved checks of this device, oldest first: [(file name, snapshot)]. Unreadable
+    files are skipped (and counted by the caller from the difference)."""
+    d = snap_dir(serial)
+    try:
+        files = sorted(f for f in os.listdir(d) if f.endswith(".json"))
+    except OSError:
+        return []
+    out = []
+    for f in files:
+        snap = load_json(os.path.join(d, f), {})
+        if isinstance(snap, dict) and isinstance(snap.get("apps"), dict) and snap.get("time"):
+            out.append((f, snap))
+    return out
+
+
+def snapshot_gaps(snap):
+    """What this check couldn't read (shown in the timeline - an unread item is not 'no change')."""
+    gaps = ["%s (kept from before)" % f for f in (snap.get("device") or {}).get("unverified", [])]
+    gaps += ["%s access (kept from before)" % ACCESS_INFO.get(k, (k,))[0] for k in snap.get("access_unverified", [])]
+    # a field MISSING from a snapshot = an older version didn't track it (not a gap);
+    # present but None / unverified = this check couldn't read it
+    if "boot" in snap:
+        b = snap["boot"]
+        if b is None or b.get("unverified"):
+            gaps.append("which apps start at boot")
+        elif not b.get("complete"):
+            gaps.append("the full start-at-boot list")
+    if "bg" in snap:
+        g = snap["bg"]
+        if g is None or g.get("unverified"):
+            gaps.append("background restrictions")
+    return gaps
 
 
 def save_snapshot(serial, snap):
@@ -1311,8 +1508,50 @@ def compare_snapshots(prev, cur, labeler):
     if dp.get("patch") and dc.get("patch") and dp["patch"] != dc["patch"]:
         out.append(finding("changes", INFO, "Security patch changed: %s \u2192 %s" % (dp["patch"], dc["patch"]),
                            key="changes:patch"))
-    if not out:
+    out += compare_boot_bg(prev, cur, ca, lbl, when)
+    gaps = snapshot_gaps(cur)
+    if not out and gaps:                 # not an all-clear: part of the phone couldn't be read this time
+        out.append(finding("changes", INFO, "No change found in what could be checked since %s" % when,
+                           "Not checked this time: %s." % "; ".join(gaps), key="changes:none-partial"))
+    elif not out:
         out.append(finding("changes", OK, "Nothing changed since %s" % when, key="changes:none"))
+    return out
+
+
+def compare_boot_bg(prev, cur, ca, lbl, when):
+    """Start-at-boot and background changes - only where BOTH checks could see them."""
+    out = []
+    pb, cb = prev.get("boot"), cur.get("boot")
+    if isinstance(pb, dict) and isinstance(cb, dict) and not pb.get("unverified") and not cb.get("unverified") \
+            and pb.get("user") == cb.get("user"):
+        before, now = set(pb.get("pkgs", [])), set(cb.get("pkgs", []))
+        if pb.get("complete"):                       # otherwise it may just have been missed last time
+            for p in sorted(now - before):
+                if p in ca:
+                    sysapp = ca[p].get("sys", False)
+                    out.append(finding("changes", INFO if sysapp else WARN, "%s now starts by itself at boot" % lbl(p),
+                                       "It didn't at %s." % when, "The Autorun tab can switch that off.",
+                                       pkg=p, key="changes:boot:%s" % p))
+        if cb.get("complete"):                       # otherwise it may just be unread now
+            stopped = sorted(p for p in before - now if p in ca)
+            if stopped:
+                out.append(finding("changes", INFO, "%d app(s) no longer start at boot" % len(stopped),
+                                   "\n".join("\u2022 " + lbl(p) for p in stopped[:60]), key="changes:boot-off"))
+    pg, cg = prev.get("bg"), cur.get("bg")
+    if isinstance(pg, dict) and isinstance(cg, dict) and not pg.get("unverified") and not cg.get("unverified") \
+            and pg.get("user") == cg.get("user"):
+        a, b = pg.get("pkgs", {}), cg.get("pkgs", {})
+        lifted = sorted(p for p in set(a) & set(b) if a[p] is True and b[p] is False and p in ca)
+        added = sorted(p for p in set(a) & set(b) if a[p] is False and b[p] is True and p in ca)
+        for p in lifted:
+            out.append(finding("changes", INFO if ca[p].get("sys") else WARN,
+                               "%s may run in the background again" % lbl(p),
+                               "Its background restriction was lifted since %s." % when,
+                               "If you didn't do that, restrict it again in the Autorun tab.", pkg=p,
+                               key="changes:bg-lifted:%s" % p))
+        if added:
+            out.append(finding("changes", INFO, "%d app(s) restricted from running in the background" % len(added),
+                               "\n".join("\u2022 " + lbl(p) for p in added[:60]), key="changes:bg-added"))
     return out
 
 
@@ -1393,14 +1632,14 @@ def certs_from_signing_block(path):
 def certs_from_v1(path):
     """SHA-256 of the certificates in a v1 (JAR) signature, via cryptography or openssl."""
     try:
-        z = zipfile.ZipFile(path)
-    except (zipfile.BadZipFile, OSError):
+        with zipfile.ZipFile(path) as z:                 # closed promptly, even on errors
+            blocks = [n for n in z.namelist()
+                      if n.upper().startswith("META-INF/") and n.upper().endswith((".RSA", ".DSA", ".EC"))]
+            if not blocks:
+                return []
+            data = z.read(blocks[0])
+    except (zipfile.BadZipFile, OSError, KeyError):
         return []
-    blocks = [n for n in z.namelist()
-              if n.upper().startswith("META-INF/") and n.upper().endswith((".RSA", ".DSA", ".EC"))]
-    if not blocks:
-        return []
-    data = z.read(blocks[0])
     try:
         from cryptography.hazmat.primitives.serialization import pkcs7, Encoding
         return [hashlib.sha256(c.public_bytes(Encoding.DER)).hexdigest()
@@ -1528,6 +1767,404 @@ def _http(url, headers=None, data=None, timeout=30):
     req = urllib.request.Request(url, data=data, headers=dict({"User-Agent": UA}, **(headers or {})))
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8", "replace"))
+
+
+# --------------------------------------------------------------------------
+# Known Android security issues: bulletin data (OSV) + CISA's exploited list.
+# Downloaded ONLY when the user presses the button; read from the local cache
+# otherwise. The comparison itself is cve_check.py (pure, no network).
+# --------------------------------------------------------------------------
+
+CVE_DATA_FILE = os.path.join(CONFIG_DIR, "cve_data.json")
+CVE_DATA_SCHEMA = 1
+OSV_ANDROID_URL = "https://osv-vulnerabilities.storage.googleapis.com/Android/all.zip"
+KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+CVE_UA = "ADB-Manager/1.0 (+https://github.com/peterpt/Adb-Manager)"
+OSV_ZIP_CAP = 60 << 20           # the real file is ~10 MB
+OSV_MEMBER_CAP = 16 << 20        # one record can carry MBs of code signatures (dropped)
+OSV_MAX_MEMBERS = 50000
+KEV_CAP = 20 << 20
+
+
+def download_capped(url, cap, timeout=60, headers=None):
+    """GET url -> bytes, refusing to read past `cap` whatever the server claims.
+    Raises urllib.error.URLError / HTTPError / OSError / ValueError."""
+    req = urllib.request.Request(url, headers=dict({"User-Agent": CVE_UA}, **(headers or {})))
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        declared = r.headers.get("Content-Length")
+        if declared and declared.isdigit() and int(declared) > cap:
+            raise ValueError("the download is larger than the %d MB limit" % (cap >> 20))
+        buf, total = [], 0
+        while True:
+            chunk = r.read(1 << 16)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > cap:
+                raise ValueError("the download is larger than the %d MB limit" % (cap >> 20))
+            buf.append(chunk)
+    return b"".join(buf)
+
+
+def parse_osv_zip(raw, cancel=None):
+    """OSV's Android all.zip (bytes) -> (compact records, number of unusable records).
+    Nothing is extracted to disk; each member is read with a size cap."""
+    import io
+    import cve_check as cv
+    records, skipped = [], 0
+    with zipfile.ZipFile(io.BytesIO(raw)) as z:
+        names = [n for n in z.namelist() if n.endswith(".json")]
+        if not names:
+            raise ValueError("the bulletin archive contains no records")
+        if len(names) > OSV_MAX_MEMBERS:
+            raise ValueError("the bulletin archive has too many entries (%d)" % len(names))
+        for n in names:
+            if cancel is not None and cancel.is_set():
+                raise InterruptedError("stopped")
+            try:
+                rec = cv.compact_record(json.loads(read_member_capped(z, n, OSV_MEMBER_CAP)))
+            except (ValueError, KeyError, zipfile.BadZipFile, RecursionError):
+                rec = None
+            if rec is None:
+                skipped += 1
+            else:
+                records.append(rec)
+    return records, skipped
+
+
+def refresh_cve_data(cancel=None, say=lambda text: None, fetch=download_capped):
+    """Download both sources and replace the cache. The old cache is only replaced
+    after the bulletin data was fully read; if the exploited list fails, the cache
+    says so (exploited = unknown). Returns {"ok": bool, "message", "data"}."""
+    import cve_check as cv
+    say("Downloading the Android security bulletin data (about 10 MB) ...")
+    try:
+        raw = fetch(OSV_ANDROID_URL, OSV_ZIP_CAP, 120)
+        say("Reading the bulletin data ...")
+        records, skipped = parse_osv_zip(raw, cancel)
+    except InterruptedError:
+        return {"ok": False, "message": "stopped - the saved data (if any) was kept", "data": None}
+    except (urllib.error.URLError, OSError, ValueError, zipfile.BadZipFile) as e:
+        return {"ok": False, "message": "couldn't get the bulletin data (%s) - the saved data (if any) "
+                                        "was kept" % (str(e)[:200] or type(e).__name__), "data": None}
+    if not records:
+        return {"ok": False, "message": "the bulletin data had no usable records - the saved data was kept",
+                "data": None}
+    say("Downloading CISA's list of exploited vulnerabilities ...")
+    kev, kev_error = None, ""
+    try:
+        kev = cv.compact_kev(json.loads(fetch(KEV_URL, KEV_CAP, 60)))
+        if kev is None:
+            kev_error = "the exploited list wasn't in the expected format"
+    except (urllib.error.URLError, OSError, ValueError, RecursionError) as e:
+        kev_error = "couldn't get the exploited list (%s)" % (str(e)[:200] or type(e).__name__)
+    data = {"schema": CVE_DATA_SCHEMA, "checked": time.strftime("%Y-%m-%d %H:%M"), "osv_records": records,
+            "osv_skipped": skipped, "kev": kev, "kev_error": kev_error}
+    try:
+        atomic_write_json(CVE_DATA_FILE, data, indent=None)
+    except OSError as e:
+        return {"ok": False, "message": "downloaded, but couldn't save it (%s)" % e, "data": data}
+    msg = "%d issues from the Android bulletins%s; %s" % (
+        len(records), " (%d unreadable, skipped)" % skipped if skipped else "",
+        "%d on CISA's exploited list" % len(kev) if kev is not None else kev_error)
+    return {"ok": True, "message": msg, "data": data}
+
+
+def load_cve_data():
+    """The saved data, or None if there is none / it's damaged / from a newer app."""
+    d = load_json(CVE_DATA_FILE, {})
+    if not isinstance(d, dict) or d.get("schema") != CVE_DATA_SCHEMA or not isinstance(d.get("osv_records"), list):
+        return None
+    recs = [r for r in d["osv_records"] if isinstance(r, dict) and isinstance(r.get("affected"), list)
+            and isinstance(r.get("cves"), list) and isinstance(r.get("id"), str)]
+    if not recs:
+        return None
+    kev = d.get("kev") if isinstance(d.get("kev"), dict) else None
+    return {"checked": str(d.get("checked", "?")), "osv_records": recs,
+            "osv_skipped": int(d.get("osv_skipped") or 0) + (len(d["osv_records"]) - len(recs)),
+            "kev": kev, "kev_error": str(d.get("kev_error") or ("" if kev is not None else "not downloaded"))}
+
+
+# ---- CIRCL Vulnerability-Lookup: the chip maker's own security notices -------
+# Only the chip MAKER's name is sent (e.g. "Unisoc") - never the serial, model,
+# fingerprint or app list. Matching against the phone happens locally.
+
+CIRCL_BASE = "https://vulnerability.circl.lu/api"
+CIRCL_CACHE_FILE = os.path.join(CONFIG_DIR, "circl_cache.json")
+CIRCL_PER_PAGE = 100
+CIRCL_MAX_PAGES = 10              # at most 1000 notices per maker; the server allows 20 requests a minute
+CIRCL_CAP = 8 << 20
+CIRCL_MAX_AGE = 7 * 86400
+CIRCL_MAX_QUERIES = 6
+# chip maker as the phone reports it -> the name its own notices use
+CIRCL_VENDORS = {"unisoc": "Unisoc", "spreadtrum": "Unisoc", "sprd": "Unisoc", "mediatek": "MediaTek",
+                 "mtk": "MediaTek", "qti": "Qualcomm", "qualcomm": "Qualcomm", "samsung": "Samsung"}
+# a chip's internal name -> the marketing names its maker's notices use. Only entries
+# with a public source; letter variants (UMS9230E, ...) aren't pinned to one name.
+#   UMS9230 = Unisoc Tiger T606/T616 (postmarketOS wiki "Unisoc Tiger T606/T616 (UMS9230)")
+CHIP_FAMILIES = {"ums9230": ("T606", "T616")}
+# names under which a maker publishes its own CVE records (CNA short name / vendor field)
+VENDOR_ALIASES = {"Unisoc": ("unisoc", "spreadtrum"), "MediaTek": ("mediatek",), "Qualcomm": ("qualcomm",),
+                  "Samsung": ("samsung",)}
+
+
+class CirclError(Exception):
+    """kind: 'unavailable' (503), 'rate_limited' (429, retry_after s), 'bad_request', 'network', 'format'."""
+
+    def __init__(self, kind, message, retry_after=None):
+        super().__init__(message)
+        self.kind, self.retry_after = kind, retry_after
+
+
+def circl_vendor(props):
+    """The chip maker's name for the search, from the phone's own report (or None)."""
+    for k in ("ro.soc.manufacturer", "ro.hardware.chipname"):
+        v = (props.get(k) or "").strip().lower()
+        for key, name in CIRCL_VENDORS.items():
+            if v.startswith(key):
+                return name
+    return None
+
+
+def _circl_get(path, params, fetch):
+    url = CIRCL_BASE + path + "?" + urllib.parse.urlencode(params)
+    try:
+        raw = fetch(url, CIRCL_CAP, 30, {"Accept": "application/json"})
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            ra = (e.headers or {}).get("Retry-After", "")
+            ra = int(ra) if str(ra).isdigit() else None
+            raise CirclError("rate_limited", "the service asks to slow down%s" % (
+                " - try again in %d s" % ra if ra else ""), ra)
+        if e.code == 503:
+            raise CirclError("unavailable", "the search service is unavailable right now (HTTP 503)")
+        if e.code == 400:
+            raise CirclError("bad_request", "the service rejected the search (HTTP 400)")
+        raise CirclError("network", "the service answered HTTP %d" % e.code)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise CirclError("network", "couldn't reach the service (%s)" % (str(e)[:160] or type(e).__name__))
+    try:
+        return json.loads(raw)
+    except (ValueError, RecursionError):
+        raise CirclError("format", "the service's answer wasn't valid JSON")
+
+
+def _txt(v, n=600):
+    return v[:n] if isinstance(v, str) else ""
+
+
+def compact_circl(rec):
+    """One CVE 5.x record -> the fields shown and matched, or None if it isn't one."""
+    if not isinstance(rec, dict):
+        return None
+    meta = rec.get("cveMetadata") if isinstance(rec.get("cveMetadata"), dict) else {}
+    cve = meta.get("cveId")
+    if not isinstance(cve, str) or not re.match(r"^CVE-\d{4}-\d{4,}$", cve):
+        return None
+    cont = rec.get("containers") if isinstance(rec.get("containers"), dict) else {}
+    cna = cont.get("cna") if isinstance(cont.get("cna"), dict) else {}
+    adp = [a for a in cont.get("adp") or [] if isinstance(a, dict)] if isinstance(cont.get("adp"), list) else []
+    desc = next((_txt(d.get("value")) for d in cna.get("descriptions") or []
+                 if isinstance(d, dict) and str(d.get("lang", "")).startswith("en")), "")
+    vendors, products, versions, damaged, ranges = [], [], [], False, False
+    aff = cna.get("affected")
+    if not isinstance(aff, list):
+        damaged = True
+        aff = []
+    for a in aff:
+        if not isinstance(a, dict):
+            damaged = True
+            continue
+        if isinstance(a.get("vendor"), str):
+            vendors.append(a["vendor"][:120])
+        if isinstance(a.get("product"), str):
+            products += [t.strip()[:60] for t in re.split(r"[/,;]", a["product"]) if t.strip()][:80]
+        if a.get("defaultStatus") == "affected":
+            ranges = True                 # everything NOT listed is affected: a list can't rule anything out
+        for v in a.get("versions") or []:
+            if not isinstance(v, dict):
+                continue
+            if any(k in v for k in ("lessThan", "lessThanOrEqual", "changes")):
+                ranges = True             # a version RANGE: not interpreted here -> Android version unknown
+            if v.get("status") == "affected" and isinstance(v.get("version"), str):
+                versions.append(v["version"][:120])
+    severity, kev = "", False
+    for block in [cna] + adp:
+        for m in block.get("metrics") or [] if isinstance(block.get("metrics"), list) else []:
+            if not isinstance(m, dict):
+                continue
+            for key in ("cvssV4_0", "cvssV3_1", "cvssV3_0"):
+                c = m.get(key)
+                if isinstance(c, dict) and isinstance(c.get("baseSeverity"), str) and not severity:
+                    severity = c["baseSeverity"].capitalize()[:12]
+            o = m.get("other")
+            if isinstance(o, dict) and o.get("type") == "kev":
+                kev = True
+    refs = [r["url"][:300] for r in cna.get("references") or []
+            if isinstance(r, dict) and isinstance(r.get("url"), str) and r["url"].startswith("https://")][:3]
+    prov = cna.get("providerMetadata") if isinstance(cna.get("providerMetadata"), dict) else {}
+    return {"cve": cve, "published": _txt(meta.get("datePublished"), 10), "desc": desc,
+            "vendor": vendors[0] if vendors else "", "vendors": vendors[:10], "products": products,
+            "versions": versions[:20], "ranges": ranges, "severity": severity, "kev_listed": kev, "refs": refs,
+            "damaged": damaged, "assigner": _txt(meta.get("assignerShortName"), 80),
+            "provider": _txt(prov.get("shortName"), 80)}
+
+
+def circl_attributed(rec, vendor):
+    """True only if `vendor` PUBLISHED the record: its CNA assigner short name or the CNA
+    container's provider. Being the affected vendor (e.g. a MITRE-assigned CVE about a
+    Unisoc chip) doesn't make it the maker's own notice."""
+    names = VENDOR_ALIASES.get(vendor, (vendor.lower(),))
+    return any(n in (f or "").lower() for f in (rec.get("assigner", ""), rec.get("provider", "")) for n in names)
+
+
+def circl_search(vendor, refresh=False, fetch=download_capped, cancel=None, now=None, max_age=CIRCL_MAX_AGE):
+    """The maker's notices, from the cache when fresh (unless refresh), else from
+    CIRCL. Returns {"records", "count", "complete", "stopped", "fetched", "from_cache"};
+    raises CirclError when nothing usable could be got (a failure is never 'no results').
+    Only COMPLETE searches are cached; partial ones are returned once, marked partial."""
+    now = now or time.time()
+    cache = load_json(CIRCL_CACHE_FILE, {})
+    hit = cache.get(vendor) if isinstance(cache.get(vendor), dict) else None
+    if hit and not refresh and hit.get("complete") is True and isinstance(hit.get("records"), list) \
+            and now - float(hit.get("time") or 0) < max_age:
+        return dict(hit, from_cache=True)
+    seen, records, count, complete, error, stopped, raw_rows, bad_rows = set(), [], None, False, None, False, 0, 0
+    for page in range(1, CIRCL_MAX_PAGES + 1):
+        if cancel is not None and cancel.is_set():
+            stopped = True
+            break
+        try:
+            doc = _circl_get("/vulnerability/fulltext", {"q": vendor, "page": page, "per_page": CIRCL_PER_PAGE,
+                                                         "sources": "cvelistv5"}, fetch)
+        except CirclError as e:
+            if not records:
+                raise
+            error = e                                # keep what was read, say it's partial
+            break
+        if not isinstance(doc, dict) or not isinstance(doc.get("data"), list):
+            if not records:
+                raise CirclError("format", "the service's answer had an unexpected shape")
+            break
+        md = doc.get("metadata") if isinstance(doc.get("metadata"), dict) else {}
+        if isinstance(md.get("count"), int):
+            count = md["count"]
+        raw_rows += len(doc["data"])
+        for rec in doc["data"]:
+            c = compact_circl(rec)
+            if c is None:
+                bad_rows += 1                       # counted, never silently dropped
+            elif c["cve"] not in seen:              # de-duplicated by CVE id
+                seen.add(c["cve"])
+                records.append(c)
+        if len(doc["data"]) < CIRCL_PER_PAGE or (count is not None and page * CIRCL_PER_PAGE >= count):
+            complete = True
+            break
+    if raw_rows and not records:
+        raise CirclError("format", "the service returned %d record(s), but none could be read as a CVE "
+                                   "record - that's a data problem, not 'no issues'" % raw_rows)
+    short = count is not None and complete and raw_rows < count     # the service said more than it sent
+    ok = complete and error is None and not stopped and not bad_rows and not short
+    reason = ("stopped" if stopped else str(error) if error else
+              "%d record(s) in the answer couldn't be read" % bad_rows if bad_rows else
+              "the service reported %d result(s) but sent %d" % (count, raw_rows) if short else
+              "" if complete else "page limit reached")
+    result = {"records": records, "count": count if count is not None else len(records), "complete": ok,
+              "stopped": stopped, "fetched": time.strftime("%Y-%m-%d %H:%M"), "time": now,
+              "partial_reason": reason, "bad_rows": bad_rows}
+    if ok:                                            # only complete searches are reused later
+        cache[vendor] = result
+        for k in sorted(cache, key=lambda k: float(cache[k].get("time") or 0) if isinstance(cache[k], dict) else 0
+                        )[:-CIRCL_MAX_QUERIES]:
+            cache.pop(k, None)                        # bounded
+        save_json(CIRCL_CACHE_FILE, cache)
+    return dict(result, from_cache=False)
+
+
+def _android_majors(versions):
+    """'Android10/Android11', 'Android 12.0', '15', '16-qpr2' -> {10, 11, 12, 15, 16}; None if none readable."""
+    out = set()
+    for v in versions:
+        v = v.strip().lower()
+        if "android" in v:
+            nums = [int(n) for n in re.findall(r"android\s*(\d{1,2})", v)]
+        else:
+            m = re.fullmatch(r"(\d{1,2})(?:\.\d+)*(?:-qpr\d)?", v)
+            nums = [int(m.group(1))] if m else []
+        out |= {n for n in nums if 1 <= n <= 30}
+    return out or None
+
+
+def circl_assess(records, props, bulletin=None, known=None, vendor=None):
+    """Each notice vs. the phone, locally.
+    bulletin: {cve: cve_check finding} - verdicts already made from the Android bulletin data,
+              reused, never recomputed;
+    known:    every CVE in the downloaded bulletin data (shown or not) - such a CVE never gets a
+              second, independent verdict here;
+    vendor:   the maker searched for - only its OWN records are matched as its notices.
+    Fix state is never decided here: these notices carry no patch dates."""
+    pr = props or {}
+    chip_tokens = {t for t in re.split(r"[^a-z0-9]+", " ".join(pr.get(k, "") for k in (
+        "ro.soc.model", "ro.board.platform", "ro.product.board")).lower()) if t}
+    family = set()
+    for tok in chip_tokens:
+        for fam, names in CHIP_FAMILIES.items():
+            if tok.startswith(fam):
+                family |= {n.lower() for n in names}
+    try:
+        release = int(str(pr.get("ro.build.version.release", "")).split(".")[0])
+    except ValueError:
+        release = None
+    reported = pr.get("ro.soc.model") or pr.get("ro.board.platform") or "?"
+    out = []
+    for r in records:
+        f = {"cve": r["cve"], "desc": r["desc"], "severity": r["severity"], "published": r["published"],
+             "refs": r["refs"], "kev_listed": r["kev_listed"], "fix": "unknown"}
+        b = (bulletin or {}).get(r["cve"])
+        if b is not None or r["cve"] in (known or ()):
+            f.update(source="bulletin", chip="", android="", bulletin_state=b["state"] if b else None,
+                     summary="covered by the Android bulletin data - its verdict is shown there" if b else
+                     "in the Android bulletin data, outside the serious issues listed there - no separate "
+                     "verdict is made here")
+            out.append(f)
+            continue
+        if vendor and not circl_attributed(r, vendor):
+            f.update(source="mention", chip="", android="", summary="mentions %s, but wasn't published by %s "
+                     "(published by %s) - not matched against your phone" % (
+                         vendor, vendor, r.get("assigner") or r.get("provider") or "someone else"))
+            out.append(f)
+            continue
+        prods = {p.lower() for p in r["products"]}
+        if r["damaged"] or not prods:
+            chip = "unknown"
+            chip_text = "the notice doesn't say which chips are affected"
+        elif chip_tokens & prods:
+            chip, chip_text = "listed", "lists your chip (%s)" % reported
+        elif family & prods:
+            chip = "family"
+            chip_text = "lists your chip family (%s); your exact variant can't be confirmed" % (
+                "/".join(sorted(n.upper() for n in family & prods)))
+        else:
+            chip = "unmatched"
+            chip_text = "your chip (%s) couldn't be matched to its list" % reported
+        majors = None if r.get("ranges") else _android_majors(r["versions"])
+        if r.get("ranges"):
+            android, a_text = "unknown", "it gives Android version ranges that this check doesn't interpret"
+        elif majors is None or release is None:
+            android, a_text = "unknown", "Android versions not stated" if majors is None else "your Android version is unknown"
+        elif release in majors:
+            android, a_text = "listed", "lists Android %d" % release
+        else:
+            android, a_text = "not_listed", "not listed for Android %d (lists %s)" % (
+                release, ", ".join(str(m) for m in sorted(majors)))
+        f.update(source="maker", chip=chip, android=android, summary="%s; %s; whether your update includes the "
+                 "fix can't be told" % (chip_text, a_text))
+        out.append(f)
+    rank = {("listed", "listed"): 0, ("family", "listed"): 1}
+    out.sort(key=lambda f: f["published"], reverse=True)                    # newest first ...
+    order = {"maker": 0, "bulletin": 1, "mention": 2}
+    out.sort(key=lambda f: (order[f["source"]], rank.get((f.get("chip"), f.get("android")), 2)))
+    return out
 
 
 def virustotal(key, sha256):
@@ -2184,7 +2821,8 @@ def rooting_entry_stale(entry, info):
 # Process model: the heavy lifting (Androguard) runs in a SEPARATE worker
 # process - "<inspector python> security_audit.py --inspect-worker job.json" -
 # under memory / CPU / file-size limits, in its own process group, killed on
-# timeout or Stop. The GUI process never imports Androguard, so a crash or a
+# timeout or Stop. It's a resource-limited process running with the user's own
+# permissions, not a sandbox. The GUI process never imports Androguard, so a crash or a
 # hostile APK can't take the app down. Androguard lives in its own virtual
 # environment (it pulls in a large dependency tree). Results are local only:
 # nothing here talks to the network or to an AI.
@@ -2671,17 +3309,29 @@ def _worker_env():
     return keep
 
 
-def _worker_limits(limits):
-    def apply():
-        import resource
-        os.umask(0o077)
-        for res_id, val in ((resource.RLIMIT_AS, limits["mem_bytes"]), (resource.RLIMIT_CPU, limits["cpu_s"]),
-                            (resource.RLIMIT_FSIZE, limits["file_bytes"]), (resource.RLIMIT_CORE, 0)):
-            try:
-                resource.setrlimit(res_id, (val, val))
-            except (ValueError, OSError):
-                pass
-    return apply
+# Applies the limits as the FIRST thing inside the child, then runs the worker
+# script. Used instead of preexec_fn, which isn't safe to use from a program that
+# has other threads running (the GUI does). These are resource limits on a normal
+# process running with the user's own permissions - not a sandbox.
+_LIMITED_BOOT = (
+    "import json, os, resource, runpy, sys\n"
+    "L = json.loads(sys.argv[1])\n"
+    "os.umask(0o077)\n"
+    "for k, v in ((resource.RLIMIT_AS, L['mem_bytes']), (resource.RLIMIT_CPU, L['cpu_s']),\n"
+    "             (resource.RLIMIT_FSIZE, L['file_bytes']), (resource.RLIMIT_CORE, 0)):\n"
+    "    try:\n"
+    "        resource.setrlimit(k, (v, v))\n"
+    "    except (ValueError, OSError):\n"
+    "        pass\n"
+    "script = sys.argv[2]\n"
+    "sys.argv = [script] + sys.argv[3:]\n"
+    "runpy.run_path(script, run_name='__main__')\n")
+
+
+def limited_cmd(python, limits, script, *args):
+    """Command line that runs `script args...` under `limits` (see _LIMITED_BOOT)."""
+    lim = {k: int(limits[k]) for k in ("mem_bytes", "cpu_s", "file_bytes")}
+    return [python, "-c", _LIMITED_BOOT, json.dumps(lim), script] + list(args)
 
 
 def run_inspection(job, python, limits, on_progress=None, stop=None, script=None):
@@ -2715,10 +3365,10 @@ def run_inspection(job, python, limits, on_progress=None, stop=None, script=None
         atomic_write_json(jpath, dict(job, mode=limits["mode"], limits=limits, result=rpath,
                                       scratch=os.path.join(work, "scratch")), private=True)
         try:
-            proc = subprocess.Popen([python, script or os.path.abspath(__file__), "--inspect-worker", jpath],
+            proc = subprocess.Popen(limited_cmd(python, limits, script or os.path.abspath(__file__),
+                                                "--inspect-worker", jpath),
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
-                                    cwd=work, env=_worker_env(), start_new_session=True,
-                                    preexec_fn=_worker_limits(limits))
+                                    cwd=work, env=_worker_env(), start_new_session=True)
         except OSError as e:
             return failed(STAGE_FAILED, "couldn't start the analysis program: %s" % (e.strerror or e))
         err_chunks = []
@@ -3384,9 +4034,478 @@ def _inspect_worker(job_path):
     return 0
 
 
+
+# ==========================================================================
+# App names (labels) from APK metadata
+# ==========================================================================
+#
+# Android exposes no shell command that returns an app's display name, so the
+# name is read from the app's own base.apk: its binary manifest (AndroidManifest.xml,
+# "AXML") says android:label = a literal string or a resource id, and the resource
+# table (resources.arsc, "ARSC") holds the string for each language.
+#
+#   - Zip directory parsing (fixed-size headers only) runs in the GUI process.
+#   - Inflating and parsing AXML/ARSC - complex untrusted binary formats - runs in
+#     a separate, resource-limited worker process (time / CPU / memory / file-size
+#     limits; "security_audit.py --label-worker job.json"), like the inspector.
+#     It runs with the user's own permissions: limited, NOT a sandbox.
+#   - Locale choice is BEST EFFORT Android resource resolution (language, region,
+#     script), not an exact replacement for PackageManager.getApplicationLabel():
+#     the result says which kind of match was used.
+
+LABEL_MAX_CD = 8 << 20           # zip central directory
+LABEL_MAX_MANIFEST = 2 << 20     # compressed manifest
+LABEL_MAX_MANIFEST_OUT = 4 << 20  # inflated manifest
+LABEL_MAX_ARSC = 16 << 20        # resources.arsc (stored or compressed)
+LABEL_MAX_ARSC_OUT = 24 << 20    # inflated resources.arsc
+LABEL_MAX_LEN = 200              # longest label kept
+LABEL_MATCHES = ("literal", "exact", "language", "default", "other")
+ANDROID_LABEL_ATTR = 0x01010001  # android:label
+
+
+class LabelError(ValueError):
+    pass
+
+
+def _u16(b, o):
+    if o < 0 or o + 2 > len(b):
+        raise LabelError("read past end")
+    return struct.unpack_from("<H", b, o)[0]
+
+
+def _u32(b, o):
+    if o < 0 or o + 4 > len(b):
+        raise LabelError("read past end")
+    return struct.unpack_from("<I", b, o)[0]
+
+
+# ---- zip directory (GUI side: fixed headers, bounded) ----------------------
+
+def zip_find_cd(tail, file_size):
+    """From the last bytes of a zip (the tail MUST end at end of file), return
+    (cd_offset, cd_size, entry_count). The end record must be complete, its comment
+    must end exactly at end of file, and the central directory must sit directly
+    before it. Raises LabelError."""
+    tail_start = file_size - len(tail)
+    i = len(tail) - 22
+    while i >= 0:
+        if tail[i:i + 4] == b"PK\x05\x06" and i + 22 + _u16(tail, i + 20) == len(tail):
+            break
+        i -= 1
+    else:
+        raise LabelError("no valid zip end record")
+    if _u16(tail, i + 4) or _u16(tail, i + 6) or _u16(tail, i + 8) != _u16(tail, i + 10):
+        raise LabelError("multi-disk zip not supported")
+    count, cd_size, cd_off = _u16(tail, i + 10), _u32(tail, i + 12), _u32(tail, i + 16)
+    if 0xFFFF in (count,) or cd_off == 0xFFFFFFFF or cd_size == 0xFFFFFFFF:
+        raise LabelError("zip64 not supported")
+    if cd_size > LABEL_MAX_CD or cd_off + cd_size != tail_start + i:
+        raise LabelError("central directory out of range")
+    return cd_off, cd_size, count
+
+
+def zip_find_entries(cd, cd_off, count, wanted=("AndroidManifest.xml", "resources.arsc")):
+    """Central directory -> {name: (method, comp_size, size, local_header_offset)}.
+    Exactly `count` entries must fill the directory completely; a wanted name may
+    appear only once; entries must start before the directory."""
+    out, o = {}, 0
+    for _ in range(count):
+        if o + 46 > len(cd) or cd[o:o + 4] != b"PK\x01\x02":
+            raise LabelError("bad central directory entry")
+        flags, method = _u16(cd, o + 8), _u16(cd, o + 10)
+        csize, usize = _u32(cd, o + 20), _u32(cd, o + 24)
+        nlen, xlen, clen = _u16(cd, o + 28), _u16(cd, o + 30), _u16(cd, o + 32)
+        lho = _u32(cd, o + 42)
+        end = o + 46 + nlen + xlen + clen
+        if end > len(cd):
+            raise LabelError("entry past end of directory")
+        name = cd[o + 46:o + 46 + nlen].decode("utf-8", "replace")
+        if name in wanted:
+            if 0xFFFFFFFF in (csize, usize, lho):
+                raise LabelError("zip64 entry %s not supported" % name)
+            if name in out:
+                raise LabelError("duplicate %s entry" % name)
+            if method not in (0, 8) or flags & 0x1 or lho + 30 + csize > cd_off:
+                raise LabelError("unusable entry %s" % name)
+            out[name] = (method, csize, usize, lho)
+        o = end
+    if o != len(cd):
+        raise LabelError("central directory not fully consumed")
+    return out
+
+
+def zip_data_offset(local_header, lho, name, csize, cd_off):
+    """Local file header -> absolute data offset; the header must match the name
+    and the whole data range must end before the central directory."""
+    if local_header[:4] != b"PK\x03\x04":
+        raise LabelError("bad local header")
+    nlen, xlen = _u16(local_header, 26), _u16(local_header, 28)
+    if len(local_header) < 30 + nlen or local_header[30:30 + nlen].decode("utf-8", "replace") != name:
+        raise LabelError("local header doesn't match")
+    start = lho + 30 + nlen + xlen
+    if start + csize > cd_off:
+        raise LabelError("entry data out of range")
+    return start
+
+
+# ---- AXML / ARSC (worker side only) ----------------------------------------
+
+def _string_pool(b, o, limit, max_strings=500000):
+    """Parse a ResStringPool chunk at o that must end by `limit`.
+    Returns (get(i) -> str, chunk_size)."""
+    ctype, hsize, size = _u16(b, o), _u16(b, o + 2), _u32(b, o + 4)
+    if ctype != 0x0001 or hsize < 28 or size < hsize or o + size > limit:
+        raise LabelError("bad string pool")
+    count, flags, sstart = _u32(b, o + 8), _u32(b, o + 16), _u32(b, o + 20)
+    if count > max_strings or hsize + 4 * count > size or (count and not hsize + 4 * count <= sstart < size):
+        raise LabelError("string pool too large")
+    utf8 = bool(flags & 0x100)
+    end = o + size
+
+    def get(i):
+        if not 0 <= i < count:
+            raise LabelError("string index out of range")
+        p = o + sstart + _u32(b, o + hsize + 4 * i)
+        if not o + sstart <= p < end:
+            raise LabelError("string offset out of range")
+        if utf8:
+            n = b[p]
+            p += 2 if n & 0x80 else 1                    # skip UTF-16 length
+            if p >= end:
+                raise LabelError("string past end")
+            n = b[p]
+            if n & 0x80:
+                if p + 1 >= end:
+                    raise LabelError("string past end")
+                n = ((n & 0x7F) << 8) | b[p + 1]
+                p += 2
+            else:
+                p += 1
+            n = min(n, 4 * LABEL_MAX_LEN)
+            if p + n > end:
+                raise LabelError("string past end")
+            return b[p:p + n].decode("utf-8", "replace")
+        n = _u16(b, p)
+        p += 2
+        if n & 0x8000:
+            n = ((n & 0x7FFF) << 16) | _u16(b, p)
+            p += 2
+        n = min(n, 2 * LABEL_MAX_LEN)
+        if p + 2 * n > end:
+            raise LabelError("string past end")
+        return b[p:p + 2 * n].decode("utf-16-le", "replace")
+    return get, size
+
+
+def axml_app_label(b, max_chunks=200000):
+    """Binary manifest -> ("literal", text) or ("ref", resource_id) or (None, None)."""
+    if len(b) < 8 or _u16(b, 0) != 0x0003:
+        raise LabelError("not a binary manifest")
+    total = _u32(b, 4)
+    if total > len(b) or total < 8 or _u16(b, 2) != 8:
+        raise LabelError("manifest size doesn't match the data")
+    o, n, strings, resmap = 8, 0, None, []
+    result, seen_app = (None, None), False       # decided only after the WHOLE file checks out
+    while o + 8 <= total and n < max_chunks:
+        ctype, hsize, size = _u16(b, o), _u16(b, o + 2), _u32(b, o + 4)
+        if size < 8 or hsize > size or o + size > total:
+            raise LabelError("bad manifest chunk")
+        n += 1
+        cend = o + size
+        if ctype == 0x0001 and strings is None:
+            strings, _ = _string_pool(b, o, cend)
+        elif ctype == 0x0180:
+            if hsize < 8 or (size - hsize) % 4 or (size - hsize) // 4 > 100000:
+                raise LabelError("bad resource map")
+            resmap = [_u32(b, o + hsize + 4 * k) for k in range((size - hsize) // 4)]
+        elif ctype == 0x0102 and strings is not None:
+            ext = o + hsize
+            if hsize < 16 or ext + 20 > cend:
+                raise LabelError("bad element header")
+            name = _u32(b, ext + 4)
+            if not seen_app and name < 0x7FFFFFFF and strings(name) == "application":
+                seen_app = True
+                astart, asize, acount = _u16(b, ext + 8), _u16(b, ext + 10), _u16(b, ext + 12)
+                if asize < 20 or acount > 4096 or ext + astart + acount * asize > cend or astart < 20:
+                    raise LabelError("bad attributes")
+                for k in range(acount):
+                    a = ext + astart + k * asize
+                    an, raw = _u32(b, a + 4), _u32(b, a + 8)
+                    dtype, data = b[a + 15], _u32(b, a + 16)
+                    is_label = (an < len(resmap) and resmap[an] == ANDROID_LABEL_ATTR)
+                    if not is_label and an != 0xFFFFFFFF:
+                        try:
+                            is_label = strings(an) == "label"
+                        except LabelError:
+                            is_label = False
+                    if not is_label:
+                        continue
+                    if dtype == 0x01 and data:                  # @string/... reference
+                        result = ("ref", data)
+                    elif dtype == 0x03:
+                        result = ("literal", strings(data))
+                    elif raw != 0xFFFFFFFF:
+                        result = ("literal", strings(raw))
+                    break
+        o += size
+    if o != total:
+        raise LabelError("manifest chunks don't add up")
+    return result
+
+
+def _lang(b2):
+    if not b2 or b2 == b"\x00\x00":
+        return ""
+    if b2[0] & 0x80:                                         # packed 3-letter code
+        a, c = b2[0], b2[1]
+        return "".join(chr(ord("a") + x) for x in (c & 0x1F, ((c & 0xE0) >> 5) | ((a & 0x03) << 3),
+                                                       (a & 0x7C) >> 2))
+    return b2.decode("ascii", "replace").lower()
+
+
+def arsc_strings_for(b, resid, max_chunks=200000):
+    """resources.arsc + resource id -> [(lang, region, script, qualified, text)]."""
+    if len(b) < 12 or _u16(b, 0) != 0x0002:
+        raise LabelError("not a resource table")
+    total = _u32(b, 4)
+    if total > len(b) or _u16(b, 2) != 12 or total < 12:
+        raise LabelError("resource table size doesn't match the data")
+    pkg_id, type_id, entry_id = resid >> 24, (resid >> 16) & 0xFF, resid & 0xFFFF
+    o, n, gstrings, found = 12, 0, None, []
+    while o + 8 <= total and n < max_chunks:
+        ctype, hsize, size = _u16(b, o), _u16(b, o + 2), _u32(b, o + 4)
+        if size < 8 or hsize > size or o + size > total:
+            raise LabelError("bad table chunk")
+        n += 1
+        if ctype == 0x0001 and gstrings is None:
+            gstrings, _ = _string_pool(b, o, o + size)
+        elif ctype == 0x0200 and gstrings is not None and hsize >= 12 and _u32(b, o + 8) == pkg_id:
+            p, pend = o + hsize, o + size
+            while p + 8 <= pend and n < max_chunks:
+                t, th, ts = _u16(b, p), _u16(b, p + 2), _u32(b, p + 4)
+                if ts < 8 or th > ts or p + ts > pend:
+                    raise LabelError("bad package chunk")
+                n += 1
+                if t == 0x0201 and th >= 24 and b[p + 8] == type_id:
+                    flags, count, estart = b[p + 9], _u32(b, p + 12), _u32(b, p + 16)
+                    cfg = p + 20
+                    csz = _u32(b, cfg)
+                    if flags & 0x01 and flags & 0x02:
+                        raise LabelError("sparse and 16-bit offsets can't be combined")
+                    # sparse arrays hold (16-bit index, 16-bit offset/4) pairs = 4 bytes
+                    # each; otherwise 2 bytes (16-bit offsets) or 4 bytes per entry
+                    owidth = 4 if flags & 0x01 else (2 if flags & 0x02 else 4)
+                    if csz < 4 or cfg + csz > p + th or count > 65536 or \
+                            not th + owidth * count <= estart <= ts:
+                        raise LabelError("bad type chunk")
+                    lang = _lang(b[cfg + 8:cfg + 10]) if csz >= 12 else ""
+                    region = b[cfg + 10:cfg + 12].replace(b"\x00", b"").decode("ascii", "replace") \
+                        if csz >= 12 and not (b[cfg + 10] & 0x80) else ""
+                    script = b[cfg + 36:cfg + 40].replace(b"\x00", b"").decode("ascii", "replace") \
+                        if csz >= 40 else ""
+                    qualified = any(b[cfg + 4:cfg + 8]) or (csz >= 36 and any(b[cfg + 12:cfg + 36]))
+                    offs, off = p + th, None
+                    if flags & 0x01:                             # sparse: (index, offset/4) pairs
+                        for k in range(count):
+                            if _u16(b, offs + 4 * k) == entry_id:
+                                off = _u16(b, offs + 4 * k + 2) * 4
+                                break
+                    elif entry_id < count:
+                        if flags & 0x02:                         # 16-bit offsets (Android 13+)
+                            v = _u16(b, offs + 2 * entry_id)
+                            off = None if v == 0xFFFF else v * 4
+                        else:
+                            v = _u32(b, offs + 4 * entry_id)
+                            off = None if v == 0xFFFFFFFF else v
+                    if off is not None:
+                        e = p + estart + off
+                        if e + 8 > p + ts:            # whole minimum header inside the chunk,
+                            raise LabelError("entry out of range")   # checked before any read
+                        eflags = _u16(b, e + 2)
+                        if eflags & 0x0008:                      # compact entry (Android 14+)
+                            dtype, data = eflags >> 8, _u32(b, e + 4)
+                        elif eflags & 0x0001:                    # complex (bag) - not a string
+                            dtype, data = None, None
+                        else:
+                            esz = _u16(b, e)
+                            vo = e + esz
+                            if esz < 8 or vo + 8 > p + ts:
+                                raise LabelError("value out of range")
+                            dtype, data = b[vo + 3], _u32(b, vo + 4)
+                        if dtype == 0x03:
+                            found.append((lang, region, script, qualified, gstrings(data)))
+                        elif dtype == 0x01 and data and data != resid:
+                            found.append((lang, region, script, qualified, ("ref", data)))
+                p += ts
+            if p != pend:
+                raise LabelError("package chunks don't add up")
+        o += size
+    if o != total:
+        raise LabelError("resource table chunks don't add up")
+    return found
+
+
+def pick_locale_string(cands, locale):
+    """Best-effort Android-like choice. locale = {"lang", "region", "script"}.
+    Returns (text, match) with match in LABEL_MATCHES."""
+    lang, region, script = (locale.get(k, "").lower() for k in ("lang", "region", "script"))
+    # Android's pseudo-locales (en-XA accented, ar-XB right-to-left) exist for testing
+    # translations and are never chosen for a real device language
+    cands = [c for c in cands if isinstance(c[4], str) and c[1].upper() not in ("XA", "XB")]
+    if not cands:
+        return None, None
+
+    def best(pred):
+        hits = [c for c in cands if pred(c)]
+        hits.sort(key=lambda c: c[3])                   # unqualified configs first
+        return hits[0][4] if hits else None
+    if lang:
+        for pred, m in ((lambda c: c[0] == lang and c[1].lower() == region and c[2].lower() == script, "exact"),
+                        (lambda c: c[0] == lang and c[1].lower() == region and region, "exact"),
+                        (lambda c: c[0] == lang and not c[1], "language"),
+                        (lambda c: c[0] == lang, "language")):
+            t = best(pred)
+            if t:
+                return t, m
+    t = best(lambda c: not c[0])
+    if t:
+        return t, "default"
+    return cands[0][4], "other"
+
+
+def label_from_parts(manifest, arsc, locale):
+    """Worker-side: decoded manifest (+ optional resources.arsc) -> label dict."""
+    kind, val = axml_app_label(manifest)
+    if kind is None:
+        return {"label": None, "match": None, "error": "the manifest has no app label"}
+    if kind == "literal":
+        return {"label": val, "match": "literal", "error": ""}
+    if arsc is None:
+        return {"label": None, "match": None, "error": "the label is a resource but the resource table wasn't read"}
+    resid = val
+    for _ in range(4):                                  # follow @string -> @string chains
+        cands = arsc_strings_for(arsc, resid)
+        text, match = pick_locale_string(cands, locale)
+        if text:
+            return {"label": text, "match": match, "error": ""}
+        refs = [c[4][1] for c in cands if isinstance(c[4], tuple)]
+        if not refs:
+            break
+        resid = refs[0]
+    return {"label": None, "match": None, "error": "the label resource wasn't found"}
+
+
+def clean_label(text):
+    """Display-safe: no control characters, trimmed, bounded."""
+    if not isinstance(text, str):
+        return None
+    t = "".join(ch for ch in text if ch.isprintable() or ch == " ").strip()
+    return t[:LABEL_MAX_LEN] or None
+
+
+def _label_worker(job_path):
+    import zlib
+    with open(job_path, encoding="utf-8") as f:
+        job = json.load(f)
+    out = {}
+
+    def load(spec, cap_in, cap_out):
+        """Read one entry and decode it strictly: input and output caps, the
+        declared size must match, and a deflate stream must end exactly at EOF -
+        incomplete streams, unconsumed input or trailing data are rejected."""
+        if not spec:
+            return None
+        with open(spec["path"], "rb") as f:
+            raw = f.read(cap_in + 1)
+        if len(raw) > cap_in:
+            raise LabelError("entry too large")
+        if spec["method"] == 0:
+            if len(raw) > cap_out:
+                raise LabelError("expands too much")
+            data = raw
+        else:
+            d = zlib.decompressobj(-15)
+            data = d.decompress(raw, cap_out + 1)
+            if len(data) > cap_out or d.unconsumed_tail:
+                raise LabelError("expands too much")
+            if not d.eof or d.unused_data:
+                raise LabelError("incomplete or padded deflate stream")
+        if "size" in spec and len(data) != spec["size"]:
+            raise LabelError("size doesn't match the zip directory")
+        return data
+    for item in job["items"]:
+        try:
+            man = load(item["manifest"], LABEL_MAX_MANIFEST, LABEL_MAX_MANIFEST_OUT)
+            arsc = load(item.get("arsc"), LABEL_MAX_ARSC, LABEL_MAX_ARSC_OUT)
+            out[item["id"]] = label_from_parts(man, arsc, job.get("locale") or {})
+        except Exception as e:                          # malformed input is expected; report it
+            out[item["id"]] = {"label": None, "match": None, "error": "unreadable: %s" % type(e).__name__}
+    atomic_write_json(job["result"], {"schema": 1, "results": out}, private=True)
+    return 0
+
+
+def run_label_worker(items, locale, timeout_s=60, mem_bytes=768 << 20, script=None):
+    """Parse a batch in the isolated worker. items: [{"id", "manifest": {"path","method"},
+    "arsc": {...}|None}]. Returns {id: {"label","match","error"}}; never raises. Only
+    validated results come back: ids from the batch, labels cleaned, known match kinds."""
+    import signal
+    import shutil
+    import sys
+    import tempfile
+    work = tempfile.mkdtemp(prefix="adbm_label_")
+    os.chmod(work, 0o700)
+    fail = {it["id"]: {"label": None, "match": None, "error": "the name reader didn't finish"} for it in items}
+    proc = None
+    try:
+        jpath, rpath = os.path.join(work, "job.json"), os.path.join(work, "result.json")
+        atomic_write_json(jpath, {"items": items, "locale": locale, "result": rpath}, private=True)
+        limits = {"mem_bytes": mem_bytes, "cpu_s": timeout_s, "file_bytes": 4 << 20}
+        try:
+            proc = subprocess.Popen(limited_cmd(sys.executable, limits, script or os.path.abspath(__file__),
+                                                "--label-worker", jpath),
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                                    cwd=work, env=_worker_env(), start_new_session=True)
+        except OSError:
+            return fail
+        try:
+            proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            proc.wait()
+            return fail
+        if proc.returncode != 0:
+            return fail
+        try:
+            with open(rpath, encoding="utf-8") as f:
+                res = json.load(f)
+        except (OSError, ValueError):
+            return fail
+        got = res.get("results") if isinstance(res, dict) and res.get("schema") == 1 else None
+        if not isinstance(got, dict):
+            return fail
+        out = {}
+        for it in items:
+            r = got.get(it["id"])
+            if not isinstance(r, dict):
+                out[it["id"]] = fail[it["id"]]
+                continue
+            label = clean_label(r.get("label"))
+            match = r.get("match") if r.get("match") in LABEL_MATCHES else None
+            out[it["id"]] = {"label": label if match else None, "match": match if label else None,
+                             "error": str(r.get("error") or "")[:200] if not (label and match) else ""}
+        return out
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) == 3 and sys.argv[1] == "--inspect-worker":
         sys.exit(_inspect_worker(sys.argv[2]))
+    if len(sys.argv) == 3 and sys.argv[1] == "--label-worker":
+        sys.exit(_label_worker(sys.argv[2]))
     sys.stderr.write("security_audit.py is part of ADB Manager - run adb_manager.py\n")
     sys.exit(2)
