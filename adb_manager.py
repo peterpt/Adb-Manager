@@ -8857,6 +8857,140 @@ def initial_window_size(screen_w, screen_h, scale=1.0, want=(1250, 780), least=(
     return w, h, x, y, min_w, min_h
 
 
+# ---- which monitor: with two screens, winfo_screenwidth() is BOTH of them -----
+
+_MONITORS = None
+XRANDR_RE = re.compile(r"^\s*\d+:\s+\S+\s+(\d+)/\d+x(\d+)/\d+([+-]\d+)([+-]\d+)")
+
+
+def parse_xrandr_monitors(text):
+    """'xrandr --listactivemonitors' -> [(x, y, w, h)]."""
+    out = []
+    for line in (text or "").splitlines():
+        m = XRANDR_RE.match(line)
+        if m:
+            w, h, x, y = (int(g) for g in m.groups())
+            if w > 0 and h > 0:
+                out.append((x, y, w, h))
+    return out
+
+
+def _windows_monitors():
+    import ctypes
+    from ctypes import wintypes
+    found = []
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT), ("rcWork", wintypes.RECT),
+                    ("dwFlags", wintypes.DWORD)]
+
+    def cb(hmon, hdc, rect, data):
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        if ctypes.windll.user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+            r = mi.rcWork                                  # minus the taskbar
+            found.append((r.left, r.top, r.right - r.left, r.bottom - r.top))
+        return 1
+    proto = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_double)
+    ctypes.windll.user32.EnumDisplayMonitors(None, None, proto(cb), 0)
+    return found
+
+
+def list_monitors():
+    """The physical monitors (x, y, w, h), or [] when they can't be listed. Cached."""
+    global _MONITORS
+    if _MONITORS is None:
+        mons = []
+        try:
+            if sys.platform.startswith("win"):
+                mons = _windows_monitors()
+            elif os.environ.get("DISPLAY") and shutil.which("xrandr"):
+                r = subprocess.run(["xrandr", "--listactivemonitors"], capture_output=True, text=True, timeout=3)
+                mons = parse_xrandr_monitors(r.stdout) if r.returncode == 0 else []
+        except Exception:
+            mons = []
+        _MONITORS = mons
+    return _MONITORS
+
+
+def pick_monitor(mons, px, py, screen_w, screen_h):
+    """The monitor containing point (px, py); the nearest one if none does. Without a
+    monitor list, a very wide 'screen' is treated as side-by-side monitors of 16:9."""
+    if mons:
+        inside = [m for m in mons if m[0] <= px < m[0] + m[2] and m[1] <= py < m[1] + m[3]]
+        if inside:
+            return inside[0]
+        return min(mons, key=lambda m: (max(m[0] - px, 0, px - m[0] - m[2]) ** 2 +
+                                        max(m[1] - py, 0, py - m[1] - m[3]) ** 2))
+    n = max(1, round(screen_w / (screen_h * 16 / 9))) if screen_h else 1
+    if n > 1 and screen_w / screen_h > 2.2:
+        part = screen_w // n
+        i = min(n - 1, max(0, px // part))
+        return (i * part, 0, part, screen_h)
+    return (0, 0, screen_w, screen_h)
+
+
+def monitor_for(widget, px=None, py=None):
+    """(x, y, w, h) of the monitor at a point (default: the middle of the widget)."""
+    try:
+        if px is None:
+            widget.update_idletasks()
+            px = widget.winfo_rootx() + widget.winfo_width() // 2
+            py = widget.winfo_rooty() + widget.winfo_height() // 2
+        return pick_monitor(list_monitors(), px, py, widget.winfo_screenwidth(), widget.winfo_screenheight())
+    except tk.TclError:
+        return (0, 0, 1024, 768)
+
+
+def fit_rect(req_w, req_h, mon, anchor=None, max_frac=(0.92, 0.88)):
+    """(w, h, x, y, max_w, max_h): a window of the requested size shrunk to fit the
+    monitor, centred on `anchor` (x, y) when given, always fully on that monitor."""
+    mx, my, mw, mh = mon
+    max_w, max_h = int(mw * max_frac[0]), int(mh * max_frac[1])
+    w, h = max(200, min(req_w, max_w)), max(150, min(req_h, max_h))
+    ax, ay = anchor if anchor else (mx + mw // 2, my + mh // 3)
+    x = min(max(mx, ax - w // 2), mx + mw - w)
+    y = min(max(my, ay - h // 3), my + mh - h)
+    return w, h, x, y, mw, mh
+
+
+def fit_toplevel(win, root):
+    """Once, when a window first opens: never wider or taller than the monitor the main
+    window is on, placed fully on it, and not stretchable past it. Long wrapping labels
+    get a sane width first so they can't request one screen-wide line."""
+    if getattr(win, "_fitted", False) or not isinstance(win, tk.Toplevel):
+        return
+    win._fitted = True
+    try:
+        mon = monitor_for(root)
+        limit = int(mon[2] * 0.92)
+
+        def tame(w):
+            for c in w.winfo_children():
+                if isinstance(c, (ttk.Label, tk.Label)):
+                    try:
+                        if not int(str(c.cget("wraplength") or 0)) and len(str(c.cget("text"))) > 80:
+                            c.configure(wraplength=min(limit - 60, 900))
+                    except (tk.TclError, ValueError):
+                        pass
+                tame(c)
+        tame(win)
+        win.update_idletasks()
+        req_w = max(win.winfo_reqwidth(), win.winfo_width() if win.winfo_ismapped() else 0)
+        req_h = max(win.winfo_reqheight(), win.winfo_height() if win.winfo_ismapped() else 0)
+        anchor = (root.winfo_rootx() + root.winfo_width() // 2, root.winfo_rooty() + root.winfo_height() // 3)
+        w, h, x, y, max_w, max_h = fit_rect(req_w, req_h, mon, anchor)
+        try:
+            mn_w, mn_h = (int(v) for v in win.minsize())
+            win.minsize(min(mn_w, w), min(mn_h, h))      # a minimum can never push it past the screen
+        except (tk.TclError, ValueError):
+            pass
+        win.maxsize(max_w, max_h)
+        win.geometry("%dx%d+%d+%d" % (w, h, x, y))
+    except tk.TclError:
+        pass
+
+
 # ---- toolbars that wrap, status lines that wrap ------------------------------
 
 class WrapRow:
@@ -8998,9 +9132,13 @@ class App:
         root.title("ADB Manager")
         # size from THIS screen: never larger than the desktop, minimum shrinks on
         # small screens, everything scaled with the desktop's DPI
-        w, h, x, y, mw, mh = initial_window_size(root.winfo_screenwidth(), root.winfo_screenheight(),
-                                                 ui_scale(root))
-        root.geometry("%dx%d+%d+%d" % (w, h, x, y))
+        try:
+            px, py = root.winfo_pointerxy()               # the screen the user is looking at
+        except tk.TclError:
+            px, py = 0, 0
+        mon = monitor_for(root, px, py)                   # ONE monitor - not both screens together
+        w, h, x, y, mw, mh = initial_window_size(mon[2], mon[3], ui_scale(root))
+        root.geometry("%dx%d+%d+%d" % (w, h, x + mon[0], y + mon[1]))
         root.minsize(mw, mh)
         style = ttk.Style()
         if "clam" in style.theme_names():
@@ -9096,6 +9234,8 @@ class App:
         self.icons = Icons(root)
         apply_icons(root, self.icons, self.nb)
         root.bind_class("Toplevel", "<Map>", lambda e: apply_icons(e.widget, self.icons)
+                        if isinstance(e.widget, tk.Toplevel) else None, add="+")
+        root.bind_class("Toplevel", "<Map>", lambda e: fit_toplevel(e.widget, root)
                         if isinstance(e.widget, tk.Toplevel) else None, add="+")
         self.wrappers, _ = make_responsive(root)
 
